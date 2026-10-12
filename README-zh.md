@@ -25,6 +25,10 @@
 
 ## 💎赞助
 
+> English version: [README.md](README.md)
+> [Bilibili video](https://www.bilibili.com/video/BV1y4Gi6CEo1/?spm_id_from=333.1387.homepage.video_card.click&vd_source=d22726fe6b108647dbebf1c5d8817377)
+> [抖音](https://www.douyin.com/search/comet?aid=cd8fcc82-498b-4d59-8860-617deb719412&modal_id=7646429015808936293&type=general)
+
 本项目由 [PackyCode](https://www.packyapi.ai/register?aff=DIId)、[RunApi](https://runapi.host)、[Cubence](https://cubence.com?source=comet)等赞助方支持
 
 > [想出现在这里？](mailto:benyuanming@gmail.com)
@@ -78,10 +82,6 @@
 ╚██████╗╚██████╔╝██║ ╚═╝ ██║███████╗   ██║
  ╚═════╝ ╚═════╝ ╚═╝     ╚═╝╚══════╝   ╚═╝
 ```
-
-> English version: [README.md](README.md)
-> [Bilibili video](https://www.bilibili.com/video/BV1y4Gi6CEo1/?spm_id_from=333.1387.homepage.video_card.click&vd_source=d22726fe6b108647dbebf1c5d8817377)
-> [抖音](https://www.douyin.com/search/comet?aid=cd8fcc82-498b-4d59-8860-617deb719412&modal_id=7646429015808936293&type=general)
 
 **Comet 是一个面向Coding的可恢复长程任务工作流与 Skill 平台。**
 
