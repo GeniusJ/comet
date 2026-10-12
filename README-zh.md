@@ -56,7 +56,7 @@
   <tr>
     <td width="25%" align="center" valign="middle">
       <a href="https://cubence.com?source=comet">
-        <img src="https://github.com/rpamis/comet/blob/master/img/Cubence.jpg" alt="Cubence Sponsor" width="180">
+        <img src="https://github.com/rpamis/comet/blob/master/img/Cubence.png" alt="Cubence Sponsor" width="180">
       </a>
     </td>
     <td width="75%" align="left" valign="middle">
