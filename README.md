@@ -25,6 +25,10 @@
 
 ## 💎 Sponsorship
 
+> 中文版：[README-zh.md](README-zh.md)
+> [Bilibili video](https://www.bilibili.com/video/BV1y4Gi6CEo1/?spm_id_from=333.1387.homepage.video_card.click&vd_source=d22726fe6b108647dbebf1c5d8817377)
+> [DouYin](https://www.douyin.com/search/comet?aid=cd8fcc82-498b-4d59-8860-617deb719412&modal_id=7646429015808936293&type=general)
+
 This project is supported by sponsors including [PackyCode](https://www.packyapi.ai/register?aff=DIId)、[RunAPI](https://runapi.host)、[Cubence](https://cubence.com?source=comet).
 
 > [Want to be featured here?](mailto:benyuanming@gmail.com)
@@ -81,10 +85,6 @@ This project is supported by sponsors including [PackyCode](https://www.packyapi
 ╚██████╗╚██████╔╝██║ ╚═╝ ██║███████╗   ██║
  ╚═════╝ ╚═════╝ ╚═╝     ╚═╝╚══════╝   ╚═╝
 ```
-
-> 中文版：[README-zh.md](README-zh.md)
-> [Bilibili video](https://www.bilibili.com/video/BV1y4Gi6CEo1/?spm_id_from=333.1387.homepage.video_card.click&vd_source=d22726fe6b108647dbebf1c5d8817377)
-> [DouYin](https://www.douyin.com/search/comet?aid=cd8fcc82-498b-4d59-8860-617deb719412&modal_id=7646429015808936293&type=general)
 
 **Comet is a resumable long-running task workflow and Skill platform for coding.**
 
