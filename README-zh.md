@@ -25,7 +25,7 @@
 
 ## 💎赞助
 
-本项目由 [PackyCode](https://www.packyapi.ai/register?aff=DIId)、[RunApi](https://runapi.host)等赞助方支持
+本项目由 [PackyCode](https://www.packyapi.ai/register?aff=DIId)、[RunApi](https://runapi.host)、[Cubence](https://cubence.com?source=comet)等赞助方支持
 
 > [想出现在这里？](mailto:benyuanming@gmail.com)
 
@@ -46,11 +46,22 @@
   <tr>
     <td width="25%" align="center" valign="middle">
       <a href="https://runapi.host">
-        <img src="https://github.com/rpamis/comet/blob/master/img/RunApi.jpg" alt="PackyCode Sponsor" width="180">
+        <img src="https://github.com/rpamis/comet/blob/master/img/RunApi.jpg" alt="RunApi Sponsor" width="180">
       </a>
     </td>
     <td width="75%" align="left" valign="middle">
-      RunAPI 是高效稳定的 AI 模型 API 中转平台，一个 API Key 即可访问 OpenAI、Claude、Gemini、DeepSeek、Grok 等 150+ 主流模型，低至 1 折，极其稳定，可以无缝兼容 Claude Code、OpenClaw 等工具。<a href="https://runapi.host">点此链接注册，立即开始使用！</a>
+      RunAPI 是高效稳定的 AI 模型 API 中转平台，一个 API Key 即可访问 OpenAI、Claude、Gemini、DeepSeek、Grok 等 150+ 主流模型，低至 1 折，极其稳定，可以无缝兼容 Claude Code、OpenClaw 等工具。<a href="https://runapi.host">点此链接注册！</a>
+    </td>
+  </tr>
+  <tr>
+    <td width="25%" align="center" valign="middle">
+      <a href="https://cubence.com?source=comet">
+        <img src="https://github.com/rpamis/comet/blob/master/img/Cubence.jpg" alt="Cubence Sponsor" width="180">
+      </a>
+    </td>
+    <td width="75%" align="left" valign="middle">
+      <p>Cubence 是稳定高效的模型聚合网关，支持主流大模型的API调用，同时也支持主流的开发工具Claude Code及Codex等专用分组，价格实惠，服务稳定高效。</p>
+      <p><a href="https://cubence.com?source=comet">使用 `COMET` 优惠卷即可享受9折充值优惠。</a></p>
     </td>
   </tr>
 </table>
