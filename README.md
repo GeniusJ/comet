@@ -25,7 +25,7 @@
 
 ## 💎 Sponsorship
 
-This project is supported by sponsors including [PackyCode](https://www.packyapi.ai/register?aff=DIId) and [RunAPI](https://runapi.host).
+This project is supported by sponsors including [PackyCode](https://www.packyapi.ai/register?aff=DIId)、[RunAPI](https://runapi.host)、[Cubence](https://cubence.com?source=comet).
 
 > [Want to be featured here?](mailto:benyuanming@gmail.com)
 
