@@ -4,6 +4,10 @@ import path from 'path';
 import { fileExists } from '../../platform/fs/file-system.js';
 import type { ClassicArtifactLayout } from '../comet-classic/classic-layout.js';
 import {
+  isClassicStateFileName,
+  resolveClassicStateFile,
+} from '../comet-classic/classic-state-file.js';
+import {
   hasExplicitClassicArtifactLayout,
   normalizeWorkflowArtifactRoot,
 } from '../workflow-contract/project-config.js';
@@ -55,11 +59,40 @@ async function containsLegacyManagedResumeBlock(
   }
 }
 
+async function findClassicStateEvidence(projectRoot: string): Promise<string[]> {
+  const evidence: string[] = [];
+  const visit = async (relativeDirectory: string): Promise<void> => {
+    const inspection = await inspectProtectedProjectPath(projectRoot, relativeDirectory, {
+      label: 'Classic change evidence',
+      expected: 'directory',
+    });
+    if (!inspection.exists) return;
+    const entries = await fs.readdir(inspection.target, { withFileTypes: true });
+    if (entries.some((entry) => isClassicStateFileName(entry.name))) {
+      await resolveClassicStateFile(inspection.target);
+    }
+    for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
+      if (entry.isSymbolicLink()) continue;
+      const relativeTarget = `${relativeDirectory}/${entry.name}`;
+      if (entry.isDirectory()) {
+        await visit(relativeTarget);
+      } else if (entry.isFile() && isClassicStateFileName(entry.name)) {
+        evidence.push(relativeTarget);
+      }
+    }
+  };
+  await visit('openspec/changes');
+  await visit('docs/openspec/changes');
+
+  return evidence;
+}
+
 async function findLegacyEvidence(
   projectRoot: string,
+  classicStateEvidence: string[],
   projectConfigExists?: boolean,
 ): Promise<string[]> {
-  const evidence: string[] = [];
+  const evidence = [...classicStateEvidence];
   const legacyConfig = '.comet/config.yaml';
   if (
     projectConfigExists ??
@@ -67,25 +100,6 @@ async function findLegacyEvidence(
   ) {
     evidence.push(legacyConfig);
   }
-
-  const visit = async (relativeDirectory: string): Promise<void> => {
-    const inspection = await inspectProtectedProjectPath(projectRoot, relativeDirectory, {
-      label: 'legacy Classic change evidence',
-      expected: 'directory',
-    });
-    if (!inspection.exists) return;
-    const entries = await fs.readdir(inspection.target, { withFileTypes: true });
-    for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
-      if (entry.isSymbolicLink()) continue;
-      const relativeTarget = `${relativeDirectory}/${entry.name}`;
-      if (entry.isDirectory()) {
-        await visit(relativeTarget);
-      } else if (entry.isFile() && entry.name === '.comet.yaml') {
-        evidence.push(relativeTarget);
-      }
-    }
-  };
-  await visit('openspec/changes');
 
   const inspectedResumeTargets = new Set<string>();
   for (const file of ['AGENTS.md', 'CLAUDE.md']) {
@@ -119,6 +133,7 @@ export async function resolveInitWorkflow(
       allowPartialProject: true,
       allowMissingNativeFields: true,
     }));
+  const classicStateEvidence = await findClassicStateEvidence(projectRoot);
   const existing = snapshot.document?.config ?? null;
   if (existing) {
     if (
@@ -150,7 +165,11 @@ export async function resolveInitWorkflow(
     };
   }
 
-  const legacyEvidence = await findLegacyEvidence(projectRoot, snapshot.identity.exists);
+  const legacyEvidence = await findLegacyEvidence(
+    projectRoot,
+    classicStateEvidence,
+    snapshot.identity.exists,
+  );
   const [legacyOpenSpecRootExists, docsOpenSpecRootExists] = await Promise.all([
     fileExists(path.join(projectRoot, 'openspec')),
     fileExists(path.join(projectRoot, 'docs', 'openspec')),

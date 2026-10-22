@@ -1,0 +1,142 @@
+.dashboard-version {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--color-muted);
+  font-size: 14px;
+  cursor: pointer;
+  font-variant-numeric: tabular-nums;
+}
+.dashboard-version-number {
+  font-family: var(--font-mono);
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: -0.03em;
+  font-variant-numeric: lining-nums tabular-nums;
+}
+.dashboard-version:hover {
+  color: var(--color-fg);
+}
+.dashboard-version-new {
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--color-danger-soft);
+  color: var(--color-danger);
+  font-size: 13px;
+  line-height: 20px;
+  font-weight: 600;
+}
+.dashboard-modal.dashboard-update-modal .ant-modal-container {
+  height: auto;
+  max-height: calc(100dvh - 64px);
+}
+.dashboard-modal.dashboard-update-modal .ant-modal-body {
+  display: block;
+  overflow: auto;
+  padding: 24px;
+}
+.dashboard-update-modal .dashboard-update-heading {
+  justify-content: flex-end;
+}
+.dashboard-system-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.dashboard-update-page {
+  display: grid;
+  gap: 24px;
+  max-width: 1080px;
+  margin: 0 auto;
+  min-width: 0;
+}
+.dashboard-update-heading,
+.dashboard-update-confirm,
+.dashboard-update-log-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+.dashboard-update-modal .dashboard-update-page .ant-typography {
+  margin-block: 0;
+}
+.dashboard-update-modal .dashboard-update-versions h2.ant-typography {
+  font-family: var(--font-mono);
+  font-weight: 600;
+  letter-spacing: -0.04em;
+  font-variant-numeric: lining-nums tabular-nums;
+}
+.dashboard-update-heading > div {
+  display: grid;
+  gap: 8px;
+}
+.dashboard-update-versions {
+  display: flex;
+  align-items: center;
+  gap: 40px;
+  padding-block: 24px;
+  border-block: 1px solid var(--color-border);
+  flex-wrap: wrap;
+}
+.dashboard-update-versions > div {
+  display: grid;
+  gap: 8px;
+}
+.dashboard-update-versions .ant-tag {
+  margin-left: auto;
+}
+.dashboard-update-projects {
+  margin: 12px 0 20px;
+  padding-left: 20px;
+  max-height: 180px;
+  overflow: auto;
+}
+.dashboard-update-projects li {
+  padding-block: 4px;
+  overflow-wrap: anywhere;
+}
+.dashboard-update-confirm {
+  padding: 0;
+}
+.dashboard-update-log-section {
+  display: grid;
+  gap: 16px;
+  min-width: 0;
+}
+.dashboard-update-log {
+  margin: 0;
+  padding: 20px;
+  height: 360px;
+  max-height: 55vh;
+  overflow: auto;
+  border: 1px solid var(--color-border);
+  border-radius: 10px;
+  background: var(--color-surface-warm);
+  color: var(--color-fg);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font: 13px/1.7 var(--font-mono, Consolas, monospace);
+}
+.dashboard-update-log .is-stderr {
+  color: var(--color-danger, #c64848);
+}
+@media (max-width: 600px) {
+  .dashboard-modal.dashboard-update-modal .ant-modal-body {
+    padding: 20px 16px;
+  }
+  .dashboard-update-versions {
+    gap: 24px;
+  }
+  .dashboard-update-versions .ant-tag {
+    margin-left: 0;
+  }
+  .dashboard-update-confirm .ant-btn {
+    width: 100%;
+  }
+}

@@ -73,6 +73,7 @@ export interface AgentExperienceEpisode {
 
 export interface AgentLearningStatus {
   readonly pending: number;
+  readonly processing?: number;
   readonly retryScheduled: number;
   readonly waiting: number;
   readonly failed: number;
@@ -137,6 +138,39 @@ export class StorageAgentExperienceJournalStore implements AgentExperienceJourna
   }
 }
 
+/** 只读核对完整事件回执；未完成的学习仍须交给原执行路径重试。 */
+export async function areAgentExperienceEventsProcessed(
+  store: AgentExperienceJournalStore,
+  events: readonly AgentExperienceEvent[],
+): Promise<boolean> {
+  const state = await store.read();
+  if (
+    Object.values(state.reflections).some((reflection) => reflection.status !== 'processed') ||
+    state.events.some((event) => state.reflections[event.eventId]?.status !== 'processed')
+  )
+    return false;
+  return events.every((expected) => {
+    const actual = state.events.find((event) => event.eventId === expected.eventId);
+    if (!actual || state.reflections[expected.eventId]?.status !== 'processed') return false;
+    // 沿用现有去重规则，时间戳和本地化摘要不属于事件身份。
+    const identity = (event: AgentExperienceEvent) =>
+      JSON.stringify({
+        schema: event.schema,
+        eventId: event.eventId,
+        episodeId: event.episodeId,
+        type: event.type,
+        actor: event.actor,
+        scope: event.scope,
+        projectId: event.projectId,
+        source: event.source,
+        context: event.context,
+        evidence: event.evidence,
+        outcome: event.outcome?.status,
+      });
+    return identity(actual) === identity(expected);
+  });
+}
+
 export class AgentExperienceJournal {
   private queue = Promise.resolve();
 
@@ -144,13 +178,31 @@ export class AgentExperienceJournal {
 
   public async status(): Promise<AgentLearningStatus> {
     const state = await this.store.read();
-    const result = { pending: 0, retryScheduled: 0, waiting: 0, failed: 0 };
+    const result = { pending: 0, processing: 0, retryScheduled: 0, waiting: 0, failed: 0 };
+    const now = Date.now();
     for (const reflection of Object.values(state.reflections)) {
-      if (reflection.status === 'waiting') result.waiting += 1;
-      else if (reflection.status === 'failed') result.failed += 1;
-      else if (reflection.status === 'pending' && reflection.nextRetryAt)
-        result.retryScheduled += 1;
-      else if (reflection.status === 'pending') result.pending += 1;
+      switch (reflection.status) {
+        case 'waiting':
+          result.waiting += 1;
+          break;
+        case 'failed':
+          result.failed += 1;
+          break;
+        case 'pending':
+          if (reflection.nextRetryAt) result.retryScheduled += 1;
+          else result.pending += 1;
+          break;
+        case 'processing':
+          if (Date.parse(reflection.leaseExpiresAt ?? '') <= now) result.pending += 1;
+          else result.processing += 1;
+          break;
+        case 'processed':
+          break;
+        default: {
+          const unexpected: never = reflection.status;
+          throw new Error(`Unknown learning state: ${unexpected}`);
+        }
+      }
     }
     return result;
   }
@@ -191,6 +243,34 @@ export class AgentExperienceJournal {
         episodeEventCount: episode.events.length,
         episodeEvidenceCount: episode.evidence.length,
       };
+    });
+  }
+
+  /** Persist an outbox batch atomically; reflection is a separate maintenance operation. */
+  public async captureMany(
+    values: readonly AgentExperienceEvent[],
+    options: { readonly processedEventIds?: readonly string[] } = {},
+  ): Promise<void> {
+    const additions = values.map(validateAgentExperienceEvent);
+    if (additions.length === 0) return;
+    await this.serialized(async () => {
+      const state = await this.store.read();
+      const known = new Set(state.events.map((event) => event.eventId));
+      const events = [...state.events];
+      const reflections = { ...state.reflections };
+      const processed = new Set(options.processedEventIds ?? []);
+      for (const event of additions) {
+        if (known.has(event.eventId)) continue;
+        known.add(event.eventId);
+        events.push(event);
+        reflections[event.eventId] = {
+          status: processed.has(event.eventId) ? 'processed' : 'pending',
+          attempts: 0,
+          updatedAt: event.occurredAt,
+        };
+      }
+      if (events.length !== state.events.length)
+        await this.store.write({ version: 2, events, reflections });
     });
   }
 
@@ -358,7 +438,7 @@ export class AgentExperienceJournal {
   /** Atomically lease one episode so independent CLI/Hook processes cannot reflect it twice. */
   public async claimEpisode(
     episodeId: string,
-    options: { readonly now?: string; readonly leaseMs?: number } = {},
+    options: { readonly now?: string; readonly leaseMs?: number; readonly maxEvents?: number } = {},
   ): Promise<AgentExperienceReflectionClaim | null> {
     return this.serialized(async () => {
       const state = await this.store.read();
@@ -372,16 +452,18 @@ export class AgentExperienceJournal {
         );
       });
       if (active) return null;
-      const pending = episodeEvents.filter((event) => {
-        const reflection = state.reflections[event.eventId];
-        return (
-          (reflection?.status === 'pending' &&
-            (reflection.nextRetryAt === undefined ||
-              Date.parse(reflection.nextRetryAt) <= nowMs)) ||
-          (reflection?.status === 'processing' &&
-            Date.parse(reflection.leaseExpiresAt ?? '') <= nowMs)
-        );
-      });
+      const pending = episodeEvents
+        .filter((event) => {
+          const reflection = state.reflections[event.eventId];
+          return (
+            (reflection?.status === 'pending' &&
+              (reflection.nextRetryAt === undefined ||
+                Date.parse(reflection.nextRetryAt) <= nowMs)) ||
+            (reflection?.status === 'processing' &&
+              Date.parse(reflection.leaseExpiresAt ?? '') <= nowMs)
+          );
+        })
+        .slice(0, Math.max(1, Math.min(1000, options.maxEvents ?? 1000)));
       if (pending.length === 0) return null;
       const claimId = `reflection:${randomUUID()}`;
       const leaseMs = Math.max(1_000, Math.min(30 * 60_000, options.leaseMs ?? 5 * 60_000));
@@ -412,6 +494,24 @@ export class AgentExperienceJournal {
           ]),
         ),
       };
+    });
+  }
+
+  public async releaseClaim(claim: AgentExperienceReflectionClaim): Promise<void> {
+    await this.serialized(async () => {
+      const state = await this.store.read(),
+        reflections = { ...state.reflections };
+      for (const id of claim.eventIds) {
+        const current = reflections[id];
+        if (current?.status !== 'processing' || current.claimId !== claim.claimId) continue;
+        reflections[id] = {
+          status: 'pending',
+          attempts: current.attempts,
+          updatedAt: new Date().toISOString(),
+          completedOwners: [...(current.completedOwners ?? [])],
+        };
+      }
+      await this.store.write({ ...state, reflections });
     });
   }
 

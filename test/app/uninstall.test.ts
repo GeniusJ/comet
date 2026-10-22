@@ -1,3 +1,7 @@
+import {
+  resolveWorkspaceRuntimeRoot,
+  resolveWorkspaceRuntimeRootSync,
+} from '../../domains/workflow-contract/workspace-runtime.js';
 import { describe, it, expect, beforeEach, afterEach, vi, type MockInstance } from 'vitest';
 import { promises as fs } from 'fs';
 import { execFileSync } from 'child_process';
@@ -1288,12 +1292,79 @@ describe('uninstall', () => {
       await writeNativeProjectConfig('docs');
       const nativeRoot = await createNativeWorkingTree('docs');
 
+      const runtimeRoot = resolveWorkspaceRuntimeRootSync(tmpDir);
       const result = await removeWorkingDirs(tmpDir);
 
       expect(result).toEqual({ removed: 1, failed: 0 });
       expect(await fileExists(path.join(tmpDir, '.comet'))).toBe(false);
       expect(await fileExists(nativeRoot)).toBe(false);
       expect(await fileExists(path.join(tmpDir, 'docs'))).toBe(false);
+      expect(await fileExists(runtimeRoot)).toBe(false);
+    });
+
+    it.each(['empty', 'durable'])(
+      'keeps the Runtime fence and %s user-level state while removing project config and empty artifacts',
+      async (state) => {
+        const configPath = await writeNativeProjectConfig('docs');
+        const nativeRoot = await createNativeWorkingTree('docs');
+        const runtimeRoot = await resolveWorkspaceRuntimeRoot(tmpDir);
+        const fencePath = path.join(tmpDir, '.comet/runtime');
+        const fence = await fs.readFile(fencePath, 'utf8');
+        const checkpoint = path.join(runtimeRoot, 'native/checkpoint.json');
+        if (state === 'durable') {
+          await fs.mkdir(path.dirname(checkpoint), { recursive: true });
+          await fs.writeFile(checkpoint, '{"activeAction":"keep-me","revision":7}');
+        }
+
+        await expect(removeWorkingDirs(tmpDir)).resolves.toEqual({
+          removed: 1,
+          failed: 0,
+          preserved: [fencePath],
+        });
+        expect(await fileExists(configPath)).toBe(false);
+        expect(await fileExists(nativeRoot)).toBe(false);
+        expect(await fileExists(runtimeRoot)).toBe(true);
+        await expect(fs.readFile(fencePath, 'utf8')).resolves.toBe(fence);
+        if (state === 'durable') {
+          await expect(fs.readFile(checkpoint, 'utf8')).resolves.toBe(
+            '{"activeAction":"keep-me","revision":7}',
+          );
+        }
+        await expect(
+          fs.mkdir(path.join(fencePath, 'native'), { recursive: true }),
+        ).rejects.toThrow();
+      },
+    );
+
+    it('keeps shared Runtime state when selectively removing Native after initialization', async () => {
+      const configPath = await writeNativeProjectConfig('docs', 'both');
+      const nativeRoot = await createNativeWorkingTree('docs');
+      const runtimeRoot = await resolveWorkspaceRuntimeRoot(tmpDir);
+      const checkpoint = path.join(runtimeRoot, 'classic/state.json');
+      await fs.mkdir(path.dirname(checkpoint), { recursive: true });
+      await fs.writeFile(checkpoint, '{"revision":2}');
+      const fencePath = path.join(tmpDir, '.comet/runtime');
+      const fence = await fs.readFile(fencePath, 'utf8');
+
+      await expect(removeWorkingDirs(tmpDir, { workflows: ['native'] })).resolves.toEqual({
+        removed: 0,
+        failed: 0,
+      });
+      expect(await fileExists(configPath)).toBe(true);
+      expect(await fileExists(nativeRoot)).toBe(false);
+      await expect(fs.readFile(fencePath, 'utf8')).resolves.toBe(fence);
+      await expect(fs.readFile(checkpoint, 'utf8')).resolves.toBe('{"revision":2}');
+    });
+
+    it('does not treat an unknown Runtime file as a removable migration fence', async () => {
+      const configPath = await writeNativeProjectConfig('docs');
+      const nativeRoot = await createNativeWorkingTree('docs');
+      const runtimeFile = path.join(tmpDir, '.comet/runtime');
+      await fs.writeFile(runtimeFile, 'user-owned notes');
+      await expect(removeWorkingDirs(tmpDir)).resolves.toMatchObject({ removed: 0, failed: 1 });
+      expect(await fileExists(configPath)).toBe(true);
+      expect(await fileExists(nativeRoot)).toBe(true);
+      await expect(fs.readFile(runtimeFile, 'utf8')).resolves.toBe('user-owned notes');
     });
 
     it('removes the standard empty Native tree from an explicit artifact root', async () => {

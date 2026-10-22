@@ -1,32 +1,13 @@
 import path from 'path';
 import os from 'os';
-import { discoverBundleCandidates } from '../../domains/bundle/candidates.js';
-import {
-  generateBundleDraftFromFactoryState,
-  initializeBundleFactoryState,
-} from '../../domains/bundle/factory.js';
-import { resolveBundleFactoryCandidate } from '../../domains/bundle/factory-resolve.js';
-import { readSkillPreferences } from '../../domains/bundle/preferences.js';
-import { createBundleDraft, optimizeBundleDraft } from '../../domains/bundle/draft.js';
 import { loadBundle } from '../../domains/bundle/load.js';
 import {
   listBundleAuthoringStates,
   reconcileBundleAuthoringState,
 } from '../../domains/bundle/state.js';
-import { compileBundleIr } from '../../domains/bundle/compiler.js';
-import { compileBundleForPlatform } from '../../domains/bundle/platform.js';
-import { buildBundleReviewSummary } from '../../domains/bundle/review-summary.js';
-import { listBundlePlatformTargets } from '../../domains/bundle/bundle-platform.js';
-import { planBundleEval, recordBundleEval } from '../../domains/bundle/eval.js';
-import {
-  buildAuthoringPlan,
-  recordAuthoringLane,
-  type AuthoringDepth,
-} from '../../domains/bundle/authoring.js';
-import { publishBundle, reviewBundle } from '../../domains/bundle/publish.js';
-import { distributeBundle } from '../../domains/bundle/distribute.js';
-import { buildBundleFactoryProposal } from '../../domains/bundle/factory-proposal.js';
-import { buildBundleFactoryGuide } from '../../domains/bundle/factory-guide.js';
+import type { compileBundleIr } from '../../domains/bundle/compiler.js';
+import type { buildBundleReviewSummary } from '../../domains/bundle/review-summary.js';
+import type { distributeBundle } from '../../domains/bundle/distribute.js';
 import {
   buildBundleResumeSummary,
   determineBundleNextAction,
@@ -37,7 +18,6 @@ import type { BundleCapability } from '../../domains/bundle/types.js';
 import {
   buildSkillCreatorInstallText,
   buildSkillCreatorResumeText,
-  formatSkillCreatorPlanSummary,
 } from '../../domains/bundle/user-facing.js';
 
 interface BundleCommandOptions {
@@ -47,8 +27,6 @@ interface BundleCommandOptions {
   scope?: 'project' | 'global';
   locale?: string;
   level?: 'quick' | 'full';
-  depth?: AuthoringDepth;
-  lane?: string;
   result?: string;
   approve?: boolean;
   reject?: boolean;
@@ -61,12 +39,6 @@ interface BundleCommandOptions {
   defaultLocale?: string;
   localeOption?: string[];
   engine?: boolean;
-  file?: string;
-  confirmedProposal?: boolean;
-  candidate?: string;
-  source?: string;
-  ignoreMissing?: boolean;
-  reason?: string;
 }
 
 function projectRoot(options: BundleCommandOptions): string {
@@ -112,16 +84,12 @@ function formatStatusText(
       ? []
       : [`Backend command: ${resumeSummary.recommendedNextStep.backendCommand}`];
   const userText = buildSkillCreatorResumeText({
-    title: 'Found an unfinished Skill creation',
+    title: 'Found an unfinished Bundle',
     completed: resumeSummary.completed,
     missing: resumeSummary.missing,
     nextAction: resumeSummary.recommendedNextStep.userLabel,
     choices: resumeSummary.choices.map((choice) => choice.label),
   });
-  const factoryPackage =
-    state.factory?.generatedSkillPackage?.packageRoot ??
-    state.factory?.planPath ??
-    'missing; run comet creator generate or inspect creator init plan';
 
   return [
     userText,
@@ -130,7 +98,6 @@ function formatStatusText(
     `Status: ${state.status}`,
     `Hash: ${state.currentHash ?? '(invalid)'}`,
     `Draft: ${state.draftPath}`,
-    `Skill Creator package: ${factoryPackage}`,
     formatStateEval(state.eval),
     formatStateReview(state.review),
     `Next action: ${resumeSummary.recommendedNextStep.action}`,
@@ -156,7 +123,7 @@ function formatListText(
     }
   >,
 ): string {
-  if (states.length === 0) return 'No Skill Creator states found.';
+  if (states.length === 0) return 'No Bundle states found.';
   return states
     .map((state) =>
       [
@@ -170,35 +137,6 @@ function formatListText(
       ].join('\n'),
     )
     .join('\n\n');
-}
-
-function formatFactoryGuideText(
-  guide: Awaited<ReturnType<typeof buildBundleFactoryGuide>>,
-): string {
-  return [
-    guide.userMessage.title,
-    guide.userMessage.summary,
-    `Preference file: ${guide.preference.state} (${guide.preference.path})`,
-    `Discovered Skills: ${guide.inventory.total}`,
-    ...formatOptionalSection(
-      'Recommended Skills:',
-      guide.inventory.recommended.map((item) => `${item.name} - ${item.reason}`),
-    ),
-    ...formatOptionalSection(
-      'Ambiguous Skills:',
-      guide.inventory.ambiguous.map(
-        (item) =>
-          `${item.name} (${item.sources.map((source) => source.platform ?? source.origin).join(', ')})`,
-      ),
-    ),
-    ...formatOptionalSection(
-      'Resumable flows:',
-      guide.resumable.map(
-        (item) => `${item.name}: ${item.currentStep}; next ${item.recommendedNextStep.userLabel}`,
-      ),
-    ),
-    `Next step: ${guide.userMessage.nextStep}`,
-  ].join('\n');
 }
 
 function formatReviewSummaryText(
@@ -269,6 +207,7 @@ async function compileDraft(
   state: Awaited<ReturnType<typeof reconcileBundleAuthoringState>>;
   ir: Awaited<ReturnType<typeof compileBundleIr>>;
 }> {
+  const { compileBundleIr } = await import('../../domains/bundle/compiler.js');
   const state = await reconcileBundleAuthoringState(projectRoot(options), name);
   const bundle = await loadBundle(state.draftPath);
   return {
@@ -278,6 +217,10 @@ async function compileDraft(
 }
 
 export async function bundleCandidatesCommand(options: BundleCommandOptions = {}): Promise<void> {
+  const [{ discoverBundleCandidates }, { readSkillPreferences }] = await Promise.all([
+    import('../../domains/bundle/candidates.js'),
+    import('../../domains/bundle/preferences.js'),
+  ]);
   const root = projectRoot(options);
   const preferences = await readSkillPreferences(root);
   const candidates = await discoverBundleCandidates({ projectRoot: root, preferences });
@@ -292,6 +235,7 @@ export async function bundleDraftCreateCommand(
   name: string,
   options: BundleCommandOptions = {},
 ): Promise<void> {
+  const { createBundleDraft } = await import('../../domains/bundle/draft.js');
   const state = await createBundleDraft({
     projectRoot: projectRoot(options),
     name,
@@ -307,6 +251,7 @@ export async function bundleDraftOptimizeCommand(
   source: string,
   options: BundleCommandOptions = {},
 ): Promise<void> {
+  const { optimizeBundleDraft } = await import('../../domains/bundle/draft.js');
   const sourceRoot = path.resolve(source);
   const bundle = await loadBundle(sourceRoot);
   const state = await optimizeBundleDraft({
@@ -352,103 +297,16 @@ export async function bundleListCommand(options: BundleCommandOptions = {}): Pro
   emit({ bundles: states }, options.json, formatListText(states));
 }
 
-export async function bundleFactoryGuideCommand(options: BundleCommandOptions = {}): Promise<void> {
-  const guide = await buildBundleFactoryGuide({ projectRoot: projectRoot(options) });
-  emit(guide, options.json, formatFactoryGuideText(guide));
-}
-
-export async function bundleFactoryGenerateCommand(
-  name: string,
-  options: BundleCommandOptions = {},
-): Promise<void> {
-  const root = projectRoot(options);
-  const state = await reconcileBundleAuthoringState(root, name);
-  const updated = await generateBundleDraftFromFactoryState({ projectRoot: root, state });
-  emit(
-    updated,
-    options.json,
-    `Generated Skill Creator package ${updated.name}\nDraft: ${updated.draftPath}`,
-  );
-}
-
-export async function bundleFactoryInitCommand(
-  name: string,
-  options: BundleCommandOptions = {},
-): Promise<void> {
-  if (!options.file) throw new Error('--file is required');
-  const updated = await initializeBundleFactoryState({
-    projectRoot: projectRoot(options),
-    name,
-    filePath: options.file,
-    confirmedProposal: options.confirmedProposal,
-  });
-  emit(
-    updated,
-    options.json,
-    `Initialized Skill Creator state ${updated.name}\nDraft: ${updated.draftPath}`,
-  );
-}
-
-export async function bundleFactoryProposeCommand(
-  name: string,
-  options: BundleCommandOptions = {},
-): Promise<void> {
-  if (!options.file) throw new Error('--file is required');
-  const proposal = await buildBundleFactoryProposal({
-    projectRoot: projectRoot(options),
-    name,
-    filePath: options.file,
-  });
-  emit(
-    proposal,
-    options.json,
-    [
-      formatSkillCreatorPlanSummary(proposal.skillCreatorSummary),
-      'Advanced details:',
-      `Skill Creator proposal ${proposal.name}`,
-      `Preference mode: ${proposal.preference.mode}`,
-      `Can generate: ${proposal.canGenerate ? 'yes' : 'no'}`,
-      ...formatOptionalSection(
-        'Will reuse Skills:',
-        proposal.userSummary.reusedSkills.map(
-          (item) => `${item.skill}: ${item.status}; ${item.sourceCount} source(s)`,
-        ),
-      ),
-      ...formatOptionalSection('Blockers:', proposal.blockers),
-      ...formatOptionalSection(
-        'Actions:',
-        proposal.actions.map((action) => `${action.id}: ${action.command}`),
-      ),
-    ].join('\n'),
-  );
-}
-
-export async function bundleFactoryResolveCommand(
-  name: string,
-  options: BundleCommandOptions = {},
-): Promise<void> {
-  if (!options.candidate) throw new Error('--candidate is required');
-  const updated = await resolveBundleFactoryCandidate({
-    projectRoot: projectRoot(options),
-    name,
-    candidate: options.candidate,
-    ...(options.source ? { source: options.source } : {}),
-    ...(options.ignoreMissing ? { ignoreMissing: true } : {}),
-    ...(options.reason ? { reason: options.reason } : {}),
-  });
-  emit(
-    updated,
-    options.json,
-    `Resolved Skill Creator candidate ${options.candidate} for ${updated.name}`,
-  );
-}
-
 export async function bundleCompileCommand(
   name: string,
   options: BundleCommandOptions = {},
 ): Promise<void> {
   const ids = platformIds(options.platform);
   if (ids.length !== 1) throw new Error('--platform is required exactly once');
+  const [{ compileBundleForPlatform }, { listBundlePlatformTargets }] = await Promise.all([
+    import('../../domains/bundle/platform.js'),
+    import('../../domains/bundle/bundle-platform.js'),
+  ]);
   const { state, ir } = await compileDraft(name, options);
   const target = listBundlePlatformTargets({
     projectRoot: projectRoot(options),
@@ -472,6 +330,7 @@ export async function bundleEvalPlanCommand(
   name: string,
   options: BundleCommandOptions = {},
 ): Promise<void> {
+  const { planBundleEval } = await import('../../domains/bundle/eval.js');
   const { ir } = await compileDraft(name, options);
   const plan = planBundleEval(ir, options.level ?? 'quick');
   emit(
@@ -491,6 +350,7 @@ export async function bundleEvalRecordCommand(
   options: BundleCommandOptions = {},
 ): Promise<void> {
   if (!options.result) throw new Error('--result is required');
+  const { recordBundleEval } = await import('../../domains/bundle/eval.js');
   const state = await recordBundleEval(projectRoot(options), name, path.resolve(options.result));
   emit(state, options.json, `Recorded Eval for ${state.name}: ${state.status}`);
 }
@@ -503,6 +363,7 @@ export async function bundleReviewCommand(
     throw new Error('Pass exactly one of --approve or --reject');
   }
   if (!options.reviewer) throw new Error('--reviewer is required');
+  const { reviewBundle } = await import('../../domains/bundle/publish.js');
   const state = await reviewBundle({
     projectRoot: projectRoot(options),
     name,
@@ -518,6 +379,7 @@ export async function bundleReviewSummaryCommand(
 ): Promise<void> {
   const ids = platformIds(options.platform);
   if (ids.length !== 1) throw new Error('--platform is required exactly once');
+  const { buildBundleReviewSummary } = await import('../../domains/bundle/review-summary.js');
   const summary = await buildBundleReviewSummary({
     projectRoot: projectRoot(options),
     name,
@@ -534,6 +396,7 @@ export async function bundlePublishCommand(
 ): Promise<void> {
   const ids = platformIds(options.platform);
   if (ids.length !== 1) throw new Error('--platform is required exactly once');
+  const { publishBundle } = await import('../../domains/bundle/publish.js');
   const state = await publishBundle({
     projectRoot: projectRoot(options),
     name,
@@ -549,6 +412,7 @@ export async function bundleDistributeCommand(
 ): Promise<void> {
   const ids = platformIds(options.platform);
   if (ids.length === 0) throw new Error('At least one --platform is required');
+  const { distributeBundle } = await import('../../domains/bundle/distribute.js');
   const result = await distributeBundle({
     projectRoot: projectRoot(options),
     name,
@@ -561,44 +425,6 @@ export async function bundleDistributeCommand(
     preview: options.preview,
   });
   emit(result, options.json, formatDistributionText(result));
-}
-
-export async function bundleAuthoringPlanCommand(
-  name: string,
-  options: BundleCommandOptions = {},
-): Promise<void> {
-  const plan = await buildAuthoringPlan({
-    projectRoot: projectRoot(options),
-    name,
-    depth: options.depth ?? options.level ?? 'quick',
-  });
-  emit(
-    plan,
-    options.json,
-    [
-      `Authoring depth: ${plan.depth}`,
-      `Protocol hash: ${plan.protocolHash}`,
-      `Wave1 (parallel): ${plan.dag.wave1.join(', ')}`,
-      `Wave2 (after script): ${plan.dag.wave2.join(', ')}`,
-      `Barrier (review): ${plan.dag.barrier.join(', ')}`,
-      `Voters: ${plan.verify.voters}; lenses: ${plan.verify.lenses.join(', ')}`,
-    ].join('\n'),
-  );
-}
-
-export async function bundleAuthoringRecordCommand(
-  name: string,
-  options: BundleCommandOptions = {},
-): Promise<void> {
-  if (!options.lane) throw new Error('--lane is required');
-  if (!options.file) throw new Error('--file is required');
-  const state = await recordAuthoringLane({
-    projectRoot: projectRoot(options),
-    name,
-    lane: options.lane,
-    file: options.file,
-  });
-  emit(state, options.json, `Recorded authoring lane ${options.lane} for ${state.name}`);
 }
 
 export type { BundleCommandOptions };

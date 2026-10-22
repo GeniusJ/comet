@@ -1,0 +1,534 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import type { WorkflowRun } from '../../../domains/engine/runtime.js';
+import { createRuntimeAction } from '../../../domains/engine/runtime-action.js';
+import { createNativePortableState } from '../../../domains/comet-native/native-portable-state.js';
+import {
+  nativeSdkNextAction,
+  projectNativeSdkContinuation,
+} from '../../../domains/comet-native/native-sdk-continuation.js';
+import { archiveNativeSdkChange } from '../../../domains/comet-native/native-sdk-archive-command.js';
+
+const mocked = vi.hoisted(() => ({
+  inspect: vi.fn(),
+  execute: vi.fn(),
+  claim: vi.fn(),
+  retry: vi.fn(),
+  load: vi.fn(),
+}));
+vi.mock('../../../domains/comet-native/native-runtime-ownership.js', () => ({
+  inspectNativeSdkRun: mocked.inspect,
+  loadOwnedNativeSdkRuntime: mocked.load,
+}));
+vi.mock('../../../domains/comet-native/native-sdk-status.js', () => ({
+  inspectNativeSdkStatus: vi.fn(),
+  projectNativeSdkStatus: async (
+    options: { projectRoot: string },
+    inspected: { run: WorkflowRun; state: ReturnType<typeof createNativePortableState> },
+  ) => ({
+    run: { revision: inspected.run.revision, status: inspected.run.status },
+    ...(await projectNativeSdkContinuation({ ...inspected, projectRoot: options.projectRoot })),
+  }),
+}));
+
+const options = {
+  projectRoot: '/unused-boundary-fixture',
+  name: 'archive-boundary',
+  dryRun: false,
+  recover: false,
+  confirmed: false,
+};
+function archiveAction(
+  stepId = 'archive.prepare',
+  ref = 'native-archive-preflight',
+  type = 'call_tool',
+) {
+  return createRuntimeAction({
+    id: `${options.name}:${stepId}`,
+    runId: options.name,
+    stepId,
+    ref,
+    type,
+    input: {},
+  });
+}
+function inspection() {
+  // 仅构造编排边界的读取快照；这些异常/扩展状态不会写入 Runtime。
+  const state: ReturnType<typeof createNativePortableState> = {
+    ...createNativePortableState({
+      name: options.name,
+      language: 'en',
+      createdAt: '2026-10-07T00:00:00Z',
+      nextAction: 'prepare-shape-confirmation',
+    }),
+    phase: 'archive' as const,
+  };
+  state.loop = { ...state.loop, stage: 'archive-ready', next_action: null };
+  const run = {
+    runId: options.name,
+    revision: 7,
+    status: 'active',
+    workflow: { id: 'comet-native', version: '1', hash: 'fixture' },
+    state,
+    actions: [archiveAction()],
+    waits: [],
+    evidenceWaits: [],
+    ready: [],
+  } as unknown as WorkflowRun;
+  return { run, state, artifactRootRef: 'docs', application: null };
+}
+beforeEach(() => {
+  vi.clearAllMocks();
+  mocked.load.mockResolvedValue({
+    runtime: { execute: mocked.execute, claim: mocked.claim, retry: mocked.retry },
+    executors: [{ id: 'archive-executor', supports: () => true }],
+  });
+});
+
+describe('Native Archive command stop boundaries', () => {
+  it('rejects legacy Spec backup during dry-run', async () => {
+    mocked.inspect.mockResolvedValue(inspection());
+    await expect(
+      archiveNativeSdkChange({
+        ...options,
+        dryRun: true,
+        legacySpecBackup: '/outside/originals.json',
+      }),
+    ).rejects.toThrow('--legacy-spec-backup cannot be used with --dry-run');
+    expect(mocked.execute).not.toHaveBeenCalled();
+  });
+
+  it.each(['manual', 'unknown', 'pending-approval'] as const)(
+    'does not replay Archive preflight with %s evidence',
+    async (kind) => {
+      const current = inspection();
+      current.run.status = 'failed';
+      current.run.reason = 'ACTION_FAILED: archive.prepare';
+      current.run.actions[0] = {
+        ...current.run.actions[0],
+        status: kind === 'unknown' ? 'unknown' : 'failed',
+        retry: kind === 'manual' ? 'manual' : 'idempotent',
+      };
+      if (kind === 'pending-approval')
+        current.run.waits.push({
+          id: 'approval',
+          stepId: 'custom.approval',
+          status: 'pending',
+        } as never);
+      mocked.inspect.mockResolvedValue(current);
+      await archiveNativeSdkChange(options);
+      expect(mocked.retry).not.toHaveBeenCalled();
+      expect(mocked.execute).not.toHaveBeenCalled();
+    },
+  );
+
+  it('retries only a failed idempotent Archive preflight without claiming it never executed', async () => {
+    const current = inspection();
+    current.run.status = 'failed';
+    current.run.reason = 'ACTION_FAILED: archive.prepare';
+    current.run.actions[0] = { ...current.run.actions[0], status: 'failed', retry: 'idempotent' };
+    mocked.inspect.mockResolvedValue(current);
+    const retried = structuredClone(current.run);
+    retried.status = 'running';
+    retried.actions[0] = { ...retried.actions[0], status: 'pending', attempt: 2 };
+    mocked.retry.mockResolvedValue(retried);
+    const executed = structuredClone(retried);
+    executed.status = 'failed';
+    executed.actions[0].status = 'failed';
+    mocked.execute.mockResolvedValue(executed);
+    expect(
+      (await projectNativeSdkContinuation({ ...current, projectRoot: options.projectRoot }))
+        .continuation.commandArgs,
+    ).toEqual([
+      'comet',
+      'native',
+      'archive',
+      options.name,
+      '--project-root',
+      options.projectRoot,
+      '--json',
+    ]);
+    await archiveNativeSdkChange(options);
+    expect(mocked.retry).toHaveBeenCalledWith({
+      runId: current.run.runId,
+      expectedRevision: current.run.revision,
+      actionId: current.run.actions[0].id,
+      attempt: 1,
+    });
+    expect(mocked.execute).toHaveBeenCalledOnce();
+  });
+
+  it.each(['recorded-host-result', 'runtime-action'] as const)(
+    'never offers not-executed retry for %s',
+    async (kind) => {
+      const current = inspection();
+      const action = {
+        ...archiveAction(
+          'custom.original',
+          'custom-original',
+          kind === 'runtime-action' ? 'call_tool' : 'handoff',
+        ),
+        status: 'unknown' as const,
+        claim: { executorId: 'original-host', token: 'original-token' },
+      };
+      if (kind === 'recorded-host-result')
+        Object.assign(action, {
+          rejectedOutcomes: [
+            {
+              outcome: { attempt: action.attempt },
+              code: 'OUTCOME_REJECTED',
+              reason: 'Recorded result needs correction.',
+            },
+          ],
+        });
+      current.run.actions = [action];
+      const projected = await projectNativeSdkContinuation({
+        ...current,
+        projectRoot: options.projectRoot,
+      });
+      expect(projected.continuation.mode).toBe('reconcile');
+      expect(projected.activeActions![0]).not.toHaveProperty('retryRequest');
+      expect(projected.activeActions![0]).toHaveProperty('outcomeRequest');
+    },
+  );
+
+  it.each([
+    ['pending', 'execute', 'archive.prepare'],
+    ['decision', 'ask', undefined],
+    ['evidence', 'reconcile', undefined],
+    ['running', 'wait', undefined],
+    ['unknown', 'reconcile', undefined],
+    ['completed', 'done', undefined],
+    ['failed', 'reconcile', undefined],
+    ['parallel-builder', 'execute', 'archive.prepare'],
+    ['child-archive', 'execute', 'supervisor.child.archive'],
+  ] as const)(
+    'uses the same next-step decision for projection and scheduling (%s)',
+    async (kind, mode, stepId) => {
+      const current = inspection();
+      if (kind === 'decision')
+        current.run.waits.push({
+          id: 'approval',
+          stepId: 'custom.approval',
+          status: 'pending',
+          proposalHash: 'proposal',
+          proposal: { summary: 'Review this proposal.' },
+          choices: ['approved'],
+        } as never);
+      if (kind === 'evidence')
+        current.run.evidenceWaits!.push({
+          id: 'evidence',
+          stepId: 'custom.evidence',
+          kind: 'external',
+          status: 'pending',
+        } as never);
+      if (['running', 'unknown', 'parallel-builder'].includes(kind))
+        current.run.actions.push({
+          ...archiveAction('custom.work', 'custom-work', 'handoff'),
+          status: kind === 'unknown' ? 'unknown' : 'running',
+          claim: {
+            executorId: 'native-host',
+            sessionId: 'original-session',
+            token: 'original-token',
+          },
+        });
+      if (kind === 'parallel-builder' || kind === 'child-archive') {
+        current.state.phase = 'build';
+        current.state.loop.stage = 'building';
+      }
+      if (kind === 'child-archive')
+        current.run.actions.push(
+          archiveAction('supervisor.child.archive', 'native-supervisor-child-archive'),
+        );
+      if (kind === 'failed') current.run.status = 'failed';
+      if (kind === 'completed') {
+        current.run.status = 'completed';
+        current.state.status = 'done';
+        current.state.loop.stage = 'done';
+        current.state.archived = true;
+      }
+      const before = structuredClone(current);
+      const projected = await projectNativeSdkContinuation({
+        ...current,
+        projectRoot: options.projectRoot,
+      });
+      expect(projected.continuation.mode).toBe(mode);
+      expect(nativeSdkNextAction(current.run, current.state)?.stepId).toBe(stepId);
+      if (stepId) expect(projected).toMatchObject({ pendingAction: { stepId } });
+      if (['running', 'unknown', 'completed'].includes(kind))
+        expect(projected.continuation.commandArgs).toBeNull();
+      if (['failed', 'completed'].includes(kind))
+        expect(projected).not.toHaveProperty('pendingActions');
+      expect(current).toEqual(before);
+    },
+  );
+
+  it('waits on the original running Archive task instead of suggesting another Archive attempt', async () => {
+    const current = inspection();
+    const running = {
+      ...archiveAction('custom.archive.review', 'custom-review'),
+      status: 'running' as const,
+      claim: { executorId: 'archive-executor', token: 'original-token' },
+    };
+    current.run.actions.push(running);
+    mocked.inspect.mockResolvedValue(current);
+    expect((await archiveNativeSdkChange({ ...options, dryRun: true })).data).toMatchObject({
+      ready: false,
+    });
+    const result = await archiveNativeSdkChange(options);
+    expect(result.exitCode).toBe(73);
+    expect(mocked.execute).not.toHaveBeenCalled();
+    expect(mocked.claim).not.toHaveBeenCalled();
+    expect(mocked.retry).not.toHaveBeenCalled();
+    expect(result.data).toMatchObject({
+      completedActions: [],
+      activeActions: [
+        {
+          id: running.id,
+          status: 'running',
+          attempt: running.attempt,
+          inputHash: running.inputHash,
+          claim: running.claim,
+          outcomeRequest: {
+            operation: 'record-outcome',
+            runId: current.run.runId,
+            outcome: {
+              actionId: running.id,
+              attempt: running.attempt,
+              inputHash: running.inputHash,
+              claimToken: running.claim.token,
+            },
+          },
+        },
+      ],
+      continuation: {
+        mode: 'wait',
+        commandArgs: null,
+        userCommunication: { agentInstruction: expect.stringContaining('original claimed task') },
+      },
+    });
+    expect(current.run.actions.at(-1)).toEqual(running);
+  });
+
+  it('still exposes parallel pending Builder work outside Archive while another Action runs', async () => {
+    const current = inspection();
+    current.state.phase = 'build';
+    current.state.loop.stage = 'building';
+    current.run.actions = [
+      archiveAction('build.builder', 'native-builder', 'handoff'),
+      {
+        ...archiveAction('custom.builder', 'custom-builder', 'handoff'),
+        status: 'running',
+        claim: { executorId: 'builder-executor', token: 'original-token' },
+      },
+    ];
+    const projected = await projectNativeSdkContinuation({
+      ...current,
+      projectRoot: options.projectRoot,
+    });
+    expect(projected.continuation).toMatchObject({
+      action: 'builder-handoff',
+      commandArgs: [
+        'comet',
+        'runtime',
+        'dispatch',
+        '--application',
+        'native',
+        '--request',
+        '<request-json-file>',
+        '--project-root',
+        options.projectRoot,
+        '--json',
+      ],
+    });
+  });
+
+  it('uses next when multiple pending Actions prevent composite Archive advancement', async () => {
+    const current = inspection();
+    current.run.actions.push(archiveAction('custom.archive.review', 'custom-review'));
+    mocked.inspect.mockResolvedValue(current);
+    expect((await archiveNativeSdkChange({ ...options, dryRun: true })).data).toMatchObject({
+      ready: false,
+    });
+    const result = await archiveNativeSdkChange(options);
+    expect(result.exitCode).toBe(0);
+    expect(mocked.execute).not.toHaveBeenCalled();
+    expect(result.data).toMatchObject({
+      completedActions: [],
+      pendingAction: { stepId: 'archive.prepare' },
+      continuation: {
+        commandArgs: [
+          'comet',
+          'native',
+          'next',
+          options.name,
+          '--project-root',
+          options.projectRoot,
+
+          '--json',
+        ],
+      },
+    });
+  });
+
+  it.each(['call_tool', 'invoke_skill'])(
+    'leaves an unrecognized %s extension for its own continuation',
+    async (type) => {
+      const current = inspection();
+      current.run.actions = [archiveAction('custom.archive.review', 'custom-review', type)];
+      mocked.inspect.mockResolvedValue(current);
+      expect((await archiveNativeSdkChange({ ...options, dryRun: true })).data).toMatchObject({
+        ready: false,
+      });
+      const result = await archiveNativeSdkChange(options);
+      expect(result.exitCode).toBe(0);
+      expect(mocked.execute).not.toHaveBeenCalled();
+      if (type === 'call_tool')
+        expect(result.data).toMatchObject({
+          continuation: {
+            commandArgs: [
+              'comet',
+              'native',
+              'next',
+              options.name,
+              '--project-root',
+              options.projectRoot,
+              '--json',
+            ],
+          },
+        });
+      else
+        expect(result.data).toMatchObject({
+          continuation: { disposition: 'blocked', commandArgs: null },
+        });
+    },
+  );
+
+  it.each(['running', 'unknown', 'failed'] as const)(
+    'does not replay an original %s Action',
+    async (status) => {
+      const current = inspection();
+      current.run.actions[0] = {
+        ...current.run.actions[0],
+        status,
+        claim: { executorId: 'archive-executor', token: 'original-token' },
+      };
+      mocked.inspect.mockResolvedValue(current);
+      expect((await archiveNativeSdkChange({ ...options, dryRun: true })).data).toMatchObject({
+        ready: false,
+      });
+      expect(await archiveNativeSdkChange(options)).toMatchObject({
+        exitCode: 73,
+        error: { code: 'blocked' },
+      });
+      expect(mocked.execute).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(['decision', 'evidence'] as const)(
+    'preserves the full %s requirement even when another Archive Action is pending',
+    async (kind) => {
+      const current = inspection();
+      const wait = {
+        id: 'extension-wait',
+        stepId: 'custom.archive.approval',
+        status: 'pending',
+        proposalHash: 'original-proposal-hash',
+        proposal: { consequence: 'Keep the full proposal for the user.' },
+        choices: ['approved', 'rejected'],
+      };
+      if (kind === 'decision') current.run.waits = [wait as never];
+      else
+        current.run.evidenceWaits = [
+          {
+            id: 'evidence-wait',
+            stepId: 'custom.archive.evidence',
+            status: 'pending',
+            kind: 'external-evidence',
+          } as never,
+        ];
+      current.state.status = 'done';
+      current.state.archived = true;
+      current.state.loop = { ...current.state.loop, stage: 'done', next_action: null };
+      mocked.inspect.mockResolvedValue(current);
+      expect((await archiveNativeSdkChange({ ...options, dryRun: true })).data).toMatchObject({
+        ready: false,
+      });
+      const result = await archiveNativeSdkChange(options);
+      expect(mocked.execute).not.toHaveBeenCalled();
+      expect(result.data).toMatchObject({
+        continuation: {
+          disposition: kind === 'decision' ? 'await-user' : 'blocked',
+          requiresUserDecision: kind === 'decision',
+          commandArgs: null,
+        },
+      });
+      if (kind === 'decision')
+        expect(result.data).toMatchObject({
+          pendingWaits: [
+            {
+              ...wait,
+              decisionRequests: [
+                {
+                  operation: 'resolve-wait',
+                  expectedRevision: current.run.revision,
+                  waitId: wait.id,
+                  proposalHash: wait.proposalHash,
+                  choice: 'approved',
+                },
+                { choice: 'rejected' },
+              ],
+            },
+          ],
+        });
+      else
+        expect(result.data).toMatchObject({
+          pendingEvidenceWaits: [
+            {
+              ...current.run.evidenceWaits![0],
+              evidenceRequest: {
+                operation: 'record-evidence',
+                expectedRevision: current.run.revision,
+                evidenceId: 'evidence-wait',
+                kind: 'external-evidence',
+              },
+            },
+          ],
+        });
+    },
+  );
+
+  it('stops at an inserted extension after committing the preceding checkpoint', async () => {
+    const current = inspection();
+    mocked.inspect.mockResolvedValue(current);
+    const committed = {
+      ...current.run,
+      revision: 9,
+      actions: [
+        { ...current.run.actions[0], status: 'succeeded' },
+        archiveAction('custom.archive.review', 'custom-review'),
+      ],
+    };
+    mocked.execute.mockResolvedValue(committed);
+    const result = await archiveNativeSdkChange(options);
+    expect(mocked.execute).toHaveBeenCalledTimes(1);
+    expect(mocked.execute).toHaveBeenCalledWith(
+      expect.objectContaining({ expectedRevision: 7, actionId: current.run.actions[0].id }),
+    );
+    expect(result.data).toMatchObject({
+      completedActions: [{ stepId: 'archive.prepare', status: 'succeeded' }],
+      run: { revision: 9 },
+      continuation: {
+        commandArgs: [
+          'comet',
+          'native',
+          'next',
+          options.name,
+          '--project-root',
+          options.projectRoot,
+
+          '--json',
+        ],
+      },
+    });
+  });
+});

@@ -1,6 +1,11 @@
 import { createHash } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
+import {
+  assertChangeNotSdkOwned,
+  COMET_CHANGE_OWNER_SCHEMA,
+  registerCompatChangeOwner,
+} from '../workflow-contract/change-runtime-owner.js';
 import { Lexer } from 'marked';
 import { atomicWriteText } from './native-atomic-file.js';
 import {
@@ -90,10 +95,35 @@ export const NATIVE_PORTABLE_BRIEF_TEMPLATE = nativeBriefTemplate('en', { compac
 
 const NATIVE_CAPABILITY_ASSOCIATION_FILE = 'capability-association.yaml';
 
+const SHAPE_MARKDOWN_FIELDS = new Set([
+  'type',
+  'text',
+  'tokens',
+  'depth',
+  'ordered',
+  'start',
+  'loose',
+  'items',
+  'task',
+  'checked',
+  'href',
+  'title',
+  'tag',
+  'lang',
+  'codeBlockStyle',
+  'escaped',
+  'pre',
+  'block',
+  'inLink',
+  'inRawBlock',
+  'align',
+  'header',
+  'rows',
+]);
+
 function normalizedShapeArtifactText(text: string, markdown = false): string {
   if (markdown) {
-    // Bind Markdown structure and content, retaining code, HTML, lists and hard
-    // breaks. Lexer transport spelling and block spacing carry no semantics.
+    // 只绑定结构和内容；解析器新增的 autolink 等元数据不改变既有确认身份。
     const normalize = (value: unknown): unknown => {
       if (Array.isArray(value)) {
         return value.filter((entry) => entry?.type !== 'space').map(normalize);
@@ -102,7 +132,10 @@ function normalizedShapeArtifactText(text: string, markdown = false): string {
         const token = value as Record<string, unknown>;
         return Object.fromEntries(
           Object.entries(token)
-            .filter(([key]) => key !== 'raw' && !(key === 'text' && Array.isArray(token.tokens)))
+            .filter(
+              ([key]) =>
+                SHAPE_MARKDOWN_FIELDS.has(key) && !(key === 'text' && Array.isArray(token.tokens)),
+            )
             .map(([key, entry]) => [
               key,
               key === 'text' && token.type === 'text' && typeof entry === 'string'
@@ -295,6 +328,7 @@ export type NativePortableExpectedContinuationAction =
   | 'revise-implementation'
   | 'revise-requirements'
   | 'retry-verifier'
+  | 'continue-builder'
   | 'resolve-verifier-blocker'
   | 'disassociate-capability';
 
@@ -337,6 +371,7 @@ export async function createNativePortableChange(options: {
     async () => {
       if (!NAME_PATTERN.test(options.name))
         throw new Error(`Invalid Native change name: ${options.name}`);
+      await assertChangeNotSdkOwned(options.paths.projectRoot, 'native', options.name);
       if (
         options.initialProjectConfig &&
         (await readProjectConfig(options.paths.projectRoot)) === null
@@ -396,6 +431,12 @@ export async function createNativePortableChange(options: {
           }),
           { containedRoot: options.paths.runtimeDir },
         );
+        await registerCompatChangeOwner(options.paths.projectRoot, {
+          schema: COMET_CHANGE_OWNER_SCHEMA,
+          workflow: 'native',
+          change: options.name,
+          format: 'compat',
+        });
         return state;
       } catch (error) {
         if (createdRuntime) await fs.rm(runtimeDir, { recursive: true, force: true });

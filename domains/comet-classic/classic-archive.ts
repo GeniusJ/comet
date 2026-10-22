@@ -1,4 +1,14 @@
+import { assertClassicEditReviewsComplete } from './classic-edit-review.js';
+import { resolveClassicStateFile } from './classic-state-file.js';
+import { classicSdkEntryData } from './classic-sdk-output.js';
 import { createHash } from 'crypto';
+import { annotatedMarkdown } from './classic-archive-annotation.js';
+export { annotatedMarkdown } from './classic-archive-annotation.js';
+import { classicCommandProjectRoot, withProjectContext } from './classic-command-context.js';
+import { resolveClassicChangeRuntimeOwner } from './classic-runtime-ownership.js';
+import { classicSdkArchiveGuard } from './classic-sdk-guard.js';
+import { findClassicSdkWorkspace } from './classic-sdk-status.js';
+import { recoverClassicSdkArchive } from './classic-sdk-archive.js';
 import {
   classicArchivedRequirementsProblems,
   recordClassicArchiveRequirements,
@@ -30,13 +40,9 @@ import {
   writeArtifacts,
   writeCheckpoint,
   writePendingAction,
-} from '../../domains/engine/run-store.js';
+} from './classic-run-store.js';
 import type { Checkpoint, EngineAction, RunState } from '../../domains/engine/types.js';
-import {
-  assertClassicLayoutWritable,
-  classicProjectRelative,
-  discoverClassicProject,
-} from './classic-layout.js';
+import { assertClassicLayoutWritable, classicProjectRelative } from './classic-layout.js';
 import {
   classicProjectTargetExists,
   ensureClassicProjectDirectory,
@@ -200,40 +206,6 @@ async function verifyFinalArchiveIntegrity(projectRoot: string, archiveDir: stri
   }
 }
 
-function exactlyOneFinalNewline(markdown: string): string {
-  return `${markdown.replace(/\n+$/u, '')}\n`;
-}
-
-export function annotatedMarkdown(
-  original: string,
-  archiveName: string,
-  extraFields: string,
-): string {
-  const normalized = original.replace(/\r\n/gu, '\n');
-  const lines = normalized.split('\n');
-  const closingDelimiter = lines[0] === '---' ? lines.indexOf('---', 1) : -1;
-  const extraFieldName = extraFields.match(/^([^:\n]+):/u)?.[1]?.trim();
-
-  if (closingDelimiter !== -1) {
-    const frontmatter = lines.slice(1, closingDelimiter).filter((line) => {
-      const fieldName = line.match(/^([^:\n]+):/u)?.[1]?.trim();
-      if (fieldName === undefined) return true;
-      return fieldName !== 'archived-with' && fieldName !== extraFieldName;
-    });
-    frontmatter.push(`archived-with: ${archiveName}`);
-    if (extraFields) frontmatter.push(extraFields);
-    return exactlyOneFinalNewline(
-      ['---', ...frontmatter, '---', ...lines.slice(closingDelimiter + 1)].join('\n'),
-    );
-  }
-
-  const header = ['---', `archived-with: ${archiveName}`];
-  if (extraFields) header.push(extraFields);
-  if (extraFieldName !== 'status') header.push('status: final');
-  header.push('---');
-  return exactlyOneFinalNewline([...header, normalized].join('\n'));
-}
-
 async function appendRecoveryEvent(
   changeDir: string,
   run: RunState,
@@ -322,16 +294,54 @@ async function verifyMainSpecsClean(projectRoot: string, specsRoot: string): Pro
   if (found) throw new ArchiveFailure('');
 }
 
-export const classicArchiveCommand: ClassicCommandHandler = async (args) => {
-  if (args.length < 1 || args.length > 2 || (args[1] !== undefined && args[1] !== '--dry-run')) {
-    return { exitCode: 64, stderr: 'Usage: comet archive <change-name> [--dry-run]' };
+export const classicArchiveCommand: ClassicCommandHandler = withProjectContext(async (args) => {
+  if (
+    args.length < 1 ||
+    args.length > 2 ||
+    (args[1] !== undefined && !['--dry-run', '--recover'].includes(args[1]))
+  ) {
+    return { exitCode: 64, stderr: 'Usage: comet archive <change-name> [--dry-run|--recover]' };
   }
   const output = new ArchiveOutput();
   const change = args[0];
   const dryRun = args[1] === '--dry-run';
+  const recover = args[1] === '--recover';
   try {
     validateChangeName(change);
-    const projectRoot = await discoverClassicProject(process.cwd());
+    const projectRoot = classicCommandProjectRoot();
+    const localOwner = await resolveClassicChangeRuntimeOwner(projectRoot, change);
+    const sdkWorkspace =
+      localOwner?.format === 'compat' ? null : await findClassicSdkWorkspace(projectRoot, change);
+    if (sdkWorkspace) {
+      if (recover) {
+        const inspected = sdkWorkspace;
+        const continued = await recoverClassicSdkArchive(inspected.runtime, {
+          projectRoot: sdkWorkspace.projectRoot,
+          runId: inspected.run.runId,
+        });
+        return {
+          exitCode: 0,
+          data: {
+            ...(await classicSdkEntryData(change, {
+              run: continued,
+              projectRoot: sdkWorkspace.projectRoot,
+            })),
+            recoveredAction: inspected.run.actions.find((action) => action.status === 'unknown')
+              ?.id,
+            pendingAction: continued.actions.find((action) => action.status === 'pending')?.id,
+          },
+          stderr: `Classic SDK Archive recovered for ${change}; continue its delivery Action\n`,
+        };
+      }
+      return classicSdkArchiveGuard({
+        projectRoot: sdkWorkspace.projectRoot,
+        change,
+        apply: !dryRun,
+      });
+    }
+    if (recover) {
+      return { exitCode: 64, stderr: '--recover is only available for SDK-owned Classic changes' };
+    }
     const layout = await assertClassicLayoutWritable(projectRoot);
     const active = await inspectClassicActiveChangeDirectory(change, layout.projectRoot);
     const activeDir = active.directory;
@@ -349,10 +359,14 @@ export const classicArchiveCommand: ClassicCommandHandler = async (args) => {
     const changeDir = activeExists ? activeDir : recoveredArchive?.directory;
     if (
       !changeDir ||
-      !(await classicProjectTargetExists(layout.projectRoot, `${changeDir}/.comet.yaml`, {
-        label: `Classic change ${change} state`,
-        expected: 'file',
-      }))
+      !(await classicProjectTargetExists(
+        layout.projectRoot,
+        await resolveClassicStateFile(changeDir),
+        {
+          label: `Classic change ${change} state`,
+          expected: 'file',
+        },
+      ))
     ) {
       throw new ArchiveFailure(red(`FATAL: .comet.yaml not found in ${activeRef}/`));
     }
@@ -365,6 +379,7 @@ export const classicArchiveCommand: ClassicCommandHandler = async (args) => {
       throw new ArchiveFailure(red('FATAL: archive requires Classic state'));
     }
     const classic = projection.classic;
+    if (!classic.archived) await assertClassicEditReviewsComplete(projectRoot, change, classic);
     const designDoc = classic.designDoc;
     const planPath = classic.plan;
 
@@ -406,6 +421,7 @@ export const classicArchiveCommand: ClassicCommandHandler = async (args) => {
       const actionId = `classic-archive:${change}`;
       const recovering = await withClassicStateLock(changeDir, async () => {
         const runtime = await ensureClassicRuntimeRun(changeDir);
+        await assertClassicEditReviewsComplete(projectRoot, change, runtime.classic);
         if (runtime.classic.phase !== 'archive' || runtime.classic.verifyResult !== 'pass') {
           throw new ArchiveFailure(
             red('FATAL: Archive state changed before preparing the pending action.'),
@@ -706,4 +722,4 @@ export const classicArchiveCommand: ClassicCommandHandler = async (args) => {
     }
     throw error;
   }
-};
+});

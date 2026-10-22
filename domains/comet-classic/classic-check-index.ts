@@ -1,5 +1,6 @@
+import path from 'node:path';
 import { promises as fs } from 'node:fs';
-import { readTrajectory } from '../engine/run-store.js';
+import { readTrajectory, resolveClassicRunReadPath } from './classic-run-store.js';
 import type { TrajectoryEvent } from '../engine/types.js';
 import { inspectProtectedProjectPath } from '../workflow-contract/protected-project-path.js';
 
@@ -14,10 +15,15 @@ const indexes = new Map<string, { stamp: string; index: CheckIndex }>();
 const MAX_INDEXES = 16;
 
 async function identity(changeDir: string, ref: string) {
-  const target = await inspectProtectedProjectPath(changeDir, ref, {
-    label: 'Classic check trajectory',
-    expected: 'file',
-  });
+  const resolved = await resolveClassicRunReadPath(changeDir, ref);
+  const target = await inspectProtectedProjectPath(
+    resolved.inspectionRoot,
+    path.relative(resolved.inspectionRoot, resolved.target).replaceAll('\\', '/'),
+    {
+      label: 'Classic check trajectory',
+      expected: 'file',
+    },
+  );
   if (!target.exists) return { target: target.target, stamp: 'missing', cacheable: false };
   const stat = await fs.lstat(target.target, { bigint: true });
   if (!stat.isFile() || stat.isSymbolicLink()) throw new Error('Classic check trajectory changed');

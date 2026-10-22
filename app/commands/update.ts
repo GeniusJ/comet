@@ -91,6 +91,8 @@ const OFFICIAL_REGISTRY = 'https://registry.npmjs.org';
 
 interface UpdateOptions {
   json?: boolean;
+  yes?: boolean;
+  targetVersion?: string;
   language?: string;
   classicLayout?: 'legacy' | 'docs';
   scope?: InstallScope;
@@ -106,6 +108,7 @@ interface UpdateOptions {
   npmSkipReason?: string;
   skipPackageSelfUpdate?: boolean;
   platform?: string;
+  customPlatform?: boolean;
 }
 
 async function refreshGlobalWorkflowConfig(
@@ -157,6 +160,7 @@ interface CapturedProcessResult {
 interface CapturedProcessLimits {
   timeoutMs: number;
   maxOutputBytes: number;
+  streamOutput?: boolean;
 }
 
 const CANDIDATE_COMMAND_LIMITS: CapturedProcessLimits = {
@@ -348,7 +352,7 @@ async function resolveClassicArtifactLayout(
   const hasLegacyRoot = await fileExists(path.join(projectPath, 'openspec'));
   const hasDocsRoot = await fileExists(path.join(projectPath, 'docs', 'openspec'));
   if (hasLegacyRoot && hasDocsRoot) {
-    if (options.json) {
+    if (options.json || options.yes) {
       throw new Error(t(lang, 'classicLayoutChoiceRequired'));
     }
     return select({
@@ -574,7 +578,7 @@ function formatSkillUpdateCommand(
 
 async function selectInstallMode(options: UpdateOptions, lang: string): Promise<InstallMode> {
   if (options.installMode) return options.installMode;
-  if (options.json) return 'copy';
+  if (options.json || options.yes) return 'copy';
 
   return select({
     message: t(lang, 'installMode'),
@@ -651,6 +655,9 @@ function runCapturedProcess(
     };
     const capture = (target: Buffer[], chunk: unknown) => {
       const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
+      if (limits?.streamOutput) {
+        (target === stderrChunks ? process.stderr : process.stdout).write(bytes);
+      }
       if (!limits) {
         target.push(bytes);
         return;
@@ -981,9 +988,13 @@ async function installCometNpmVersion(
   scope: InstallScope,
   projectPath: string,
   version: string,
+  streamOutput = false,
 ): Promise<CapturedProcessResult> {
   const cwd = scope === 'global' ? process.cwd() : projectPath;
-  return runNpmCli(npmCliPath, buildNpmUpdateArgs(scope, version), cwd, NPM_MUTATION_LIMITS);
+  return runNpmCli(npmCliPath, buildNpmUpdateArgs(scope, version), cwd, {
+    ...NPM_MUTATION_LIMITS,
+    streamOutput,
+  });
 }
 
 async function updateCometNpmPackage(
@@ -993,6 +1004,7 @@ async function updateCometNpmPackage(
   targetVersion: string,
   installedPackage: InstalledCometPackage,
   log: (message: string) => void,
+  streamOutput = false,
 ): Promise<{ success: boolean; exitCode: number | null; reason?: string }> {
   const validation = await validateRegistryCometPackage(targetVersion, npmCliPath);
   if (!validation.success) {
@@ -1014,7 +1026,13 @@ async function updateCometNpmPackage(
       };
     }
   }
-  const install = await installCometNpmVersion(npmCliPath, scope, projectPath, targetVersion);
+  const install = await installCometNpmVersion(
+    npmCliPath,
+    scope,
+    projectPath,
+    targetVersion,
+    streamOutput,
+  );
   let installReason = install.reason;
   if (install.success) {
     try {
@@ -1035,6 +1053,7 @@ async function updateCometNpmPackage(
     scope,
     projectPath,
     installedPackage.version,
+    streamOutput,
   );
   let rollbackReason: string | null = rollback.reason ?? null;
   if (rollback.success) {
@@ -1273,7 +1292,9 @@ async function updateSingleProject(
       npmReason = `unable to inspect installed Comet package: ${(error as Error).message}`;
     }
 
-    const registryVersion = installedPackage ? await getLatestVersion() : null;
+    const registryVersion = installedPackage
+      ? (options.targetVersion ?? (await getLatestVersion()))
+      : null;
     if (installedPackage && registryVersion === null) {
       npmStatus = 'failed';
       npmReason = 'unable to resolve the latest Comet version from the npm registry';
@@ -1297,6 +1318,7 @@ async function updateSingleProject(
           plan.version,
           installedPackage,
           log,
+          options.yes === true && !options.json,
         );
         npmExitCode = npmResult.exitCode;
         npmReason = npmResult.reason;
@@ -1341,7 +1363,9 @@ async function updateSingleProject(
                     projectConfigDocument?.classic?.language,
                 )
               : 'en');
-          const target = resolvePlatformTarget(options.platform!, scope);
+          const target = resolvePlatformTarget(options.platform!, scope, {
+            allowCustom: options.customPlatform,
+          });
           return {
             scope,
             platform: target.platform,
@@ -1381,7 +1405,7 @@ async function updateSingleProject(
       true,
       classicProject,
     );
-    if (nativeProject) await ensureCometProjectGitignore(projectPath);
+    if (nativeProject || classicProject) await ensureCometProjectGitignore(projectPath);
     log(`  ${t(lang, 'configMerged')}`);
   };
 
@@ -1989,7 +2013,7 @@ async function updateSingleProject(
         true,
         classicProject,
       );
-      if (nativeProject) await ensureCometProjectGitignore(configRoot);
+      if (nativeProject || classicProject) await ensureCometProjectGitignore(configRoot);
     }
     if (scope === 'project' && classicLayoutInitializationPermit) {
       await completeClassicLayoutInitialization(projectPath, classicLayoutInitializationPermit);
@@ -2011,7 +2035,8 @@ async function updateSingleProject(
   } else if (codegraphAlreadyIndexed) {
     log('\n  CodeGraph: skipped (existing .codegraph index detected)');
   } else {
-    const shouldInstallCodegraph = options.skipNpm ? false : await promptCodegraphInstall(lang);
+    const shouldInstallCodegraph =
+      options.skipNpm || options.yes ? false : await promptCodegraphInstall(lang);
 
     if (shouldInstallCodegraph) {
       log(`\n  ${t(lang, 'installingCG')}`);
@@ -2150,13 +2175,15 @@ async function updateAllIndexedProjects(
       log(`    - ${project.projectPath}`);
       log(`      ${project.targets.map((target) => target.platform.name).join(', ')}`);
     }
-    const confirmed = await select({
-      message: t(lang, 'updateAllProjectsPrompt'),
-      choices: [
-        { name: t(lang, 'updateAllProjectsYes'), value: true },
-        { name: t(lang, 'updateAllProjectsNo'), value: false },
-      ],
-    });
+    const confirmed =
+      options.yes ||
+      (await select({
+        message: t(lang, 'updateAllProjectsPrompt'),
+        choices: [
+          { name: t(lang, 'updateAllProjectsYes'), value: true },
+          { name: t(lang, 'updateAllProjectsNo'), value: false },
+        ],
+      }));
     if (!confirmed) {
       log(`\n  ${t(lang, 'cancelled')}\n`);
       return { status: 'complete' };
@@ -2315,8 +2342,17 @@ export async function updateCommand(
   const projectPath = path.resolve(targetPath);
   const log = options.json ? () => undefined : console.log;
   const lang = options.language ?? 'en';
+  if (options.customPlatform && !options.platform)
+    throw new Error('--custom-platform requires --platform');
+  if (options.platform)
+    resolvePlatformTarget(options.platform, options.scope ?? 'project', {
+      allowCustom: options.customPlatform,
+    });
 
   assertProjectScopeOptions(options);
+  if (options.targetVersion !== undefined && !parseSemver(options.targetVersion)) {
+    throw new Error('--target-version must be a valid semantic version');
+  }
   if (options.platform && options.allProjects) {
     throw new Error('--platform cannot be combined with --all-projects');
   }

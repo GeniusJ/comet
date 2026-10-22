@@ -1,9 +1,12 @@
+import { resolveWorkspaceRuntimeRoot } from '../../../domains/workflow-contract/workspace-runtime.js';
 import { spawnSync } from 'child_process';
 import { promises as fs } from 'fs';
 import os from 'os';
 import path from 'path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
+import { classicStateCommand } from '../../../domains/comet-classic/classic-state-command.js';
+import { runNativeCli } from '../../../domains/comet-native/native-cli.js';
 import {
   createNativeChange,
   writeNativeChange,
@@ -70,6 +73,121 @@ describe('packaged Hook Router worktree isolation', () => {
     await writeNativeChange(paths, change);
     await selectNativeChange(paths, name);
   }
+
+  it.each(['project', 'global'] as const)(
+    'blocks direct Runtime writes through the %s Router with no selected change',
+    async (scope) => {
+      const routerArgs = [
+        router,
+        '--platform',
+        'codex',
+        ...(scope === 'project' ? ['--project-root', primary] : []),
+      ];
+      const runtimeRoot = await resolveWorkspaceRuntimeRoot(primary);
+      await fs.rm(path.join(primary, '.comet'), { recursive: true, force: true });
+      for (const ref of [
+        'native/changes/example/state.json',
+        'sdk-runs/classic/run.json',
+        'applications/custom/run.json',
+      ]) {
+        const result = spawnSync(process.execPath, routerArgs, {
+          cwd: primary,
+          input: JSON.stringify({
+            tool_name: 'Write',
+            cwd: primary,
+            tool_input: { file_path: path.join(runtimeRoot, ref) },
+          }),
+          encoding: 'utf8',
+          timeout: 20_000,
+        });
+        expect(result.status, result.stderr).toBe(2);
+        expect(result.stderr).toContain('Runtime-owned');
+      }
+      const linkedRoot = await resolveWorkspaceRuntimeRoot(secondary);
+      await fs.rm(path.join(secondary, '.comet'), { recursive: true, force: true });
+      const linked = spawnSync(process.execPath, routerArgs, {
+        cwd: primary,
+        input: JSON.stringify({
+          tool_name: 'Write',
+          cwd: secondary,
+          tool_input: { file_path: path.join(linkedRoot, 'native/state.json') },
+        }),
+        encoding: 'utf8',
+        timeout: 20_000,
+      });
+      expect(linked.status, linked.stderr).toBe(2);
+      expect(linked.stderr).toContain('Runtime-owned');
+    },
+  );
+
+  it.each([
+    ['primary', 'runtime'],
+    ['primary', 'project-subdirectory'],
+    ['linked', 'runtime'],
+    ['linked', 'project-subdirectory'],
+  ])(
+    'blocks relative Runtime writes from the %s %s cwd without selection',
+    async (owner, cwdKind) => {
+      const projectRoot = owner === 'primary' ? primary : secondary;
+      const runtimeRoot = await resolveWorkspaceRuntimeRoot(projectRoot);
+      const cwd = cwdKind === 'runtime' ? runtimeRoot : path.join(projectRoot, 'nested');
+      await fs.mkdir(cwd, { recursive: true });
+      const result = spawnSync(
+        process.execPath,
+        [router, '--platform', 'codex', '--project-root', primary],
+        {
+          cwd: primary,
+          input: JSON.stringify({
+            tool_name: 'Write',
+            cwd,
+            tool_input: {
+              file_path: path.relative(
+                cwd,
+                path.join(runtimeRoot, 'native/changes/example/checkpoint.json'),
+              ),
+            },
+          }),
+          encoding: 'utf8',
+          timeout: 20_000,
+        },
+      );
+      expect(result.status, result.stderr).toBe(2);
+      expect(result.stderr).toContain('Runtime-owned');
+    },
+  );
+
+  it('keeps the explicit relative base when Runtime belongs to a nested linked worktree', async () => {
+    const nestedSecondary = path.join(primary, 'nested', 'worktree');
+    await fs.mkdir(path.dirname(nestedSecondary), { recursive: true });
+    const moved = spawnSync(
+      'git',
+      ['-C', primary, 'worktree', 'move', secondary, nestedSecondary],
+      {
+        encoding: 'utf8',
+        timeout: 20_000,
+      },
+    );
+    expect(moved.status, moved.stderr).toBe(0);
+    secondary = nestedSecondary;
+    const runtimeRoot = await resolveWorkspaceRuntimeRoot(secondary);
+    const result = spawnSync(
+      process.execPath,
+      [router, '--platform', 'codex', '--project-root', primary],
+      {
+        cwd: primary,
+        input: JSON.stringify({
+          tool_name: 'Write',
+          tool_input: {
+            file_path: path.relative(primary, path.join(runtimeRoot, 'native/checkpoint.json')),
+          },
+        }),
+        encoding: 'utf8',
+        timeout: 20_000,
+      },
+    );
+    expect(result.status, result.stderr).toBe(2);
+    expect(result.stderr).toContain('Runtime-owned');
+  });
 
   it('uses the linked worktree state even when the installed command still names the primary root', async () => {
     await configureChange(primary, 'primary-shape', 'shape');
@@ -164,6 +282,65 @@ describe('packaged Hook Router worktree isolation', () => {
     expect(result.status, result.stderr).toBe(2);
     expect(result.stderr).toContain('raw-patch-shape');
     expect(result.stderr).toContain('only allowed in Build');
+  });
+
+  it('routes a linked worktree SDK Native change through the packaged Hook', async () => {
+    const created = await runNativeCli([
+      'new',
+      'sdk-linked',
+      '--runtime',
+      'sdk',
+      '--project-root',
+      secondary,
+      '--json',
+    ]);
+    expect(created.exitCode, created.stderr).toBe(0);
+    const payload = JSON.stringify({
+      tool_name: 'Write',
+      cwd: secondary,
+      tool_input: { file_path: 'src/app.ts' },
+    });
+
+    const result = spawnSync(
+      process.execPath,
+      [router, '--platform', 'codex', '--project-root', primary],
+      { cwd: primary, input: payload, encoding: 'utf8', timeout: 20_000 },
+    );
+
+    expect(result.status, result.stderr).toBe(2);
+    expect(result.stderr).toContain('sdk-linked');
+  });
+
+  it('routes a linked worktree SDK Classic change through the packaged Hook', async () => {
+    await fs.mkdir(path.join(secondary, '.comet'), { recursive: true });
+    await fs.writeFile(
+      path.join(secondary, '.comet', 'config.yaml'),
+      'schema: comet.project.v1\ndefault_workflow: classic\nworkflows: [classic]\nclassic:\n  artifact_layout: legacy\n',
+    );
+    await fs.mkdir(path.join(secondary, 'openspec', 'changes'), { recursive: true });
+    const created = await classicStateCommand(
+      ['init', 'sdk-classic-linked', 'hotfix', '--runtime', 'sdk', '--isolation', 'current'],
+      { json: false, invocationCwd: secondary, projectRoot: secondary },
+    );
+    expect(created.exitCode, created.stderr).toBe(0);
+
+    const result = spawnSync(
+      process.execPath,
+      [router, '--platform', 'codex', '--project-root', primary],
+      {
+        cwd: primary,
+        input: JSON.stringify({
+          tool_name: 'Write',
+          cwd: secondary,
+          tool_input: { file_path: 'src/app.ts' },
+        }),
+        encoding: 'utf8',
+        timeout: 20_000,
+      },
+    );
+
+    expect(result.status, result.stderr).toBe(2);
+    expect(result.stderr).toContain('sdk-classic-linked');
   });
 
   it('executes Native artifact attribution and recovery through the packaged Router', async () => {

@@ -1,6 +1,7 @@
 """Tests for running the canonical Comet task set with Native workflow semantics."""
 
 from pathlib import Path
+import json
 
 import pytest
 import yaml
@@ -260,6 +261,27 @@ def test_validate_native_workflow_accepts_expected_active_hard_stop(tmp_path: Pa
     assert "native_loop" in passed
 
 
+@pytest.mark.parametrize("entry", ["valid-fence", "invalid-file", "foreign-schema", "change-local"])
+def test_native_runtime_fence_isolation(tmp_path: Path, entry: str):
+    _write_native_archive(tmp_path)
+    runtime = tmp_path / ".comet/runtime"
+    fence = {
+        "schema": "comet.workspace-runtime-migration.v1",
+        "workspaceId": "a" * 64,
+        "source": "/workspace/.comet/runtime",
+        "target": "/opt/comet-eval-data/workspaces/" + "a" * 64 + "/runtime",
+        "kind": "directory",
+    }
+    if entry == "foreign-schema":
+        fence["schema"] = "not-a-comet-fence"
+    runtime.write_text("not json" if entry == "invalid-file" else json.dumps(fence), encoding="utf-8")
+    if entry == "change-local":
+        (tmp_path / "docs/comet/archive/2026-07-16-fix-median/runtime").mkdir()
+    passed, failed = validate_native_workflow(tmp_path, {"events": {"skills_invoked": ["comet-native"]}})
+    assert ("native_isolation" in passed) == (entry == "valid-fence")
+    assert any(item.startswith("native_isolation:") for item in failed) == (entry != "valid-fence")
+
+
 def test_validate_native_workflow_rejects_classic_artifacts_and_active_change(tmp_path: Path):
     _write_native_archive(tmp_path)
     (tmp_path / "openspec").mkdir()
@@ -285,6 +307,47 @@ def test_validate_native_workflow_rejects_external_skill_invocation(tmp_path: Pa
     assert any(
         item == "native_skill_invocation: unexpected Skills were invoked: comet" for item in failed
     )
+
+
+def test_validate_native_workflow_uses_explicit_skill_call_over_path_mention(tmp_path: Path):
+    _write_native_archive(tmp_path)
+
+    passed, failed = validate_native_workflow(
+        tmp_path,
+        {
+            "events": {
+                "skills_invoked": ["comet-native", "comet-classic"],
+                "skill_invocations": ["comet-native"],
+                "files_read": [],
+                "commands_run": ["test -e .claude/skills/comet-classic"],
+            }
+        },
+    )
+
+    assert "native_skill_invocation" in passed
+    assert not any(item.startswith("native_skill_invocation:") for item in failed)
+
+
+def test_validate_native_workflow_rejects_manual_sdk_state_deletion(tmp_path: Path):
+    _write_native_archive(tmp_path)
+
+    passed, failed = validate_native_workflow(
+        tmp_path,
+        {
+            "treatment_name": "COMET_NATIVE_SDK_CURRENT",
+            "events": {
+                "skills_invoked": ["comet-native"],
+                "skill_invocations": ["comet-native"],
+                "commands_run": [
+                    "cd /workspace\nrm -rf .comet/runtime/sdk-runs/native/old-run\n"
+                    "rm -rf docs/comet/changes/sentence-counting"
+                ],
+            },
+        },
+    )
+
+    assert "native_runtime_ownership" not in passed
+    assert any(item.startswith("native_runtime_ownership:") for item in failed)
 
 
 def test_validate_native_workflow_does_not_infer_custom_agent_skill_invocation(
@@ -356,6 +419,17 @@ def test_adapt_prompt_for_native_maps_legacy_workflow_words_without_changing_bus
     assert adapted.endswith(original)
 
 
+def test_adapt_prompt_for_current_native_sdk_requires_runtime_dispatch():
+    original = "Add sentence counting and archive the change."
+
+    adapted = adapt_prompt_for_native(original, "COMET_NATIVE_SDK_CURRENT")
+
+    assert adapted.startswith("[COMET NATIVE SDK TREATMENT]")
+    assert "comet runtime dispatch --application native" in adapted
+    assert "beta17" not in adapted
+    assert adapted.endswith(original)
+
+
 @pytest.mark.parametrize(
     ("treatment", "mode"),
     [
@@ -394,6 +468,7 @@ def test_split_completion_classifies_native_checks_as_workflow():
             "native_skill_invocation",
             "native_artifacts",
             "native_loop",
+            "sdk_run",
         ],
         [
             "business_rule: failed",
@@ -412,6 +487,7 @@ def test_split_completion_classifies_native_checks_as_workflow():
                 "native_skill_invocation",
                 "native_artifacts",
                 "native_loop",
+                "sdk_run",
             ],
             "failed": [
                 "native_state: incomplete",
@@ -431,7 +507,7 @@ def test_control_filter_removes_classic_and_native_workflow_checks():
     passed, failed = filter_control_workflow_checks(
         "comet-workflow",
         "CONTROL",
-        ["sentence_feature", "workflow_phases: 5/5", "native_state"],
+        ["sentence_feature", "workflow_phases: 5/5", "native_state", "sdk_run"],
         [
             "business_rule: failed",
             "openspec_artifacts: missing",

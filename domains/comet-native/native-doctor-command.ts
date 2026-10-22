@@ -1,4 +1,40 @@
+import { closeNativeSdkHistory } from './native-sdk-history.js';
+import { readWorkflowApplicationRun } from '../workflow-application/index.js';
+import type { RuntimeStoppedAction } from '../engine/runtime.js';
+import { settleNativeSdkCancellation } from './native-sdk-cancellation-cleanup.js';
+import { settleNativeSdkCompletion } from './native-sdk-completion-cleanup.js';
 import { promises as fs } from 'node:fs';
+import {
+  readChangeRuntimeOwner,
+  readSdkChangeOwner,
+  registerSdkChangeOwner,
+  COMET_CHANGE_OWNER_SCHEMA,
+  listSdkChangeNames,
+  listSdkChangeOwnerRecoveryNames,
+  recoverSdkChangeOwnerToActive,
+} from '../workflow-contract/change-runtime-owner.js';
+import {
+  inspectNativeSdkRun,
+  inspectNativeSdkDefinitionUpgrade,
+  resolveNativeSdkCommandRoot,
+  loadOwnedNativeSdkRuntime,
+} from './native-runtime-ownership.js';
+import { inspectPristineNativeSdkChange, restoreNativeSdkChange } from './native-sdk-create.js';
+import {
+  hasNativeManagedRunMarker,
+  hasNativePortableRunCheckpoint,
+  readNativeSdkRunRecord,
+  findNativeSdkArchivedStateFile,
+  isNativeSdkRunRecoveryRequiredError,
+} from './native-sdk-state-store.js';
+import { inspectNativeSdkCheckExecutions } from './native-sdk-check-execution.js';
+import { recoverNativeSdkChecks, nativeSdkCompletedCheckInputDrift } from './native-sdk-checks.js';
+import { projectNativeSdkStatus } from './native-sdk-status.js';
+import {
+  inspectNativeSdkProjectionLock,
+  repairNativeSdkProjectionLock,
+} from './native-sdk-projection-lock.js';
+import { inspectNativeSdkCancellation } from './native-sdk-cancellation.js';
 
 /**
  * A dispatched Verifier that never confirmed startup is presumed lost after
@@ -16,7 +52,11 @@ import { doctorNativeProject } from './native-doctor.js';
 import { inspectNativeChildren, readNativeChildrenContract } from './native-children.js';
 import { archiveNativePortableChange } from './native-portable-archive.js';
 import { nativePortableContinuation } from './native-portable-continuation.js';
-import { compareAndSwapNativePortableState } from './native-portable-state.js';
+import {
+  compareAndSwapNativePortableState,
+  parseNativePortableState,
+  readNativePortableState,
+} from './native-portable-state.js';
 import { recordNativeVerifierExecutionError } from './native-loop-runtime.js';
 import {
   hasIncompleteNativePortableMigration,
@@ -29,6 +69,10 @@ import {
 import { recoverNativePortableChange } from './native-portable-recovery.js';
 import { readNativeLocalExecution } from './native-local-execution.js';
 import { inspectNativePortableCheckExecution } from './native-portable-checks.js';
+import {
+  inspectNativeCheckStopEvidenceTargets,
+  recoverNativeChecksWithStopEvidence,
+} from './native-check-stop-evidence.js';
 import { inspectNativeSupervisorOverlay } from './native-supervisor-overlay.js';
 import {
   activeNativeSupervisorTaskNames,
@@ -101,6 +145,9 @@ async function portableCheckExecutionFinding(
   if (local.execution.status !== 'running') return null;
   const liveness = await inspectNativePortableCheckExecution(local);
   if (liveness === 'running') return null;
+  const unconfirmedProcess =
+    liveness === 'unknown' &&
+    local.checks.some((check) => check.status === 'running' || check.activeProcess != null);
   const message =
     liveness === 'orphaned'
       ? `Native Runtime check operation ${local.execution.operationId} has no live owner or active check process`
@@ -108,9 +155,11 @@ async function portableCheckExecutionFinding(
   return {
     severity: 'error',
     code: 'portable-check-execution-stuck',
-    message: `${name}: ${message}; run comet native doctor ${name} --repair to recover it`,
+    message: unconfirmedProcess
+      ? `${name}: Native Runtime check operation ${local.execution.operationId} process tree has not been confirmed stopped; preserve its execution record. Doctor --repair cannot safely recover this check without process-tree termination evidence.`
+      : `${name}: ${message}; run comet native doctor ${name} --repair to recover it`,
     path: nativeLocalExecutionFile(paths, name),
-    repair: 'recover',
+    ...(unconfirmedProcess ? {} : { repair: 'recover' as const }),
   };
 }
 
@@ -407,6 +456,7 @@ function unmetReadySupervisorDependencyFinding(
 async function inspectPortableTransactions(
   paths: NativeProjectPaths,
   name?: string,
+  excludedNames?: ReadonlySet<string>,
 ): Promise<{
   transactions: NativePortableTransaction[];
   findings: NativeDoctorFinding[];
@@ -415,7 +465,7 @@ async function inspectPortableTransactions(
   const findings: NativeDoctorFinding[] = [];
   for (const entryName of await listNativePortableTransactionEntryNames(paths)) {
     const ref = describeNativePortableTransactionEntry(entryName)!;
-    if (name && ref.change !== name) continue;
+    if ((name && ref.change !== name) || excludedNames?.has(ref.change)) continue;
     const file = path.join(paths.transactionsDir, entryName);
     try {
       const transaction = await readNativePortableTransactionEntry(paths, entryName);
@@ -458,6 +508,10 @@ export async function nativeDoctorCommand(
   projectRoot: string,
 ): Promise<DispatchResult> {
   const repair = takeFlag(args, '--repair');
+  const migrateHistory = takeFlag(args, '--migrate-history');
+  const confirmed = takeFlag(args, '--confirmed');
+  const lockToken = takeOption(args, '--lock-token');
+  const stoppedActionsFile = takeOption(args, '--stopped-actions');
   const recoveryStrategy = takeOption(args, '--strategy');
   if (
     recoveryStrategy !== undefined &&
@@ -468,7 +522,488 @@ export async function nativeDoctorCommand(
   }
   const name = args[0]?.startsWith('--') ? undefined : args.shift();
   assertNoArguments(args);
+  if (migrateHistory) {
+    if (
+      repair ||
+      confirmed ||
+      lockToken !== undefined ||
+      stoppedActionsFile !== undefined ||
+      recoveryStrategy !== undefined
+    )
+      throw new NativeUsageError(
+        '--migrate-history 不能与修复、停止证据或事务选项合用；先完成 doctor 修复，再迁移已结束的任务。',
+      );
+    const recoveryNames = await listSdkChangeOwnerRecoveryNames(projectRoot, 'native');
+    const names = name ? [name] : recoveryNames;
+    const migrated: string[] = [];
+    const active: string[] = [];
+    const findings: Array<{ change: string; message: string }> = [];
+    const startedAt = Date.now();
+    let reportedAt = startedAt;
+    let processed = 0;
+    const reportProgress = (finished = false) => {
+      const now = Date.now();
+      if (!finished && processed > 0 && now - reportedAt < 5_000) return;
+      reportedAt = now;
+      try {
+        process.stderr.write(
+          `[Comet] Native 历史迁移${finished ? '结束' : '进度'}：${processed}/${names.length} 项，已封存 ${migrated.length}，保留活动 ${active.length}，失败 ${findings.length}，已用 ${Math.floor((now - startedAt) / 1_000)} 秒\n`,
+        );
+      } catch {
+        // 诊断输出失败不能改变迁移结果或留下未处理的任务。
+      }
+    };
+    reportProgress();
+    for (const change of names) {
+      try {
+        // 仅显式迁移可以收尾同身份 owner 双份；普通查看始终报告冲突。
+        let migrationOwner;
+        try {
+          migrationOwner = await readChangeRuntimeOwner(projectRoot, 'native', change, {
+            readOnly: true,
+          });
+        } catch {
+          migrationOwner = await recoverSdkChangeOwnerToActive(projectRoot, 'native', change);
+        }
+        if (
+          migrationOwner &&
+          (migrationOwner.format !== 'sdk' || migrationOwner.application !== 'native')
+        ) {
+          active.push(change);
+          continue;
+        }
+        const commandRoot = await resolveNativeSdkCommandRoot(projectRoot, change, {
+          readOnly: true,
+        });
+        const inspection = await inspectNativeSdkRun(commandRoot, change, { readOnly: true });
+        if (
+          await closeNativeSdkHistory({
+            projectRoot: commandRoot,
+            run: inspection.run,
+            recover: true,
+          })
+        )
+          migrated.push(change);
+        else active.push(change);
+      } catch (error) {
+        findings.push({ change, message: error instanceof Error ? error.message : String(error) });
+      } finally {
+        processed += 1;
+        if (processed < names.length) reportProgress();
+      }
+    }
+    reportProgress(true);
+    const data = {
+      healthy: findings.length === 0,
+      migrated,
+      active,
+      findings,
+      message:
+        '已结束且完成清理的内置 Native Run 已移入历史分区，文档、checkpoint 和恢复材料均保留。未完成或无法验证的任务仍保持活动。迁移中断可重跑；旧版本 Runtime 无法写入新格式，请同步升级 CLI 与平台 Hook。普通只读命令不会执行迁移。',
+    };
+    return data.healthy ? success('doctor', data) : unhealthyDoctor(data);
+  }
+  if (confirmed && (!repair || !name)) {
+    throw new NativeUsageError('--confirmed requires a named change and --repair');
+  }
+  if (lockToken !== undefined && (!repair || !confirmed || !name)) {
+    throw new NativeUsageError('--lock-token requires a named change, --repair and --confirmed');
+  }
+  let stoppedActions: RuntimeStoppedAction[] | undefined;
+  if (stoppedActionsFile !== undefined) {
+    if (!repair || !confirmed || !name || lockToken !== undefined)
+      throw new NativeUsageError(
+        '--stopped-actions requires a named change, --repair and --confirmed; it cannot be combined with --lock-token',
+      );
+    const file = path.resolve(projectRoot, stoppedActionsFile);
+    const stat = await fs.stat(file);
+    if (!stat.isFile() || stat.size > 1024 * 1024)
+      throw new NativeUsageError('停止证据必须是不超过 1 MiB 的 JSON 文件');
+    const value: unknown = JSON.parse((await fs.readFile(file, 'utf8')).replace(/^\uFEFF/u, ''));
+    if (
+      !Array.isArray(value) ||
+      value.length === 0 ||
+      value.some((entry) => !entry || typeof entry !== 'object' || Array.isArray(entry))
+    )
+      throw new NativeUsageError('--stopped-actions 必须包含原执行停止确认的非空数组');
+    stoppedActions = value as RuntimeStoppedAction[];
+  }
   const paths = await doctorPaths(projectRoot);
+  const owner = name ? await readChangeRuntimeOwner(projectRoot, 'native', name) : null;
+  if (
+    name &&
+    (!owner ||
+      (owner.format === 'sdk' &&
+        owner.runId === name &&
+        (owner.application === 'native'
+          ? await readNativeSdkRunRecord(projectRoot, name)
+          : await readWorkflowApplicationRun(projectRoot, owner.application, name)) === null))
+  ) {
+    let file = nativePortableStateFile(paths, name);
+    let marked = await hasNativeManagedRunMarker(file).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === 'ENOENT') return false;
+      throw error;
+    });
+    if (!marked) {
+      const archived = await findNativeSdkArchivedStateFile(paths, name);
+      if (archived) {
+        file = archived;
+        marked = await hasNativeManagedRunMarker(file);
+      }
+    }
+    if (marked) {
+      const recoverable =
+        file === nativePortableStateFile(paths, name)
+          ? await inspectPristineNativeSdkChange(paths, name)
+          : null;
+      const checkpoint = await hasNativePortableRunCheckpoint(file, name);
+      if (checkpoint) {
+        try {
+          await (
+            await loadOwnedNativeSdkRuntime(projectRoot, name, { readOnly: true })
+          ).runtime.inspect(name);
+        } catch (error) {
+          if (!isNativeSdkRunRecoveryRequiredError(error)) {
+            return unhealthyDoctor({
+              workflow: 'native-sdk',
+              runtimeFormat: 'sdk',
+              change: name,
+              healthy: false,
+              repaired: false,
+              findings: [
+                {
+                  code: 'sdk-run-invalid',
+                  message: error instanceof Error ? error.message : String(error),
+                },
+              ],
+            });
+          }
+        }
+      }
+      if (repair && confirmed && lockToken === undefined && stoppedActionsFile === undefined) {
+        const loaded = checkpoint ? await loadOwnedNativeSdkRuntime(projectRoot, name) : null;
+        const run = loaded
+          ? await loaded.runtime.inspect(name)
+          : await restoreNativeSdkChange(paths, name);
+        if (!(await readSdkChangeOwner(projectRoot, 'native', name))) {
+          await registerSdkChangeOwner(projectRoot, {
+            schema: COMET_CHANGE_OWNER_SCHEMA,
+            workflow: 'native',
+            change: name,
+            format: 'sdk',
+            application: loaded?.application?.identity.id ?? 'native',
+            runId: run.runId,
+          });
+        }
+        const state = parseNativePortableState(run.state);
+        const diagnosed = await nativeDoctorCommand([name], projectRoot);
+        return {
+          ...diagnosed,
+          data: {
+            ...(diagnosed.data as Record<string, unknown>),
+            repaired: true,
+            message: checkpoint
+              ? `Recovered at ${state.phase} from the portable Run checkpoint.`
+              : 'Recovered at Shape. Revalidate documents and obtain fresh confirmation before advancing.',
+          },
+        };
+      }
+      return unhealthyDoctor({
+        workflow: 'native-sdk',
+        runtimeFormat: 'sdk',
+        change: name,
+        healthy: false,
+        repaired: false,
+        findings: [
+          {
+            code: recoverable || checkpoint ? 'sdk-run-recoverable' : 'sdk-run-history-missing',
+            message: checkpoint
+              ? `This change can restore its Run at the saved ${parseNativePortableState(await readNativePortableState(file)).phase} phase; run comet native doctor ${name} --repair --confirmed.`
+              : recoverable
+                ? `This untouched change can safely recreate its Run. Run comet native doctor ${name} --repair --confirmed; doctor has not changed it.`
+                : `The portable state survived but this checkout has no Run history. Run comet native doctor ${name} --repair --confirmed to restart at Shape and reconfirm the work; unknown external actions will not be replayed.`,
+          },
+        ],
+      });
+    }
+  }
+  if (confirmed && lockToken === undefined && stoppedActionsFile === undefined) {
+    throw new NativeUsageError(
+      '--confirmed requires missing Run history or the inspected projection --lock-token',
+    );
+  }
+  const portableTransactions = await inspectPortableTransactions(paths, name);
+  if (name) {
+    const commandRoot = await resolveNativeSdkCommandRoot(projectRoot, name, { readOnly: true });
+    if (await readSdkChangeOwner(commandRoot, 'native', name)) {
+      const transactionFindings = portableTransactions.findings.map((finding) => ({
+        severity: finding.severity,
+        code: finding.code.replace(/^portable-/u, 'sdk-'),
+        path: finding.path,
+        message: `${finding.message}; this transaction belongs to the SDK Run and doctor will not replay it`,
+        ...(finding.code === 'portable-archive-transaction-incomplete'
+          ? { repairCommand: `comet native archive ${name} --recover` }
+          : {}),
+      }));
+      if (recoveryStrategy) {
+        throw new NativeUsageError('--strategy is only available to the legacy transaction doctor');
+      }
+      const lockFindings: Array<Record<string, unknown>> = [];
+      let lockRepaired = false;
+      try {
+        let lock = await inspectNativeSdkProjectionLock(commandRoot, name);
+        if (
+          lockToken !== undefined &&
+          lock.token !== lockToken &&
+          !lock.coordinator?.some((entry) => entry.token === lockToken)
+        ) {
+          throw new NativeUsageError(
+            'Projection lock changed since inspection; inspect doctor again before confirming repair',
+          );
+        }
+        if (repair && ((lock.token && lock.status === 'stale') || (confirmed && lockToken))) {
+          const result = await repairNativeSdkProjectionLock(
+            commandRoot,
+            name,
+            lockToken ?? lock.token!,
+            confirmed,
+          );
+          lockRepaired = result === 'removed';
+          lock = await inspectNativeSdkProjectionLock(commandRoot, name);
+        }
+        if (lock.status !== 'missing') {
+          const uncertain = lock.status === 'unknown' || lock.status === 'malformed';
+          lockFindings.push({
+            code: `sdk-projection-lock-${lock.status}`,
+            path: lock.path,
+            owner: lock.owner,
+            token: lock.token,
+            message:
+              lock.status === 'active'
+                ? 'The projection writer is still alive; wait for that writer to finish. Read-only inspection has not changed its lock.'
+                : uncertain
+                  ? 'The projection owner cannot be proved stopped. Confirm the original writer and all concurrent writers have stopped on every host before running the confirmed repair command; elapsed time alone is not evidence of exit.'
+                  : 'The local projection owner has exited; explicit doctor repair can recover its exact lock without a minimum waiting period.',
+            ...(lock.status === 'active'
+              ? {}
+              : {
+                  repairCommand: uncertain
+                    ? `comet native doctor ${name} --repair --confirmed --lock-token ${lock.token}`
+                    : `comet native doctor ${name} --repair`,
+                }),
+          });
+        }
+        for (const contender of lock.coordinator ?? []) {
+          lockFindings.push({
+            code: `sdk-projection-coordinator-${contender.status}`,
+            path: contender.file,
+            owner: contender.owner,
+            token: contender.token,
+            message:
+              contender.status === 'active'
+                ? 'A live projection lock contender is updating lock metadata; wait for it to finish.'
+                : 'Projection lock coordination has an unknown owner. Confirm every original and concurrent writer has stopped before repairing this exact record.',
+            ...(contender.status === 'active'
+              ? {}
+              : {
+                  repairCommand: `comet native doctor ${name} --repair --confirmed --lock-token ${contender.token}`,
+                }),
+          });
+        }
+        const mayRepair = repair && lockFindings.length === 0;
+        let executionRepaired = false;
+        let inspection = await inspectNativeSdkRun(commandRoot, name, { readOnly: !mayRepair });
+        if (mayRepair) {
+          const checks = await inspectNativeSdkCheckExecutions({
+            projectRoot: commandRoot,
+            run: inspection.run,
+            includeSettled: true,
+          });
+          if (checks.some((check) => check.recoveryRequired) || stoppedActions !== undefined) {
+            const { runtime } = await loadOwnedNativeSdkRuntime(commandRoot, name);
+            const recovered = await recoverNativeSdkChecks(commandRoot, inspection.run, runtime, {
+              reconcileInterrupted: confirmed && stoppedActions !== undefined,
+              stoppedActions,
+            });
+            executionRepaired = recovered.revision !== inspection.run.revision;
+            inspection = await inspectNativeSdkRun(commandRoot, name, { readOnly: true });
+          }
+        }
+        // 原 Action 必须先在固定旧定义下核对，再显式迁移；未知执行不能被定义升级覆盖。
+        let upgrade = await inspectNativeSdkDefinitionUpgrade(commandRoot, name, false);
+        if (mayRepair && upgrade?.ready) {
+          upgrade = await inspectNativeSdkDefinitionUpgrade(commandRoot, name, true);
+          if (upgrade?.repaired)
+            inspection = await inspectNativeSdkRun(commandRoot, name, { readOnly: true });
+        }
+        const recoveryChecks = await inspectNativeSdkCheckExecutions({
+          projectRoot: commandRoot,
+          run: inspection.run,
+        });
+        if (
+          upgrade?.required &&
+          !upgrade.repaired &&
+          !recoveryChecks.some((check) => check.recoveryRequired)
+        )
+          return unhealthyDoctor({
+            workflow: 'native-sdk',
+            runtimeFormat: 'sdk',
+            change: name,
+            healthy: false,
+            repaired: lockRepaired || executionRepaired,
+            findings: [
+              ...lockFindings,
+              ...transactionFindings,
+              { code: 'sdk-definition-upgrade-required', ...upgrade },
+            ],
+          });
+        const { run } = inspection;
+        if (mayRepair && run.status === 'cancelled')
+          await settleNativeSdkCancellation({ projectRoot: commandRoot, run });
+        if (mayRepair && run.status === 'completed')
+          await settleNativeSdkCompletion({ projectRoot: commandRoot, run });
+        const checks = await inspectNativeSdkCheckExecutions({
+          projectRoot: commandRoot,
+          run,
+          includeSettled: true,
+        });
+        const cancellation = await inspectNativeSdkCancellation({
+          projectRoot: commandRoot,
+          run,
+          checkExecutionObservation: checks,
+        });
+        const status = await projectNativeSdkStatus(
+          { projectRoot: commandRoot, name, checkExecutionObservation: checks },
+          inspection,
+        );
+        const unresolved = run.actions.filter((action) => action.status === 'unknown');
+        const staleCompleted = new Set<string>();
+        for (const check of checks) {
+          const action = run.actions.find((entry) => entry.id === check.actionId);
+          if (
+            action &&
+            check.recoveryRequired &&
+            check.quiescent &&
+            check.execution?.phase === 'completed' &&
+            check.execution.outcome &&
+            (await nativeSdkCompletedCheckInputDrift(
+              { projectRoot: commandRoot, run, action },
+              check.execution.outcome,
+            ))
+          )
+            staleCompleted.add(action.id);
+        }
+        const findings = [
+          ...lockFindings,
+          ...transactionFindings,
+          ...status.diagnostics.issues,
+          ...(upgrade?.required && !upgrade.repaired
+            ? [{ code: 'sdk-definition-upgrade-required', ...upgrade }]
+            : []),
+          ...checks
+            .filter(
+              (check) => check.recoveryRequired && !(run.status === 'cancelled' && check.quiescent),
+            )
+            .map((check) => {
+              const requiresStoppedEvidence =
+                staleCompleted.has(check.actionId) ||
+                check.phase === 'missing' ||
+                (check.quiescent && check.execution && !check.execution.outcome) ||
+                (process.platform === 'win32' &&
+                  !check.quiescent &&
+                  check.execution?.child &&
+                  check.owner === 'dead' &&
+                  check.process === 'dead');
+              return {
+                code: 'sdk-check-execution-recovery-required',
+                ...check,
+                message:
+                  (staleCompleted.has(check.actionId)
+                    ? '原检查已完成但输入随后变化；确认全部后代已停止并提交原领取停止证据后，可批准新的修复候选。旧结果不会用于当前验收，也不会重跑旧检查。'
+                    : check.reason) ??
+                  'SDK check execution needs reconciliation; doctor repair preserves the original claim and does not replay the check',
+                repairCommand: `comet native doctor ${name} --repair${requiresStoppedEvidence ? ' --confirmed --stopped-actions <stopped-actions-json-file>' : ''}`,
+              };
+            }),
+          ...unresolved.map((action) => ({
+            code: 'sdk-action-outcome-unresolved',
+            actionId: action.id,
+            stepId: action.stepId,
+            status: action.status,
+            message: 'Reconcile this SDK Action before continuing; doctor will not replay it',
+            ...(['archive.prepare', 'archive.execute', 'archive.finalize'].includes(action.stepId)
+              ? { repairCommand: `comet native archive ${name} --recover` }
+              : {}),
+          })),
+          ...(run.status === 'failed'
+            ? [{ code: 'sdk-run-failed', message: run.reason ?? 'SDK Run failed' }]
+            : []),
+          ...(cancellation?.cleanupRequired
+            ? [{ code: 'sdk-cancellation-cleanup-pending', ...cancellation.cleanup }]
+            : []),
+          ...(cancellation && !cancellation.quiescent
+            ? [
+                {
+                  code: 'sdk-cancellation-execution-unresolved',
+                  message:
+                    'The Run is cancelled, but external execution has not been proved stopped; preserve its workspace until cancellation is reconciled.',
+                  outstandingActions: cancellation.outstandingActions,
+                  outstandingRuns: cancellation.outstandingRuns,
+                },
+              ]
+            : []),
+        ];
+        const data = {
+          ...status,
+          workflow: 'native-sdk',
+          runtimeFormat: 'sdk',
+          change: name,
+          healthy: findings.length === 0,
+          repaired: lockRepaired || executionRepaired || (upgrade?.repaired ?? false),
+          findings,
+        };
+        return data.healthy ? success('doctor', data) : unhealthyDoctor(data);
+      } catch (error) {
+        return unhealthyDoctor({
+          workflow: 'native-sdk',
+          runtimeFormat: 'sdk',
+          change: name,
+          healthy: false,
+          repaired: lockRepaired,
+          findings: [
+            ...lockFindings,
+            ...transactionFindings,
+            {
+              code: 'sdk-run-invalid',
+              message: error instanceof Error ? error.message : String(error),
+            },
+          ],
+        });
+      }
+    }
+  }
+  if (lockToken !== undefined)
+    throw new NativeUsageError('--lock-token is only available for SDK projection locks');
+  if (stoppedActionsFile !== undefined) {
+    if (!name || !(await isNativePortableChange(paths, name)))
+      throw new NativeUsageError(
+        '--stopped-actions requires a named SDK or portable check execution',
+      );
+    const stoppedChecks = await recoverNativeChecksWithStopEvidence({
+      paths,
+      name,
+      confirmations: stoppedActions,
+    });
+    const inspected = await nativeDoctorCommand([name], projectRoot);
+    return {
+      ...inspected,
+      data: {
+        ...(inspected.data as Record<string, unknown>),
+        repaired: !stoppedChecks.alreadyApplied,
+        stoppedChecks,
+      },
+    };
+  }
   const workspaceFinishJournalErrors = await inspectWorkspaceFinishJournalErrors(paths, name);
   if (name && workspaceFinishJournalErrors.length > 0) {
     const finding = workspaceFinishJournalFinding(paths, workspaceFinishJournalErrors[0]);
@@ -508,7 +1043,6 @@ export async function nativeDoctorCommand(
       workspaceFinishJournal: { quarantined, finding },
     });
   }
-  const portableTransactions = await inspectPortableTransactions(paths, name);
   if (name && portableTransactions.findings.length > 0) {
     if (recoveryStrategy) {
       throw new NativeUsageError('--strategy is only available to the legacy transaction doctor');
@@ -739,14 +1273,16 @@ export async function nativeDoctorCommand(
         recoverUnknownRuntimeCheck: true,
       });
       if (result.reason === 'execution-active') {
-        return success('doctor', {
-          healthy: true,
-          workflow: 'native-portable',
-          change: name,
-          repaired: false,
-          result,
-          continuation: await portableContinuation(paths, result.state),
-        });
+        const inspected = await nativeDoctorCommand([name], projectRoot);
+        return {
+          ...inspected,
+          data: {
+            ...(inspected.data as Record<string, unknown>),
+            repaired: false,
+            result,
+            continuation: await portableContinuation(paths, result.state),
+          },
+        };
       }
       // Repair legacy overlays that the pre-0.4.2 derivation left self-locked
       // (issue #439): demote ready children with unmet dependencies to pending
@@ -795,6 +1331,7 @@ export async function nativeDoctorCommand(
       });
     }
     const executionFinding = await portableCheckExecutionFinding(paths, name);
+    const checkStopTargets = await inspectNativeCheckStopEvidenceTargets(paths, name);
     if (executionFinding) {
       const result = await inspectNativePortableStatus({ paths, name, details: true });
       return unhealthyDoctor({
@@ -804,6 +1341,38 @@ export async function nativeDoctorCommand(
         repaired: false,
         result,
         findings: [executionFinding],
+        checkStopTargets,
+        ...(checkStopTargets.some(({ canConfirm }) => canConfirm)
+          ? {
+              repairCommand: `comet native doctor ${name} --repair --confirmed --stopped-actions <stopped-actions-json-file>`,
+            }
+          : {}),
+        continuation: result.continuation,
+      });
+    }
+    const stoppedSupervisor = checkStopTargets.filter(
+      (target) => target.kind !== 'portable-checks' && target.owner !== 'alive',
+    );
+    if (stoppedSupervisor.length > 0) {
+      const result = await inspectNativePortableStatus({ paths, name, details: true });
+      return unhealthyDoctor({
+        healthy: false,
+        workflow: 'native-portable',
+        change: name,
+        repaired: false,
+        result,
+        checkStopTargets,
+        findings: stoppedSupervisor.map((target) => ({
+          code: 'supervisor-check-execution-stuck',
+          ...target,
+          message:
+            '原Supervisor检查树停止尚未确认；保留执行登记，只能按精确快照提交人工停止证据后重试。',
+          ...(target.canConfirm
+            ? {
+                repairCommand: `comet native doctor ${name} --repair --confirmed --stopped-actions <stopped-actions-json-file>`,
+              }
+            : {}),
+        })),
         continuation: result.continuation,
       });
     }
@@ -884,10 +1453,73 @@ export async function nativeDoctorCommand(
       },
     };
   }
-  const portableNames = await listNativePortableChangeNames(paths);
-  const projectPortableTransactions = portableTransactions;
+  const activeNames = [
+    ...new Set([
+      ...(await listActiveChangeNames(paths)),
+      ...(await listSdkChangeNames(projectRoot, 'native', { readOnly: true })),
+    ]),
+  ].sort();
+  const ownershipNames = [
+    ...new Set([
+      ...activeNames,
+      ...(await listNativePortableTransactionEntryNames(paths)).map(
+        (entry) => describeNativePortableTransactionEntry(entry)!.change,
+      ),
+      ...finishJournals.map((journal) => journal.name),
+      ...workspaceFinishJournalErrors.map((error) => error.name),
+    ]),
+  ].sort();
+  const sdkNames = new Set<string>();
+  const sdkResults: Array<Record<string, unknown>> = [];
+  for (const change of ownershipNames) {
+    try {
+      const sdk = await readSdkChangeOwner(projectRoot, 'native', change);
+      let managed =
+        sdk !== null ||
+        (await hasNativeManagedRunMarker(nativePortableStateFile(paths, change)).catch(
+          (error: NodeJS.ErrnoException) => {
+            if (error.code === 'ENOENT') return false;
+            throw error;
+          },
+        ));
+      if (!managed) {
+        const archived = await findNativeSdkArchivedStateFile(paths, change);
+        managed = archived !== null && (await hasNativeManagedRunMarker(archived));
+      }
+      if (!managed) continue;
+      sdkNames.add(change);
+      const result = await nativeDoctorCommand(
+        [change, ...(repair ? ['--repair'] : [])],
+        projectRoot,
+      );
+      sdkResults.push({ change, ...(result.data as Record<string, unknown>) });
+    } catch (error) {
+      sdkNames.add(change);
+      sdkResults.push({
+        change,
+        healthy: false,
+        repaired: false,
+        findings: [
+          {
+            code: 'sdk-run-invalid',
+            message: error instanceof Error ? error.message : String(error),
+          },
+        ],
+      });
+    }
+  }
+  const portableNames = (await listNativePortableChangeNames(paths)).filter(
+    (change) => !sdkNames.has(change),
+  );
+  // 事务文件格式不决定推进归属；SDK 的 Archive 只能由原 Run 恢复。
+  const projectPortableTransactions = await inspectPortableTransactions(paths, undefined, sdkNames);
+  const portableFinishJournals = finishJournals.filter((journal) => !sdkNames.has(journal.name));
+  const portableFinishJournalErrors = workspaceFinishJournalErrors.filter(
+    (error) => !sdkNames.has(error.name),
+  );
   if (
     portableNames.length > 0 ||
+    sdkResults.length > 0 ||
     finishJournals.length > 0 ||
     projectPortableTransactions.findings.length > 0 ||
     workspaceFinishJournalErrors.length > 0
@@ -896,6 +1528,21 @@ export async function nativeDoctorCommand(
       throw new NativeUsageError('--strategy is only available to the legacy transaction doctor');
     }
     if (repair) {
+      const sdkTransactionPending = (await listNativePortableTransactionEntryNames(paths)).some(
+        (entry) => sdkNames.has(describeNativePortableTransactionEntry(entry)!.change),
+      );
+      if (sdkTransactionPending) {
+        // SDK 事务也阻塞共享 mutation lock，先保留诊断，避免其它修复越过此边界。
+        const inspected = await nativeDoctorCommand([], projectRoot);
+        return {
+          ...inspected,
+          data: {
+            ...(inspected.data as Record<string, unknown>),
+            repaired: sdkResults.some((result) => result.repaired === true),
+            repairedPortableTransactions: [],
+          },
+        };
+      }
       const projectRepair = await doctorNativeProject({ paths, repair: true, projectOnly: true });
       const repairedPortableTransactions: Array<{
         kind: NativePortableTransaction['kind'];
@@ -905,14 +1552,14 @@ export async function nativeDoctorCommand(
       const repairedWorkspaceFinishJournals: Array<{ change: string; quarantined: string | null }> =
         [];
       const repairedWorkspaceFinishes: string[] = [];
-      for (const journal of finishJournals) {
+      for (const journal of portableFinishJournals) {
         if (
           !(await isNativePortableChange(paths, journal.name)) &&
           (await workspaceFinishInspection(paths, journal, true)).repaired
         )
           repairedWorkspaceFinishes.push(journal.name);
       }
-      for (const error of workspaceFinishJournalErrors) {
+      for (const error of portableFinishJournalErrors) {
         repairedWorkspaceFinishJournals.push({
           change: error.name,
           quarantined: await quarantineNativeWorkspaceFinishJournal(paths, error.name),
@@ -968,14 +1615,15 @@ export async function nativeDoctorCommand(
         },
       };
     }
-    const activeNames = await listActiveChangeNames(paths);
     const portableSet = new Set(portableNames);
     const migrationTransactionNames = new Set(
       projectPortableTransactions.transactions
         .filter((transaction) => transaction.kind === 'migration')
         .map(({ change }) => change),
     );
-    const legacyNames = activeNames.filter((change) => !portableSet.has(change));
+    const legacyNames = activeNames.filter(
+      (change) => !portableSet.has(change) && !sdkNames.has(change),
+    );
     const [
       changes,
       conflicts,
@@ -1010,6 +1658,14 @@ export async function nativeDoctorCommand(
       doctorNativeProject({ paths, projectOnly: true }),
     ]);
     const findings = uniqueFindings([
+      ...sdkResults.flatMap((result) =>
+        ((result.findings ?? []) as Array<{ code: string; message?: string }>).map((finding) => ({
+          ...finding,
+          severity: result.healthy ? ('info' as const) : ('error' as const),
+          message: `${result.change}: ${finding.message ?? finding.code}`,
+          path: nativePortableStateFile(paths, String(result.change)),
+        })),
+      ),
       ...(
         await Promise.all(
           finishJournals
@@ -1040,8 +1696,13 @@ export async function nativeDoctorCommand(
     ]);
     const data = {
       healthy: findings.every((finding) => finding.severity === 'info'),
-      workflow: legacyNames.length > 0 ? 'native-mixed' : 'native-portable',
-      changes,
+      workflow:
+        legacyNames.length > 0 || (sdkResults.length > 0 && portableNames.length > 0)
+          ? 'native-mixed'
+          : sdkResults.length > 0
+            ? 'native-sdk'
+            : 'native-portable',
+      changes: [...sdkResults, ...changes],
       legacyChanges: legacyNames,
       findings,
     };

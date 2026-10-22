@@ -1,9 +1,10 @@
+import { resolveClassicRunDirectory } from '../../../domains/comet-classic/classic-runtime-paths.js';
 import { spawnSync } from 'child_process';
 import { promises as fs } from 'fs';
 import os from 'os';
 import path from 'path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import * as runStore from '../../../domains/engine/run-store.js';
+import * as runStore from '../../../domains/comet-classic/classic-run-store.js';
 import { parse } from 'yaml';
 import { annotatedMarkdown } from '../../../domains/comet-classic/classic-archive.js';
 import { ensureClassicRuntimeRun } from '../../../domains/comet-classic/classic-runtime-run.js';
@@ -56,7 +57,7 @@ async function makeProject(): Promise<string> {
 }
 
 async function seedArchiveChange(dir: string): Promise<string> {
-  run(dir, ['state', 'init', 'demo', 'full']);
+  run(dir, ['state', 'init', 'demo', 'full', '--runtime', 'compat']);
   const changeDir = path.join(dir, 'openspec', 'changes', 'demo');
   await fs.writeFile(path.join(changeDir, 'proposal.md'), '# Proposal\n');
   await fs.writeFile(path.join(changeDir, 'design.md'), '# Design\n');
@@ -75,6 +76,11 @@ function confirmArchiveChange(dir: string): void {
 }
 
 describe('annotatedMarkdown', () => {
+  it('keeps the first plan annotation byte-identical on recovery', () => {
+    const once = annotatedMarkdown('# Plan\nDo the checked work.\n', '2026-10-21-example', '');
+    expect(annotatedMarkdown(once, '2026-10-21-example', '')).toBe(once);
+  });
+
   it('preserves an existing frontmatter document with one final newline', () => {
     const original = '---\ntitle: Demo\n---\nBody\n';
 
@@ -257,7 +263,7 @@ describe('Classic archive command', () => {
 
   it('rejects a change that is not in the archive phase', async () => {
     const dir = await makeProject();
-    run(dir, ['state', 'init', 'demo', 'full']); // phase = open
+    run(dir, ['state', 'init', 'demo', 'full', '--runtime', 'compat']); // phase = open
 
     const result = run(dir, ['archive', 'demo']);
     expect(result.status).not.toBe(0);
@@ -266,7 +272,7 @@ describe('Classic archive command', () => {
 
   it('rejects an unverified change in the archive phase', async () => {
     const dir = await makeProject();
-    run(dir, ['state', 'init', 'demo', 'full']);
+    run(dir, ['state', 'init', 'demo', 'full', '--runtime', 'compat']);
     run(dir, ['state', 'set', 'demo', 'phase', 'archive'], { COMET_FORCE_PHASE: '1' });
 
     const result = run(dir, ['archive', 'demo']);
@@ -333,16 +339,21 @@ describe('Classic archive command', () => {
       archived: true,
       phase: 'archive',
     });
-    const archiveRunState = await readRunState(archiveDir);
+    const archiveRunState = await readRunState(await resolveClassicRunDirectory(archiveDir));
     expect(archiveRunState).not.toBeNull();
     expect(archiveRunState!.currentStep).toBe('completed');
     expect(archiveRunState!.status).toBe('completed');
     expect(archiveRunState!.pending).toBeNull();
     await expect(
-      fs.access(path.join(archiveDir, archiveRunState!.pendingRef)),
+      fs.access(
+        path.join(await resolveClassicRunDirectory(archiveDir), archiveRunState!.pendingRef),
+      ),
     ).rejects.toMatchObject({ code: 'ENOENT' });
     const artifacts = JSON.parse(
-      await fs.readFile(path.join(archiveDir, archiveRunState!.artifactsRef), 'utf8'),
+      await fs.readFile(
+        path.join(await resolveClassicRunDirectory(archiveDir), archiveRunState!.artifactsRef),
+        'utf8',
+      ),
     ) as Record<string, string>;
     expect(artifacts.archive_directory).toBe(
       `openspec/changes/archive/${path.basename(archiveDir)}`,
@@ -401,7 +412,10 @@ describe('Classic archive command', () => {
     expect(run(dir, ['state', 'set', 'demo', 'handoff_hash', handoffHash]).status).toBe(0);
 
     const activeRun = await ensureClassicRuntimeRun(changeDir);
-    const artifactsFile = path.join(changeDir, activeRun.run.artifactsRef);
+    const artifactsFile = path.join(
+      await resolveClassicRunDirectory(changeDir),
+      activeRun.run.artifactsRef,
+    );
     const activeArtifacts = JSON.parse(await fs.readFile(artifactsFile, 'utf8')) as Record<
       string,
       string
@@ -439,10 +453,13 @@ describe('Classic archive command', () => {
       'status: final',
     );
 
-    const archivedRun = await readRunState(archiveDir);
+    const archivedRun = await readRunState(await resolveClassicRunDirectory(archiveDir));
     expect(archivedRun).not.toBeNull();
     const archivedArtifacts = JSON.parse(
-      await fs.readFile(path.join(archiveDir, archivedRun!.artifactsRef), 'utf8'),
+      await fs.readFile(
+        path.join(await resolveClassicRunDirectory(archiveDir), archivedRun!.artifactsRef),
+        'utf8',
+      ),
     ) as Record<string, string>;
     expect(archivedArtifacts.handoff_context).toBe(
       `${archiveRef}/.comet/handoff/design-context.json`,
@@ -471,7 +488,7 @@ describe('Classic archive command', () => {
     const dir = await makeProject();
     await seedArchiveChange(dir);
     confirmArchiveChange(dir);
-    expect(run(dir, ['state', 'init', 'other', 'full']).status).toBe(0);
+    expect(run(dir, ['state', 'init', 'other', 'full', '--runtime', 'compat']).status).toBe(0);
     expect(run(dir, ['state', 'select', 'other']).status).toBe(0);
     const fake = await fakeOpenSpec(dir, 'success');
 
@@ -524,11 +541,11 @@ describe('Classic archive command', () => {
       unknown
     >;
     expect(state.archived).toBe(false);
-    const failRunState = await readRunState(changeDir);
+    const failRunState = await readRunState(await resolveClassicRunDirectory(changeDir));
     expect(failRunState).not.toBeNull();
     expect(failRunState!.pending).toMatch(/^classic-archive:/u);
     await expect(
-      fs.access(path.join(changeDir, failRunState!.pendingRef)),
+      fs.access(path.join(await resolveClassicRunDirectory(changeDir), failRunState!.pendingRef)),
     ).resolves.toBeUndefined();
   });
 
@@ -552,10 +569,13 @@ describe('Classic archive command', () => {
       'archive',
       `${new Date().toISOString().slice(0, 10)}-demo`,
     );
-    const reconcileRunState = await readRunState(archiveDir);
+    const reconcileRunState = await readRunState(await resolveClassicRunDirectory(archiveDir));
     expect(reconcileRunState).not.toBeNull();
     const trajectory = (
-      await fs.readFile(path.join(archiveDir, reconcileRunState!.trajectoryRef), 'utf8')
+      await fs.readFile(
+        path.join(await resolveClassicRunDirectory(archiveDir), reconcileRunState!.trajectoryRef),
+        'utf8',
+      )
     )
       .trim()
       .split(/\r?\n/u)

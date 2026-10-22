@@ -1,3 +1,4 @@
+import { resolveWorkspaceRuntimeRoot } from '../workflow-contract/workspace-runtime.js';
 import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { runGitCommand } from '../../platform/process/git.js';
@@ -5,7 +6,7 @@ import { readProtectedProjectFile } from '../workflow-contract/protected-project
 import { atomicWriteJson } from './native-atomic-file.js';
 import type { NativeProjectPaths } from './native-types.js';
 
-const REGISTRY_REF = '.comet/runtime/native/runner-input-artifacts.json';
+const REGISTRY_REF = 'native/runner-input-artifacts.json';
 const MAX_ARTIFACTS = 256;
 const MAX_INPUT_BYTES = 8 * 1024 * 1024;
 interface RunnerInputArtifact {
@@ -32,9 +33,14 @@ function relativeInputPath(projectRoot: string, file: string): string | null {
 
 async function readRegistry(projectRoot: string): Promise<RunnerInputArtifact[]> {
   try {
-    const read = await readProtectedProjectFile(projectRoot, REGISTRY_REF, 256 * 1024, {
-      label: 'Native Runner input registry',
-    });
+    const read = await readProtectedProjectFile(
+      await resolveWorkspaceRuntimeRoot(projectRoot),
+      REGISTRY_REF,
+      256 * 1024,
+      {
+        label: 'Native Runner input registry',
+      },
+    );
     const value: unknown = JSON.parse(read.bytes.toString('utf8'));
     if (!Array.isArray(value) || value.length > MAX_ARTIFACTS)
       throw new Error('Invalid Native Runner input registry');
@@ -120,7 +126,7 @@ export async function registerNativeRunnerInputArtifactLocked(options: {
       'Too many retained Native Runner input files; remove unused protocol files before continuing',
     );
   await atomicWriteJson(
-    path.join(options.paths.projectRoot, ...REGISTRY_REF.split('/')),
+    path.join(options.paths.workspaceRuntimeRoot, ...REGISTRY_REF.split('/')),
     [...current, { path: physicalRelative, digest: digest(read.bytes) }],
     { containedRoot: options.paths.runtimeDir },
   );

@@ -1,20 +1,50 @@
 import {
   accessSync,
   constants as fsConstants,
-  createWriteStream,
   existsSync,
   promises as fs,
   statSync,
 } from 'node:fs';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 
 import {
   assertSafeWindowsBatchArguments,
   resolveWindowsCommand,
-  spawnCommand,
 } from '../../platform/process/spawn-command.js';
-import { terminateProcessTree } from '../../platform/process/terminate-process-tree.js';
+import {
+  inspectProcessTreeLiveness,
+  readProcessIdentity,
+  type ProcessLiveness,
+} from '../../platform/process/process-identity.js';
+import {
+  spawnOwnedCommand,
+  type OwnedProcessInstance,
+} from '../../platform/process/owned-command.js';
+import { terminateProcessTreeConfirmed } from '../../platform/process/terminate-process-tree.js';
 import { redactNativeCredentialText } from './native-redaction.js';
+import { observeRuntimeOperation } from '../../platform/process/runtime-performance.js';
+
+/** 不确定的停止不能当作普通失败清除登记或允许重试。 */
+export class NativeCheckTerminationUnconfirmedError extends Error {
+  constructor() {
+    super('检查进程树的停止尚未确认；保留原执行登记，不能验收或重试');
+    this.name = 'NativeCheckTerminationUnconfirmedError';
+  }
+}
+
+export function isNativeCheckTerminationUnconfirmedError(error: unknown): boolean {
+  return error instanceof NativeCheckTerminationUnconfirmedError;
+}
+
+/** Windows 的死亡组长不证明其后代停止；历史登记没有整树停止收据。 */
+export async function inspectNativeCheckProcessTreeLiveness(
+  pid: number,
+  identity?: string,
+): Promise<ProcessLiveness> {
+  const state = await inspectProcessTreeLiveness(pid, identity);
+  return process.platform === 'win32' && state === 'dead' ? 'unknown' : state;
+}
 
 export interface NativeCheckPlan {
   id: string;
@@ -187,14 +217,15 @@ export function validateNativeCheckPlan(projectRoot: string, plan: NativeCheckPl
   return resolveNativeCheckCwd(projectRoot, plan.cwdRef);
 }
 
-export async function executeNativeCheck(options: {
+async function executeNativeCheckOperation(options: {
   projectRoot: string;
   runtimeDir: string;
   operationId: string;
   plan: NativeCheckPlan;
   now?: () => Date;
-  onSpawn?: (child: { pid: number }) => Promise<void>;
-}): Promise<NativeExecutedCheck> {
+  onSpawn?: (child: OwnedProcessInstance & { signal: AbortSignal }) => Promise<void>;
+  onTerminated?: (child: OwnedProcessInstance, confirmed: boolean) => Promise<void>;
+}): Promise<NativeExecutedCheck & { logSha256: string }> {
   const { plan } = options;
   safeSegment(options.operationId, 'Native check operation ID');
   const cwd = validateNativeCheckPlan(options.projectRoot, plan);
@@ -204,16 +235,22 @@ export async function executeNativeCheck(options: {
     throw new Error('Native check log path escaped the Runtime root');
   }
   await fs.mkdir(logDirectory, { recursive: true });
+  const logHandle = await fs.open(logFile, 'wx');
+  const stream = logHandle.createWriteStream();
   const started = (options.now ?? (() => new Date()))();
-  const stream = createWriteStream(logFile, { flags: 'wx' });
+  const logHash = createHash('sha256');
 
-  return new Promise<NativeExecutedCheck>((resolve, reject) => {
+  return new Promise<NativeExecutedCheck & { logSha256: string }>((resolve, reject) => {
     let child;
+    let start: () => void;
+    let instanceId: string;
     try {
-      child = spawnCommand(plan.executable, plan.argv, {
+      ({ child, start, instanceId } = spawnOwnedCommand(plan.executable, plan.argv, {
         cwd,
         env: process.env,
-      });
+        timeoutMs: plan.timeoutMs,
+        confirmTermination: true,
+      }));
     } catch (error) {
       stream.destroy();
       reject(error);
@@ -221,73 +258,232 @@ export async function executeNativeCheck(options: {
     }
 
     let timedOut = false;
+    let supervisorInterrupted = false;
+    let supervisorResult: { exitCode: number | null; signal: NodeJS.Signals | null } | null = null;
+    let childIdentity: string | undefined;
+    let instance: OwnedProcessInstance | undefined;
+    let termination: Promise<boolean> | undefined;
+    const stop = () => {
+      termination ??= terminateProcessTreeConfirmed(child)
+        .catch(() => {
+          try {
+            child.kill('SIGKILL');
+          } catch {
+            /* 保留无法确认的停止状态。 */
+          }
+          return false;
+        })
+        .then((confirmed) => {
+          if (!confirmed) {
+            // 兜底 kill 可能没有 close 事件；停止无法证明时不能永远等待继承的句柄。
+            void registration.then(() => {
+              clearTimeout(timer);
+              stream.destroy();
+              reject(new NativeCheckTerminationUnconfirmedError());
+            });
+          }
+          return confirmed;
+        });
+      return termination;
+    };
     let spawnError: Error | null = null;
     let registrationError: unknown = null;
     let registration = Promise.resolve();
+    let registrationSettled = false;
+    let commandStarted = false;
+    const registrationController = new AbortController();
+    let cancelRegistration: ((error: Error) => void) | undefined;
+    const registrationDeadline = new Promise<never>((_resolve, rejectDeadline) => {
+      cancelRegistration = rejectDeadline;
+    });
+    void registrationDeadline.catch(() => {});
     let closed = false;
     const timer = setTimeout(() => {
       timedOut = true;
-      void terminateProcessTree(child).catch(() => child.kill('SIGKILL'));
+      if (!registrationSettled) registrationController.abort();
+      if (!registrationSettled)
+        cancelRegistration?.(new Error('检查进程登记超过执行时限；未放行的命令不会启动'));
+      void stop();
     }, plan.timeoutMs);
     timer.unref?.();
 
+    child.on(
+      'message',
+      (message: {
+        type?: string;
+        reason?: string;
+        message?: string;
+        exitCode?: number | null;
+        signal?: NodeJS.Signals | null;
+      }) => {
+        if (message.type === 'completed')
+          supervisorResult = { exitCode: message.exitCode ?? null, signal: message.signal ?? null };
+        if (message.type === 'interrupted') {
+          supervisorInterrupted = true;
+          if (message.reason === 'timeout') timedOut = true;
+        }
+        if (message.type === 'spawn-error') {
+          spawnError = new Error(message.message ?? '检查启动失败');
+          const text = `\n[comet] failed to start check: ${redactNativeCredentialText(spawnError.message)}\n`;
+          stream.write(text);
+          logHash.update(text);
+        }
+        if (
+          commandStarted &&
+          ['completed', 'interrupted', 'spawn-error'].includes(message.type ?? '')
+        )
+          clearTimeout(timer);
+        // Windows 的 opt-in 监管器等 owner 执行 taskkill /T，再退出。
+        // POSIX 监管器自行终止进程组，close 后仍核验整个进程组。
+        if (
+          process.platform === 'win32' &&
+          ['completed', 'interrupted', 'spawn-error'].includes(message.type ?? '')
+        )
+          void stop();
+      },
+    );
     child.stdout.pipe(stream, { end: false });
     child.stderr.pipe(stream, { end: false });
+    // These listeners observe the same event order as the log stream writes.
+    // Outcome validation must still hash the finished file before committing it.
+    child.stdout.on('data', (chunk: Buffer) => logHash.update(chunk));
+    child.stderr.on('data', (chunk: Buffer) => logHash.update(chunk));
     child.once('error', (error) => {
       spawnError = error;
-      stream.write(
-        `\n[comet] failed to start check: ${redactNativeCredentialText(error.message)}\n`,
-      );
+      const message = `\n[comet] failed to start check: ${redactNativeCredentialText(error.message)}\n`;
+      stream.write(message);
+      logHash.update(message);
     });
+    const processStopped = async () => {
+      const stopped = termination ? await termination : false;
+      if (!child.pid) return true;
+      if (process.platform === 'win32') return stopped;
+      // 监管器的 close 可能早于同组后代退出；有限复查，不把组长退出当作整组停止。
+      const deadline = Date.now() + 1_000;
+      for (;;) {
+        if ((await inspectProcessTreeLiveness(child.pid, childIdentity)) === 'dead') return true;
+        if (Date.now() >= deadline) return false;
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+    };
     child.once('close', (exitCode, signal) => {
       closed = true;
-      clearTimeout(timer);
+      if (registrationSettled) clearTimeout(timer);
       const completed = (options.now ?? (() => new Date()))();
-      void registration.then(() => {
-        if (registrationError !== null) {
-          stream.destroy();
-          reject(registrationError);
-          return;
-        }
-        stream.end(() => {
-          const interrupted = timedOut || spawnError !== null || signal !== null;
-          resolve({
-            id: plan.id,
-            name: plan.name,
-            argvDisplay: nativePortableArgvDisplay(plan.argv),
-            cwdRef: plan.cwdRef,
-            status: interrupted ? 'interrupted' : exitCode === 0 ? 'passed' : 'failed',
-            exitCode,
-            signal,
-            timedOut,
-            durationMs: Math.max(0, completed.getTime() - started.getTime()),
-            startedAt: started.toISOString(),
-            completedAt: completed.toISOString(),
-            repeatable: plan.repeatable,
-            logRef: path.relative(options.runtimeDir, logFile).split(path.sep).join('/'),
+      void registration
+        .then(async () => {
+          clearTimeout(timer);
+          if (supervisorResult) {
+            exitCode = supervisorResult.exitCode;
+            signal = supervisorResult.signal;
+          }
+          const confirmed = await processStopped();
+          if (instance) await options.onTerminated?.(instance, confirmed);
+          if (!confirmed) {
+            stream.destroy();
+            reject(new NativeCheckTerminationUnconfirmedError());
+            return;
+          }
+          if (registrationError !== null) {
+            stream.destroy();
+            reject(registrationError);
+            return;
+          }
+          stream.end(() => {
+            const interrupted =
+              supervisorInterrupted || timedOut || spawnError !== null || signal !== null;
+            resolve({
+              id: plan.id,
+              name: plan.name,
+              argvDisplay: nativePortableArgvDisplay(plan.argv),
+              cwdRef: plan.cwdRef,
+              status: interrupted ? 'interrupted' : exitCode === 0 ? 'passed' : 'failed',
+              exitCode,
+              signal,
+              timedOut,
+              durationMs: Math.max(0, completed.getTime() - started.getTime()),
+              startedAt: started.toISOString(),
+              completedAt: completed.toISOString(),
+              repeatable: plan.repeatable,
+              logRef: path.relative(options.runtimeDir, logFile).split(path.sep).join('/'),
+              logSha256: logHash.digest('hex'),
+            });
           });
+        })
+        .catch((error) => {
+          stream.destroy();
+          reject(error);
         });
-      });
     });
     stream.once('error', (error) => {
-      clearTimeout(timer);
       registrationError ??= error;
-      if (closed) void registration.then(() => reject(registrationError));
-      else void terminateProcessTree(child).catch(() => child.kill('SIGKILL'));
+      if (!registrationSettled) {
+        registrationController.abort();
+        cancelRegistration?.(error);
+      }
+      if (closed) {
+        // close 可能早于 taskkill 的结果；日志错误不能抢先清除尚未确认停止的登记。
+        void registration
+          .then(async () => {
+            reject(
+              (await processStopped())
+                ? registrationError
+                : new NativeCheckTerminationUnconfirmedError(),
+            );
+          })
+          .catch(reject);
+      } else void stop();
       // The close listener rejects only once the process is gone and any pending
       // registration has settled, even though this log stream is already destroyed.
     });
     // Register after all lifecycle listeners are installed. A fast child can close
     // while its identity is being persisted; a failed registration must not orphan it.
-    if (child.pid !== undefined && options.onSpawn) {
+    if (child.pid !== undefined) {
       const pid = child.pid;
-      registration = Promise.resolve()
-        .then(() => options.onSpawn!({ pid }))
+      registration = Promise.race([
+        Promise.resolve().then(async () => {
+          childIdentity = (await readProcessIdentity(pid)) ?? undefined;
+          registrationController.signal.throwIfAborted();
+          instance = {
+            pid,
+            ...(childIdentity === undefined ? {} : { identity: childIdentity }),
+            instanceId,
+            ownerPid: process.pid,
+          };
+          await options.onSpawn?.({ ...instance, signal: registrationController.signal });
+        }),
+        registrationDeadline,
+      ])
+        .then(() => {
+          if (!closed && registrationError === null) {
+            commandStarted = true;
+            start();
+          }
+        })
         .catch(async (error) => {
           registrationError = error;
-          if (child.exitCode === null && child.signalCode === null)
-            await terminateProcessTree(child).catch(() => child.kill('SIGKILL'));
+          if (child.exitCode === null && child.signalCode === null) await stop();
+        })
+        .finally(() => {
+          registrationSettled = true;
+          if (closed) clearTimeout(timer);
         });
     }
   });
+}
+
+export function executeNativeCheck(
+  options: Parameters<typeof executeNativeCheckOperation>[0],
+): ReturnType<typeof executeNativeCheckOperation> {
+  return observeRuntimeOperation(
+    {
+      projectRoot: () => options.projectRoot,
+      workflow: 'native',
+      kind: 'check',
+      command: 'check',
+      traceName: options.plan.name,
+      exitCode: (result) => (result.status === 'passed' ? 0 : result.exitCode || 1),
+    },
+    () => executeNativeCheckOperation(options),
+  );
 }

@@ -330,7 +330,13 @@ async function archiveCasPaths(
     directory,
     originalRecord: path.join(directory, `${operation.id}.original.json`),
     postRecord: path.join(directory, `${operation.id}.post.json`),
-    candidate: path.join(directory, `${operation.id}.candidate`),
+    // 发布使用硬链接，候选必须与目标位于同一卷。
+    candidate: path.join(
+      path.dirname(target),
+      '.comet-archive-staging',
+      journal.id,
+      `${operation.id}.candidate`,
+    ),
     originalQuarantine: path.join(path.dirname(target), `${prefix}.original`),
     rollbackQuarantine: path.join(path.dirname(target), `${prefix}.rollback`),
   };
@@ -719,14 +725,14 @@ async function ensureWriteCandidate(options: {
     return cas.candidate;
   }
   await ensureNativeProtectedDirectory({
-    root: options.paths.runtimeDir,
-    directory: cas.directory,
-    label: `Archive CAS ${options.operation.id} records`,
+    root: nativeStorageRoot(options.paths, cas.candidate),
+    directory: path.dirname(cas.candidate),
+    label: `Archive CAS ${options.operation.id} same-volume candidate`,
   });
   await copyNativeProtectedFile({
     sourceRoot: nativeStorageRoot(options.paths, options.staged),
     source: options.staged,
-    targetRoot: options.paths.runtimeDir,
+    targetRoot: nativeStorageRoot(options.paths, cas.candidate),
     target: cas.candidate,
     maxBytes: null,
     label: `Archive transaction staged file ${options.operation.staged}`,
@@ -1458,6 +1464,32 @@ async function rollbackMove(
   await fs.rename(target, source);
 }
 
+async function cleanupArchiveStagingDirectories(
+  paths: NativeProjectPaths,
+  journal: NativeArchiveTransactionJournalV2,
+): Promise<void> {
+  for (const operation of journal.operations) {
+    if (operation.type !== 'write') continue;
+    const target = await resolveRef(paths, operation.target);
+    const cas = await archiveCasPaths(paths, journal, operation, target);
+    // 只移除已校验的空目录；保留中断事务或其他进程留下的文件。
+    for (const directory of [
+      path.dirname(cas.candidate),
+      path.dirname(path.dirname(cas.candidate)),
+    ]) {
+      await resolveContainedNativePath(nativeStorageRoot(paths, directory), directory);
+      try {
+        await fs.rmdir(directory);
+      } catch (error) {
+        if (
+          !['ENOENT', 'ENOTEMPTY', 'EEXIST'].includes((error as NodeJS.ErrnoException).code ?? '')
+        )
+          throw error;
+      }
+    }
+  }
+}
+
 export async function rollbackNativeArchiveTransactionV2(
   paths: NativeProjectPaths,
   journal: NativeArchiveTransactionJournalV2,
@@ -1484,6 +1516,7 @@ export async function rollbackNativeArchiveTransactionV2(
     if (operation.type === 'move') await rollbackMove(paths, operation);
     else await rollbackWriteOrRemove(paths, current, operation, hooks);
   }
+  await cleanupArchiveStagingDirectories(paths, current);
   await appendNativeTransactionEvent(paths, current.id, 'rollback-completed');
   current = await setStatus(paths, current, 'rolled-back');
   return current;
@@ -1570,7 +1603,10 @@ export async function finalizeNativeArchiveTransactionV2(
   journal: NativeArchiveTransactionJournalV2,
   event: 'archive-finalization-started' | 'archive-finalized' | 'commit',
 ): Promise<NativeArchiveTransactionJournalV2> {
-  if (event === 'commit') await cleanupCommittedArchiveCas(paths, journal);
+  if (event === 'commit') {
+    await cleanupCommittedArchiveCas(paths, journal);
+    await cleanupArchiveStagingDirectories(paths, journal);
+  }
   await appendNativeTransactionEvent(paths, journal.id, event);
   return event === 'commit' ? setStatus(paths, journal, 'committed') : journal;
 }

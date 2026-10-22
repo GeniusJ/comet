@@ -69,6 +69,28 @@ function candidate(overrides: Partial<AgentContextCandidate> = {}): AgentContext
 }
 
 describe('Agent Experience Journal', () => {
+  it('validates a complete capture batch before writing and preserves retry state for duplicate IDs', async () => {
+    const store = new MemoryAgentExperienceJournalStore();
+    const journal = new AgentExperienceJournal(store);
+    await expect(
+      journal.captureMany([
+        event(),
+        { ...event(), schema: 'invalid' } as unknown as AgentExperienceEvent,
+      ]),
+    ).rejects.toThrow();
+    expect((await store.read()).events).toEqual([]);
+    await journal.captureMany([event(), event(), event({ eventId: 'event-2' })]);
+    await journal.captureMany([event()]);
+    expect((await store.read()).events.map((entry) => entry.eventId)).toEqual([
+      'event-1',
+      'event-2',
+    ]);
+    expect((await store.read()).reflections['event-1']).toMatchObject({
+      status: 'pending',
+      attempts: 0,
+    });
+  });
+
   it('validates the public envelope and requires project identity', () => {
     expect(validateAgentExperienceEvent(event())).toMatchObject({
       schema: AGENT_EXPERIENCE_SCHEMA,
@@ -792,6 +814,64 @@ describe('Agent Learning Coordinator', () => {
 });
 
 describe('Context Director', () => {
+  it('keeps an explicit phase preference visible before spending the budget on project advice', async () => {
+    const director = new ContextDirector({ defaultCharBudget: 2000 });
+    const preference = candidate({
+      id: 'verify-preference',
+      content: 'Use the requested verification Skill. '.repeat(15),
+      selectors: { phases: ['verify'] },
+    });
+    const advice = [1, 2, 3].map((index) =>
+      candidate({
+        id: `advice-${index}`,
+        owner: 'project-knowledge',
+        scope: 'project',
+        memoryType: 'project-policy',
+        authority: 'repository',
+        title: `Advice ${index}`,
+        content: 'Project advice. '.repeat(60),
+      }),
+    );
+    const selected = await director.select([...advice, preference], {
+      task: 'Verify the task',
+      phase: 'verify',
+    });
+    expect(selected.coreMemory.map((entry) => entry.id)).toContain('verify-preference');
+    expect(selected.text.length).toBeLessThanOrEqual(2000);
+  });
+  it('persists one delivery batch atomically and reuses its receipts for a restored session', async () => {
+    let value: unknown = null;
+    const storage = {
+      read: async () => value,
+      write: vi.fn(async (next: unknown) => {
+        value = next;
+      }),
+    };
+    const candidates = [1, 2, 3].map((index) =>
+      candidate({ id: `preference-${index}`, title: `Preference ${index}` }),
+    );
+    const director = new ContextDirector({
+      applications: new StorageAgentContextApplicationStore(storage),
+    });
+    const first = await director.select(candidates, {
+      task: 'Verify delivery',
+      sessionId: 'receiver',
+    });
+    expect(first.applications).toHaveLength(3);
+    expect(storage.write).toHaveBeenCalledTimes(1);
+    const restored = new ContextDirector({
+      applications: new StorageAgentContextApplicationStore(storage),
+    });
+    const snapshot = await restored.select(candidates, {
+      task: 'Verify delivery',
+      sessionId: 'receiver',
+      contextMode: 'snapshot',
+    });
+    expect(snapshot.applications.map((entry) => entry.applicationId)).toEqual(
+      first.applications.map((entry) => entry.applicationId),
+    );
+    expect(storage.write).toHaveBeenCalledTimes(1);
+  });
   it('discovers scoped project references before file selection without activating policies', async () => {
     const director = new ContextDirector();
     const knowledge = candidate({
@@ -951,7 +1031,7 @@ describe('Context Director', () => {
       title: '模块 <边界>',
       summary: 'domains 模块不直接访问文件系统',
       content: '很长'.repeat(100),
-      selectors: { projectId: 'project-1', paths: ['domains/*'] },
+      selectors: { projectId: 'project-1', paths: ['domains/**'] },
       sources: [{ type: 'repository', source: 'AGENTS.md' }],
     });
     const selection = await director.select([candidate(), projectModel], {
@@ -1028,6 +1108,43 @@ describe('Context Director', () => {
     expect(contextOutcomeTargetIds(references, 'plugin.personal')).toEqual(['shared-id']);
     expect(contextOutcomeTargetIds(references, 'plugin.project')).toEqual(['shared-id']);
     expect(contextOutcomeTargetIds(references, 'plugin.other')).toEqual([]);
+  });
+
+  it('delivers stage preferences at each phase and restores snapshots without duplicate applications', async () => {
+    const applications = new MemoryAgentContextApplicationStore();
+    const policy = candidate({
+      memoryType: 'collaboration-policy',
+      content: 'Use the requested Skill during Build and Verify.',
+      selectors: { phases: ['build', 'verify'] },
+    });
+    const request = { task: 'Implement feature', sessionId: 'builder', phase: 'build' };
+    const director = new ContextDirector({ applications });
+    expect((await director.select([policy], { ...request, phase: 'shape' })).text).toBe('');
+    const build = await director.select([policy], request);
+    expect(build.activePolicies).toEqual([policy]);
+    expect((await director.select([policy], request)).text).toBe('');
+    const verify = await director.select([policy], { ...request, phase: 'verify' });
+    expect(verify.activePolicies).toEqual([policy]);
+    const restored = await new ContextDirector({ applications }).select([policy], {
+      ...request,
+      contextMode: 'snapshot',
+    });
+    expect(restored.activePolicies).toEqual([policy]);
+    expect(restored.applications[0]?.applicationId).toBe(build.applications[0]?.applicationId);
+    expect(await applications.list()).toHaveLength(2);
+    const independent = await director.select([policy], {
+      ...request,
+      phase: 'verify',
+      sessionId: 'verifier',
+      contextMode: 'snapshot',
+    });
+    expect(independent.activePolicies).toEqual([policy]);
+    expect(await applications.list()).toHaveLength(3);
+    const changed = { ...policy, content: 'The user corrected the preferred Skill.' };
+    const refreshed = await director.select([changed], { ...request, contextMode: 'snapshot' });
+    expect(refreshed.activePolicies).toEqual([changed]);
+    expect(refreshed.applications[0]?.applicationId).not.toBe(build.applications[0]?.applicationId);
+    expect((await director.select([], { ...request, contextMode: 'snapshot' })).text).toBe('');
   });
 
   it('does not redeliver unchanged units and uses outcome feedback in later ranking', async () => {

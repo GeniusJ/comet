@@ -6,6 +6,7 @@ import path from 'node:path';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
+import { ensureCometProjectGitignore } from '../../../domains/workflow-contract/project-gitignore.js';
 import { nativeArchiveCommand } from '../../../domains/comet-native/native-archive-command.js';
 import {
   hashNativeParentContract,
@@ -293,20 +294,20 @@ async function writeMergedChildProjection(options: {
 }): Promise<void> {
   const directory = path.join(options.paths.archiveDir, `2026-08-11-${options.name}`);
   await fs.mkdir(directory, { recursive: true });
-  await writeNativePortableState(
-    path.join(directory, 'comet-state.yaml'),
-    {
-      ...options.source,
-      name: options.name,
-      workspace: {
-        isolation: 'worktree',
-        change_branch: `comet/${options.name}`,
-        target_branch: options.parentBranch,
-        finish: 'merge',
-      },
+  const projection = {
+    ...options.source,
+    name: options.name,
+    workspace: {
+      isolation: 'worktree' as const,
+      change_branch: `comet/${options.name}`,
+      target_branch: options.parentBranch,
+      finish: 'merge' as const,
     },
-    { containedRoot: options.paths.nativeRoot },
-  );
+  };
+  delete projection.verifier_action;
+  await writeNativePortableState(path.join(directory, 'comet-state.yaml'), projection, {
+    containedRoot: options.paths.nativeRoot,
+  });
 }
 
 describe('Native parent and child changes', () => {
@@ -761,7 +762,9 @@ children:
     await writeProjectConfig(repository, defaultProjectConfig('docs', 'en'));
     git(repository, ['add', '.']);
     git(repository, ['commit', '-m', 'configure comet']);
-    expect((await nativeNewCommand(['parent'], repository)).exitCode).toBe(0);
+    expect((await nativeNewCommand(['parent', '--runtime', 'compat'], repository)).exitCode).toBe(
+      0,
+    );
     const paths = await nativeProjectPaths(repository, 'docs');
     const directory = nativePortableChangeDir(paths, 'parent');
     await fs.writeFile(path.join(directory, 'brief.md'), PARENT_BRIEF);
@@ -831,7 +834,9 @@ children:
     await writeProjectConfig(repository, defaultProjectConfig('docs', 'en'));
     git(repository, ['add', '.']);
     git(repository, ['commit', '-m', 'seed parent']);
-    expect((await nativeNewCommand(['parent'], repository)).exitCode).toBe(0);
+    expect((await nativeNewCommand(['parent', '--runtime', 'compat'], repository)).exitCode).toBe(
+      0,
+    );
     const paths = await nativeProjectPaths(repository, 'docs');
     const directory = nativePortableChangeDir(paths, 'parent');
     await fs.writeFile(path.join(directory, 'brief.md'), PARENT_BRIEF);
@@ -879,7 +884,7 @@ children:
     git(repository, ['add', '.']);
     git(repository, ['commit', '--allow-empty', '-m', 'seed parent integration branch']);
 
-    const parentCreated = await nativeNewCommand(['parent'], repository);
+    const parentCreated = await nativeNewCommand(['parent', '--runtime', 'compat'], repository);
     expect(parentCreated.exitCode).toBe(0);
     const parentPaths = await nativeProjectPaths(repository, 'docs');
     await ensureNativeDirectories(parentPaths);
@@ -931,9 +936,12 @@ children:
     config.default_workflow = 'native';
     await writeProjectConfig(repository, config);
 
-    const parentCreated = await nativeNewCommand(['parent', '--isolation', 'current'], repository);
+    const parentCreated = await nativeNewCommand(
+      ['parent', '--isolation', 'current', '--runtime', 'compat'],
+      repository,
+    );
     expect(parentCreated.exitCode).toBe(0);
-    const parentPaths = await nativeProjectPaths(repository, 'docs');
+    let parentPaths = await nativeProjectPaths(repository, 'docs');
     await ensureNativeDirectories(parentPaths);
     const parentDir = nativePortableChangeDir(parentPaths, 'parent');
     await fs.writeFile(path.join(parentDir, 'brief.md'), PARENT_BRIEF);
@@ -957,10 +965,7 @@ children:
     git(repository, ['init', '-b', 'main']);
     git(repository, ['config', 'user.email', 'native@example.test']);
     git(repository, ['config', 'user.name', 'Native Test']);
-    await fs.writeFile(
-      path.join(repository, '.gitignore'),
-      '.comet/runtime/\n.comet/current-change.json\n',
-    );
+    await ensureCometProjectGitignore(repository);
     git(repository, ['add', '.']);
     git(repository, ['commit', '--allow-empty', '-m', 'seed after the change exists']);
 
@@ -976,6 +981,22 @@ children:
         ],
       },
     });
+    const previousRuntimeRoot = parentPaths.workspaceRuntimeRoot;
+    parentPaths = await nativeProjectPaths(repository, 'docs');
+    expect(parentPaths.workspaceRuntimeRoot).not.toBe(previousRuntimeRoot);
+    const recovered = await nativeNextCommand(
+      ['parent', '--summary', 'Recover the portable Shape in the new Git workspace'],
+      repository,
+    );
+    expect(recovered.data).toMatchObject({
+      state: {
+        phase: 'shape',
+        status: 'active',
+        workspace: { change_branch: null, target_branch: null },
+      },
+      recovery: { reason: 'missing', action: 'resume-stable-boundary' },
+    });
+
     const parentPrepared = await nativeNextCommand(
       [
         'parent',
@@ -1022,7 +1043,7 @@ children:
     config.workflows = ['native', 'classic'];
     config.default_workflow = 'native';
     await writeProjectConfig(repository, config);
-    await nativeNewCommand(['parent', '--isolation', 'current'], repository);
+    await nativeNewCommand(['parent', '--isolation', 'current', '--runtime', 'compat'], repository);
     const paths = await nativeProjectPaths(repository, 'docs');
     await ensureNativeDirectories(paths);
     const changeDir = nativePortableChangeDir(paths, 'parent');
@@ -1032,12 +1053,14 @@ children:
     git(repository, ['init', '-b', 'main']);
     git(repository, ['config', 'user.email', 'native@example.test']);
     git(repository, ['config', 'user.name', 'Native Test']);
-    await fs.writeFile(
-      path.join(repository, '.gitignore'),
-      '.comet/runtime/\n.comet/current-change.json\n',
-    );
+    await ensureCometProjectGitignore(repository);
     git(repository, ['add', '.']);
     git(repository, ['commit', '-m', 'seed after the change exists']);
+    const recovered = await nativeNextCommand(
+      ['parent', '--summary', 'Recover the portable Shape in the new Git workspace'],
+      repository,
+    );
+    expect(recovered.data).toMatchObject({ recovery: { reason: 'missing' } });
     await fs.writeFile(path.join(repository, 'uncommitted.txt'), 'not part of the baseline\n');
 
     await expect(nativeDoctorCommand(['parent'], repository)).resolves.toMatchObject({
@@ -1074,7 +1097,7 @@ children:
     config.workflows = ['native', 'classic'];
     config.default_workflow = 'native';
     await writeProjectConfig(repository, config);
-    await nativeNewCommand(['parent', '--isolation', 'current'], repository);
+    await nativeNewCommand(['parent', '--isolation', 'current', '--runtime', 'compat'], repository);
     const paths = await nativeProjectPaths(repository, 'docs');
     await ensureNativeDirectories(paths);
     const changeDir = nativePortableChangeDir(paths, 'parent');
@@ -1084,12 +1107,15 @@ children:
     git(repository, ['init', '-b', 'main']);
     git(repository, ['config', 'user.email', 'native@example.test']);
     git(repository, ['config', 'user.name', 'Native Test']);
-    await fs.writeFile(
-      path.join(repository, '.gitignore'),
-      '.comet/runtime/\n.comet/current-change.json\n',
-    );
+    await ensureCometProjectGitignore(repository);
     git(repository, ['add', '.']);
     git(repository, ['commit', '-m', 'seed after the change exists']);
+    const currentPaths = await nativeProjectPaths(repository, 'docs');
+    const recovered = await nativeNextCommand(
+      ['parent', '--summary', 'Recover the portable Shape in the new Git workspace'],
+      repository,
+    );
+    expect(recovered.data).toMatchObject({ recovery: { reason: 'missing' } });
     const head = git(repository, ['rev-parse', 'HEAD']);
     const supervisor = createNativeSupervisorState({
       parent: 'parent',
@@ -1105,7 +1131,7 @@ children:
       projectRoot: repository,
       runId: 'active-builder',
     });
-    await writeNativeSupervisorState(paths, active.state);
+    await writeNativeSupervisorState(currentPaths, active.state);
 
     await expect(nativeDoctorCommand(['parent'], repository)).resolves.toMatchObject({
       exitCode: 65,
@@ -1143,10 +1169,7 @@ children:
     config.workflows = ['native', 'classic'];
     config.default_workflow = 'native';
     await writeProjectConfig(repository, config);
-    await fs.writeFile(
-      path.join(repository, '.gitignore'),
-      '.comet/runtime/\n.comet/current-change.json\n',
-    );
+    await ensureCometProjectGitignore(repository);
     await fs.mkdir(path.join(repository, 'src'), { recursive: true });
     await fs.writeFile(path.join(repository, 'src', 'base.ts'), 'export const base = true;\n');
     await fs.mkdir(path.join(repository, 'openspec', 'changes', 'child-a'), { recursive: true });
@@ -1157,7 +1180,7 @@ children:
     git(repository, ['add', '.']);
     git(repository, ['commit', '-m', 'seed parent integration branch']);
 
-    const parentCreated = await nativeNewCommand(['parent'], repository);
+    const parentCreated = await nativeNewCommand(['parent', '--runtime', 'compat'], repository);
     expect(parentCreated.exitCode).toBe(0);
     const parentPaths = await nativeProjectPaths(repository, 'docs');
     await ensureNativeDirectories(parentPaths);
@@ -1241,7 +1264,15 @@ children:
     expect(git(repository, ['status', '--short'])).toBe('');
 
     const earlyDependentCreated = await nativeNewCommand(
-      ['child-b', '--isolation', 'worktree', '--target-branch', 'integration'],
+      [
+        'child-b',
+        '--isolation',
+        'worktree',
+        '--target-branch',
+        'integration',
+        '--runtime',
+        'compat',
+      ],
       repository,
     );
     const earlyDependentRoot = data(earlyDependentCreated).preparation?.projectRoot;
@@ -1264,7 +1295,15 @@ children:
     });
 
     const childCreated = await nativeNewCommand(
-      ['child-a', '--isolation', 'worktree', '--target-branch', 'integration'],
+      [
+        'child-a',
+        '--isolation',
+        'worktree',
+        '--target-branch',
+        'integration',
+        '--runtime',
+        'compat',
+      ],
       repository,
     );
     const childRoot = data(childCreated).preparation?.projectRoot;
@@ -1326,7 +1365,15 @@ children:
 
     const parentHeadAfterA = git(repository, ['rev-parse', 'HEAD']);
     const dependentCreated = await nativeNewCommand(
-      ['child-b', '--isolation', 'worktree', '--target-branch', 'integration'],
+      [
+        'child-b',
+        '--isolation',
+        'worktree',
+        '--target-branch',
+        'integration',
+        '--runtime',
+        'compat',
+      ],
       repository,
     );
     const dependentRoot = data(dependentCreated).preparation?.projectRoot;

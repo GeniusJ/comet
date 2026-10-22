@@ -1,3 +1,4 @@
+import { readNodeHookArguments } from '../../platform/process/hook-command.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createHash } from 'crypto';
 import { spawnSync } from 'child_process';
@@ -443,7 +444,11 @@ describe('doctor command', () => {
       }
 
       const hooks = await fs.readFile(path.join(secondary, '.codex', 'hooks.json'), 'utf8');
-      expect(hooks.replaceAll('\\', '/')).toContain(
+      expect(
+        readNodeHookArguments(
+          JSON.parse(hooks).hooks.PreToolUse[0].hooks[0].command,
+        )![0].replaceAll('\\', '/'),
+      ).toContain(
         `${secondary.replaceAll('\\', '/')}/.agents/skills/comet/scripts/comet-hook-router.mjs`,
       );
       await expect(
@@ -506,7 +511,11 @@ describe('doctor command', () => {
       }
 
       const hooks = await fs.readFile(path.join(secondary, '.codex', 'hooks.json'), 'utf8');
-      expect(hooks.replaceAll('\\', '/')).toContain(
+      expect(
+        readNodeHookArguments(
+          JSON.parse(hooks).hooks.PreToolUse[0].hooks[0].command,
+        )![0].replaceAll('\\', '/'),
+      ).toContain(
         `${secondary.replaceAll('\\', '/')}/.agents/skills/comet/scripts/comet-hook-router.mjs`,
       );
     } finally {
@@ -594,6 +603,24 @@ describe('doctor command', () => {
     } finally {
       process.env.PATH = previousPath;
     }
+  });
+
+  it('reports an unreadable CodeGraph registration without telling the user it is missing', async () => {
+    const homeDir = path.join(tmpDir, 'codegraph-home');
+    await writeProjectConfig(tmpDir, defaultProjectConfig('docs'));
+    await fs.writeFile(path.join(tmpDir, 'opencode.jsonc'), '{"mcp": ');
+    const payload = await collectDoctorPayload(tmpDir, 'project', homeDir);
+    expect(payload.codegraph).toMatchObject({
+      mcpStatus: 'unavailable',
+      agents: [expect.objectContaining({ id: 'opencode', registrationStatus: 'unknown' })],
+    });
+    expect(payload.results).toContainEqual(
+      expect.objectContaining({
+        check: 'CodeGraph MCP registration',
+        status: 'warn',
+        message: expect.stringContaining('unable to inspect'),
+      }),
+    );
   });
 
   it('reports CodeGraph CLI, project index, and Codex MCP registration as separate layers', async () => {
@@ -1251,7 +1278,7 @@ describe('doctor command', () => {
   });
 
   it('fails a Classic change check without reading through its runtime directory link', async () => {
-    const initialized = await state(tmpDir, 'init', 'runtime-link', 'full');
+    const initialized = await state(tmpDir, 'init', 'runtime-link', 'full', '--runtime', 'compat');
     expect(initialized.status, initialized.stderr).toBe(0);
     const changeDir = path.join(tmpDir, 'openspec', 'changes', 'runtime-link');
     const runtimeDir = path.join(changeDir, '.comet');
@@ -1282,7 +1309,7 @@ describe('doctor command', () => {
 
   it('accepts current Comet state fields while a standalone OpenSpec root coexists', async () => {
     const changeDir = path.join(tmpDir, 'openspec', 'changes', 'current-state');
-    await state(tmpDir, 'init', 'current-state', 'full');
+    await state(tmpDir, 'init', 'current-state', 'full', '--runtime', 'compat');
     await state(tmpDir, 'set', 'current-state', 'phase', 'verify');
     await fs.mkdir(path.join(tmpDir, 'docs', 'openspec'), { recursive: true });
     const before = await fs.readFile(path.join(changeDir, '.comet.yaml'), 'utf8');
@@ -1551,6 +1578,54 @@ describe('doctor command', () => {
       status: 'pass',
       message: 'exactly one managed Router Hook present',
     });
+  });
+
+  it('reuses managed asset observations within one report and refreshes the next report', async () => {
+    await installManagedCometSkills(tmpDir, '.claude');
+    await installManagedCometSkills(tmpDir, '.gemini');
+    const managedFile = path.join(
+      tmpDir,
+      '.claude',
+      'skills',
+      'comet-classic',
+      'reference',
+      'auto-transition.md',
+    );
+    const bundledRouter = path.resolve(
+      'assets',
+      'skills',
+      'comet',
+      'scripts',
+      'comet-hook-router.mjs',
+    );
+    const access = vi.spyOn(fs, 'access');
+    const read = vi.spyOn(fs, 'readFile');
+    try {
+      const first = await collectDoctorPayload(tmpDir);
+      expect(first.results).toContainEqual({
+        check: 'skills: Claude Code (project)',
+        status: 'pass',
+        message: expect.stringContaining('complete'),
+      });
+      expect(access.mock.calls.filter(([file]) => file === managedFile)).toHaveLength(1);
+      expect(read.mock.calls.filter(([file]) => file === bundledRouter)).toHaveLength(1);
+      expect(first.results.filter(({ check }) => check.startsWith('hook runtime:'))).toHaveLength(
+        2,
+      );
+
+      await fs.unlink(managedFile);
+      const second = await collectDoctorPayload(tmpDir);
+      expect(second.results).toContainEqual({
+        check: 'skills: Claude Code (project)',
+        status: 'warn',
+        message: expect.stringContaining('partial'),
+      });
+      expect(access.mock.calls.filter(([file]) => file === managedFile)).toHaveLength(2);
+      expect(read.mock.calls.filter(([file]) => file === bundledRouter)).toHaveLength(2);
+    } finally {
+      access.mockRestore();
+      read.mockRestore();
+    }
   });
 
   it('detects and repairs an outdated Hook Router runtime', async () => {
@@ -2060,7 +2135,7 @@ describe('doctor command', () => {
 
   it('uses the shared schema and leaves invalid state untouched', async () => {
     const invalidChangeDir = path.join(tmpDir, 'openspec', 'changes', 'top-level-invalid');
-    await state(tmpDir, 'init', 'top-level-invalid', 'full');
+    await state(tmpDir, 'init', 'top-level-invalid', 'full', '--runtime', 'compat');
     await fs.appendFile(path.join(invalidChangeDir, '.comet.yaml'), 'unknown_root_field: true\n');
     const before = await fs.readFile(path.join(invalidChangeDir, '.comet.yaml'), 'utf8');
 
@@ -2089,7 +2164,7 @@ describe('doctor command', () => {
   });
 
   it('uses Classic diagnostics for comet yaml validity messages', async () => {
-    await state(tmpDir, 'init', 'demo', 'full');
+    await state(tmpDir, 'init', 'demo', 'full', '--runtime', 'compat');
 
     const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
     let json: string;
@@ -2109,7 +2184,7 @@ describe('doctor command', () => {
   });
 
   it('does not synthesize runtime evidence while inspecting a legacy change', async () => {
-    await state(tmpDir, 'init', 'demo', 'full');
+    await state(tmpDir, 'init', 'demo', 'full', '--runtime', 'compat');
     const stateFile = path.join(tmpDir, 'openspec', 'changes', 'demo', '.comet.yaml');
     const before = await fs.readFile(stateFile, 'utf8');
 
@@ -2129,7 +2204,7 @@ describe('doctor command', () => {
 
   it('prints invalid comet yaml errors together with a concrete next step', async () => {
     const invalidChangeDir = path.join(tmpDir, 'openspec', 'changes', 'top-level-invalid');
-    await state(tmpDir, 'init', 'top-level-invalid', 'full');
+    await state(tmpDir, 'init', 'top-level-invalid', 'full', '--runtime', 'compat');
     await fs.appendFile(path.join(invalidChangeDir, '.comet.yaml'), 'unknown_root_field: true\n');
 
     const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);

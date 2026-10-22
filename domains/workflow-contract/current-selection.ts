@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 
+import { memoizedHookRead } from '../../platform/process/hook-read-cache.js';
 import { readFileRaceSafe } from '../../platform/fs/race-safe-read.js';
 import type { CometProjectWorkflow } from './types.js';
 
@@ -12,9 +13,10 @@ export type CometWorkflow = CometProjectWorkflow;
 
 export interface CometCurrentSelection {
   schema: typeof COMET_CURRENT_SELECTION_SCHEMA;
-  workflow: CometWorkflow;
+  workflow: CometWorkflow | 'application';
   change: string;
   branch: string | null;
+  applicationId?: string;
 }
 
 export interface LegacyClassicSelection {
@@ -73,9 +75,22 @@ function parseSelection(source: string): { selection: CometCurrentSelection; leg
   if (value.schema !== COMET_CURRENT_SELECTION_SCHEMA) {
     throw new Error(`current change selection schema must be ${COMET_CURRENT_SELECTION_SCHEMA}`);
   }
-  if (value.workflow !== 'native' && value.workflow !== 'classic') {
-    throw new Error('current change selection workflow must be native or classic');
+  if (
+    value.workflow !== 'native' &&
+    value.workflow !== 'classic' &&
+    value.workflow !== 'application'
+  ) {
+    throw new Error('current change selection workflow must be native, classic or application');
   }
+  if (
+    value.workflow === 'application' &&
+    (typeof value.applicationId !== 'string' ||
+      !value.applicationId.trim() ||
+      value.branch !== null)
+  )
+    throw new Error('application selection requires applicationId and a null branch');
+  if (value.workflow !== 'application' && value.applicationId !== undefined)
+    throw new Error('built-in selection cannot retain another application identity');
   if (typeof value.change !== 'string') {
     throw new Error('current change selection change must be a string');
   }
@@ -109,6 +124,12 @@ export async function readCometCurrentSelection(
   return { status: 'selected', ...parsed };
 }
 
+/** 同一次 Hook 使用一个安全读取结果；Runtime 修改仍直接读取当前选择。 */
+export const readHookCurrentSelection = memoizedHookRead(
+  'readCometCurrentSelection',
+  (projectRoot: string) => readCometCurrentSelection(projectRoot),
+);
+
 export async function writeCometCurrentSelection(
   projectRoot: string,
   selection: CometCurrentSelection,
@@ -141,7 +162,7 @@ export async function clearCometCurrentSelection(projectRoot: string): Promise<v
 
 export async function clearCometCurrentSelectionIf(
   projectRoot: string,
-  workflow: CometWorkflow,
+  workflow: CometCurrentSelection['workflow'],
   change: string,
 ): Promise<boolean> {
   const current = await readCometCurrentSelection(projectRoot);

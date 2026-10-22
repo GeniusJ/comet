@@ -1,10 +1,14 @@
 """Unit tests for eval scaffold utilities."""
 
 import importlib
+import json
 import os
+import re
 import shlex
+import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import dotenv
@@ -12,6 +16,7 @@ import pytest
 
 from scaffold.python import utils
 from scaffold.python.skill_parser import load_skill_content, parse_skill_md
+from scaffold.python.tasks import load_task
 
 
 # The unchanged three-turn driver also takes about 16 s under Git Bash here;
@@ -22,7 +27,8 @@ AGENT_FIXTURE_TIMEOUT = 30 if os.name == "nt" else 10
 def _isolated_fake_agent_env(fake_bin: Path, agent: str) -> dict[str, str]:
     """Use only fixtures and Bash system tools, with no host Agent/auth fallback."""
     env = {
-        key: value for key, value in os.environ.items()
+        key: value
+        for key, value in os.environ.items()
         if key.upper() in {"SYSTEMROOT", "WINDIR", "TEMP", "TMP"}
     }
     env["PATH"] = f"{utils._to_bash_path(fake_bin)}:/usr/bin:/bin"
@@ -32,8 +38,10 @@ def _isolated_fake_agent_env(fake_bin: Path, agent: str) -> dict[str, str]:
     python_shim = fake_bin / "python3"
     python_shim.write_text(
         "#!/usr/bin/env bash\nexec "
-        + shlex.quote(utils._to_bash_path(Path(sys.executable))) + ' "$@"\n',
-        encoding="utf-8", newline="\n",
+        + shlex.quote(utils._to_bash_path(Path(sys.executable)))
+        + ' "$@"\n',
+        encoding="utf-8",
+        newline="\n",
     )
     python_shim.chmod(0o755)
     # A wrong Agent name must fail closed even if /usr/bin later gains a CLI.
@@ -44,7 +52,11 @@ def _isolated_fake_agent_env(fake_bin: Path, agent: str) -> dict[str, str]:
             target.chmod(0o755)
     resolved = subprocess.run(
         [utils.BASH_EXEC, "-c", 'command -v "$1"', "--", agent],
-        env=env, capture_output=True, text=True, check=True, timeout=5,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=5,
     )
     assert resolved.stdout.strip() == utils._to_bash_path(fake_bin / agent)
     return env
@@ -184,6 +196,32 @@ def test_run_shell_decodes_subprocess_output_as_utf8(monkeypatch):
     assert captured["kwargs"]["errors"] == "replace"
 
 
+def test_wsl_bash_preserves_eval_project_and_experiment_ownership(monkeypatch):
+    monkeypatch.setattr(utils.os, "name", "nt")
+    monkeypatch.setattr(utils, "BASH_EXEC", r"C:\Windows\System32\bash.exe")
+    scope = "a" * 64
+    env = utils._bash_env({"COMET_EVAL_PROJECT_ID": scope, "COMET_EVAL_EXPERIMENT_ID": "owned-run"})
+    assert env["COMET_EVAL_PROJECT_ID"] == scope
+    assert "COMET_EVAL_PROJECT_ID" in env["WSLENV"].split(":")
+    assert "COMET_EVAL_EXPERIMENT_ID" in env["WSLENV"].split(":")
+
+
+def test_run_shell_file_capture_keeps_stdout_and_stderr(monkeypatch, tmp_path: Path):
+    shell_dir = tmp_path / "shell"
+    shell_dir.mkdir()
+    (shell_dir / "docker.sh").write_text(
+        "#!/usr/bin/env bash\nprintf 'output\\n'\nprintf 'warning\\n' >&2\nexit 7\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(utils, "SHELL_DIR", shell_dir)
+
+    result = utils.run_shell("docker.sh", "check", check=False, capture_to_file=True)
+
+    assert result.returncode == 7
+    assert result.stdout == "output\n"
+    assert result.stderr == "warning\n"
+
+
 def test_to_bash_path_uses_msys_drive_prefix_for_git_bash(monkeypatch):
     monkeypatch.setattr(utils.os, "name", "nt")
     monkeypatch.setattr(utils, "BASH_EXEC", r"C:\Program Files\Git\bin\bash.exe")
@@ -315,7 +353,10 @@ def test_run_agent_in_docker_builds_the_selected_adapter_command(monkeypatch, tm
     calls = []
 
     def fake_run_shell(script, *args, **kwargs):
+        if args[0] == "cleanup-agent-turn":
+            return subprocess.CompletedProcess([script, *args], 0, "", "")
         calls.append((script, args, kwargs))
+        assert Path(args[3]).read_text(encoding="utf-8") == "inspect the task"
         return subprocess.CompletedProcess([script, *args], 0, "", "")
 
     monkeypatch.setattr(utils, "run_shell", fake_run_shell)
@@ -330,10 +371,11 @@ def test_run_agent_in_docker_builds_the_selected_adapter_command(monkeypatch, tm
     )
 
     assert result.returncode == 0
-    assert calls[0][1] == (
+    assert calls[0][1][:-2] == (
         "run-agent",
         str(tmp_path),
-        "inspect the task",
+        "--prompt-file",
+        calls[0][1][3],
         "--agent",
         "codex",
         "--model",
@@ -341,6 +383,176 @@ def test_run_agent_in_docker_builds_the_selected_adapter_command(monkeypatch, tm
         "--timeout",
         "42",
     )
+    assert calls[0][1][-2] == "--container-name"
+    assert re.fullmatch(r"comet-eval-turn-[a-f0-9]{32}", calls[0][1][-1])
+    assert not Path(calls[0][1][3]).exists()
+
+
+@pytest.mark.parametrize("agent", ["claude-code", "codex"])
+def test_single_turn_large_prompt_avoids_host_argv_and_cleans_up(monkeypatch, tmp_path, agent):
+    prompt = ("中文\r\nline\\path $() `echo no` 'quoted'\n" * 8000) + "no final newline"
+    files = []
+
+    def fake_run_shell(script, *args, **kwargs):
+        if args[0] == "cleanup-agent-turn":
+            return subprocess.CompletedProcess([script, *args], 0, "", "")
+        # Reproduce Windows CreateProcess's command-line limit without calling a model.
+        if sum(len(str(arg)) for arg in args) > 32767:
+            raise OSError(206, "The filename or extension is too long")
+        assert prompt not in args
+        assert args[2] == "--prompt-file"
+        file = Path(args[3])
+        files.append(file)
+        assert file.read_bytes() == prompt.encode("utf-8")
+        if os.name != "nt":
+            assert file.stat().st_mode & 0o077 == 0
+        return subprocess.CompletedProcess([script, *args], 0, "ok", "")
+
+    monkeypatch.setattr(utils, "run_shell", fake_run_shell)
+    monkeypatch.setattr(utils, "check_docker_available", lambda: True)
+    assert utils.run_agent_in_docker(tmp_path, prompt, agent=agent).returncode == 0
+    assert len(files) == 1
+    assert not files[0].exists()
+
+
+@pytest.mark.parametrize("failure", ["timeout", "exception"])
+def test_single_turn_prompt_file_is_removed_on_failure(monkeypatch, tmp_path, failure):
+    files = []
+
+    def fake_run_shell(script, *args, **kwargs):
+        if args[0] == "cleanup-agent-turn":
+            return subprocess.CompletedProcess([script, *args], 0, "", "")
+        files.append(Path(args[3]))
+        assert files[-1].read_text(encoding="utf-8") == "prompt body"
+        if failure == "timeout":
+            raise subprocess.TimeoutExpired([script, *args], 1)
+        raise RuntimeError("fixture failure")
+
+    monkeypatch.setattr(utils, "run_shell", fake_run_shell)
+    monkeypatch.setattr(utils, "check_docker_available", lambda: True)
+    if failure == "timeout":
+        assert utils.run_agent_in_docker(tmp_path, "prompt body").returncode == 124
+    else:
+        with pytest.raises(RuntimeError, match="fixture failure"):
+            utils.run_agent_in_docker(tmp_path, "prompt body")
+    assert not files[0].exists()
+
+
+@pytest.mark.parametrize("agent", ["claude-code", "codex"])
+@pytest.mark.parametrize("input_mode", ["file", "stdin"])
+def test_single_turn_runtime_preserves_prompt_stdin_without_body_in_argv(
+    tmp_path, agent, input_mode
+):
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / agent.replace("-code", "")).write_text(
+        "#!/usr/bin/env bash\n"
+        'printf "%s\\0" "$@" > "$FIXTURE_ARGS"\n'
+        'cat > "$FIXTURE_STDIN"\n'
+        'printf \'%s\\n\' \'{"type":"result","result":"fixture ok"}\'\n',
+        encoding="utf-8",
+    )
+    (fake_bin / agent.replace("-code", "")).chmod(0o755)
+    prompt = ("正文\r\nback\\slash $() `no` 'x'\n" * 3000) + "exact ending"
+    prompt_file = tmp_path / "prompt.txt"
+    prompt_file.write_bytes(prompt.encode("utf-8"))
+    args_file, stdin_file = tmp_path / "argv.bin", tmp_path / "stdin.bin"
+    env = _isolated_fake_agent_env(fake_bin, agent.replace("-code", ""))
+    env.update(
+        FIXTURE_ARGS=utils._to_bash_path(args_file), FIXTURE_STDIN=utils._to_bash_path(stdin_file)
+    )
+    command = [
+        utils.BASH_EXEC,
+        utils._to_bash_path(utils.SHELL_DIR / "run-agent-runtime.sh"),
+        agent,
+        "fixture-model",
+    ]
+    if input_mode == "file":
+        command.extend(["--prompt-file", utils._to_bash_path(prompt_file)])
+    else:
+        command.append("--prompt-stdin")
+    command.extend(["--", "--fixture-extra"])
+    result = subprocess.run(
+        command,
+        env=env,
+        input=prompt.encode("utf-8") if input_mode == "stdin" else None,
+        capture_output=True,
+        timeout=AGENT_FIXTURE_TIMEOUT,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr.decode("utf-8", errors="replace")
+    assert stdin_file.read_bytes() == prompt.encode("utf-8")
+    actual_args = args_file.read_bytes().split(b"\0")[:-1]
+    assert prompt.encode("utf-8") not in actual_args
+    assert b"--fixture-extra" in actual_args
+    if agent == "claude-code":
+        assert actual_args[0] == b"-p"
+        assert actual_args[1] == b"--dangerously-skip-permissions"
+    else:
+        assert actual_args[0] == b"exec"
+        assert b"-" in actual_args
+
+
+@pytest.mark.parametrize("agent", ["qoder", "codebuddy"])
+def test_single_turn_other_adapters_keep_existing_prompt_argument(monkeypatch, tmp_path, agent):
+    calls = []
+    monkeypatch.setattr(utils, "check_docker_available", lambda: True)
+
+    def fake_run_shell(script, *args, **kwargs):
+        calls.append(args)
+        return subprocess.CompletedProcess([script, *args], 0, "ok", "")
+
+    monkeypatch.setattr(utils, "run_shell", fake_run_shell)
+    assert utils.run_agent_in_docker(tmp_path, "existing body", agent=agent).returncode == 0
+    assert calls[0][:5] == ("run-agent", str(tmp_path), "existing body", "--agent", agent)
+
+
+@pytest.mark.parametrize("agent", ["claude-code", "codex"])
+def test_docker_single_turn_transports_prompt_file_readonly_and_streams_stdin(tmp_path, agent):
+    prompt = ("大快照\r\npath\\literal $() `not-run`\n" * 8000) + "no trailing newline"
+    prompt_file = tmp_path / "prompt.txt"
+    prompt_file.write_bytes(prompt.encode("utf-8"))
+    args_file, stdin_file = tmp_path / "docker-argv.bin", tmp_path / "docker-stdin.bin"
+    script = """
+source "$1"
+resolve_runtime_image() { printf '%s' fake-image; }
+prepare_agent_workspace_owner() { return 0; }
+build_env_args() { ENV_ARGS=(); }
+build_agent_runtime_mount_args() { RUNTIME_CONFIG_MOUNT_ARGS=(); RUNTIME_CONFIG_TMPFS_ARGS=(); }
+build_plugin_args() { PLUGIN_MOUNT_ARGS=(); PLUGIN_CLI_ARGS=(); }
+build_langfuse_plugin_args() { LANGFUSE_PLUGIN_MOUNT_ARGS=(); LANGFUSE_PLUGIN_CLI_ARGS=(); }
+build_trusted_oracle_mount_args() { TRUSTED_ORACLE_MOUNT_ARGS=(); }
+TIMEOUT_CMD=""
+docker() { if [[ "$1" == run ]]; then printf '%s\\0' "$@" > "$FIXTURE_ARGS"; cat > "$FIXTURE_STDIN"; fi; }
+docker_run_agent "$2" --prompt-file "$3" --agent "$4" --model fixture-model
+"""
+    result = subprocess.run(
+        [
+            utils.BASH_EXEC,
+            "-c",
+            script,
+            "_",
+            utils._to_bash_path(utils.SHELL_DIR / "docker.sh"),
+            utils._to_bash_path(tmp_path),
+            utils._to_bash_path(prompt_file),
+            agent,
+        ],
+        env={
+            **os.environ,
+            "FIXTURE_ARGS": utils._to_bash_path(args_file),
+            "FIXTURE_STDIN": utils._to_bash_path(stdin_file),
+        },
+        capture_output=True,
+        timeout=AGENT_FIXTURE_TIMEOUT,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr.decode("utf-8", errors="replace")
+    actual_args = args_file.read_bytes().split(b"\0")[:-1]
+    assert b"-i" in actual_args
+    assert any(arg.endswith(b"://opt/comet-eval-prompt.txt:ro") for arg in actual_args)
+    assert b"--prompt-stdin" in actual_args
+    assert prompt.encode("utf-8") not in actual_args
+    assert stdin_file.read_bytes() == prompt.encode("utf-8")
 
 
 def test_bash_env_bridges_langsmith_hook_log_to_wsl(monkeypatch):
@@ -363,6 +575,109 @@ def test_docker_loop_passes_langsmith_plugin_args_to_loop_driver():
     assert '${PLUGIN_CLI_ARGS[@]+"' in docker_sh
     assert 'bash //opt/scaffold-shell/run-claude-loop.sh "$prompt"' in docker_sh
     assert "CC_LANGSMITH_LOG_FILE" in docker_sh
+
+
+def test_optional_docker_arrays_use_bash32_nounset_safe_expansion():
+    source = (utils.SHELL_DIR / "docker.sh").read_text(encoding="utf-8")
+    for name in (
+        "EVAL_LABEL_ARGS", "ENV_ARGS", "COMET_RUNTIME_MOUNT_ARGS", "prompt_docker_args",
+        "prompt_mount_args", "RUNTIME_CONFIG_MOUNT_ARGS", "RUNTIME_CONFIG_TMPFS_ARGS",
+        "TRUSTED_ORACLE_MOUNT_ARGS", "PLUGIN_MOUNT_ARGS", "LANGFUSE_PLUGIN_MOUNT_ARGS",
+        "PLUGIN_CLI_ARGS", "LANGFUSE_PLUGIN_CLI_ARGS", "loop_args", "cmd", "custom_keys",
+    ):
+        safe = '${' + name + '[@]+"${' + name + '[@]}"}'
+        assert safe in source, name
+        assert '${' + name + '[@]}' not in source.replace(safe, ""), name
+    assert "mapfile" not in source
+
+
+@pytest.mark.parametrize(
+    "entry", ["generic", "validation", "single", "single-timeout", "claude-loop", "agent-loop"]
+)
+@pytest.mark.parametrize("populated", [False, True])
+def test_docker_optional_arrays_preserve_empty_and_quoted_arguments(tmp_path, entry, populated):
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    env = _isolated_fake_agent_env(fake_bin, "codex")
+    args_file = tmp_path / "docker-argv.bin"
+    script = r'''
+source "$1"
+docker_build() { printf '%s' fake-image; }
+resolve_runtime_image() { printf '%s' fake-image; }
+prepare_agent_workspace_owner() { :; }
+prepare_eval_runtime_data() { COMET_RUNTIME_MOUNT_ARGS=(); }
+build_env_args() { ENV_ARGS=(); }
+build_agent_runtime_mount_args() { RUNTIME_CONFIG_MOUNT_ARGS=(); RUNTIME_CONFIG_TMPFS_ARGS=(); }
+build_plugin_args() { PLUGIN_MOUNT_ARGS=(); PLUGIN_CLI_ARGS=(); }
+build_langfuse_plugin_args() { LANGFUSE_PLUGIN_MOUNT_ARGS=(); LANGFUSE_PLUGIN_CLI_ARGS=(); }
+build_trusted_oracle_mount_args() { TRUSTED_ORACLE_MOUNT_ARGS=(); }
+if [[ "$POPULATED" == 1 ]]; then
+  prepare_eval_runtime_data() { COMET_RUNTIME_MOUNT_ARGS=(-v 'runtime with spaces:*' ''); }
+  build_env_args() { ENV_ARGS=(-e 'FIXTURE=two words *'); }
+  build_agent_runtime_mount_args() {
+    RUNTIME_CONFIG_MOUNT_ARGS=(-v 'config with spaces:*');
+    RUNTIME_CONFIG_TMPFS_ARGS=(--tmpfs 'tmpfs with spaces:*');
+  }
+  build_plugin_args() { PLUGIN_MOUNT_ARGS=(-v 'plugin with spaces:*'); PLUGIN_CLI_ARGS=(--plugin-dir 'plugin dir *'); }
+fi
+TIMEOUT_CMD=""
+fixture_timeout() { shift 2; "$@"; }
+docker() { if [[ "$1" == run ]]; then printf '%s\0' "$@" > "$FIXTURE_ARGS"; fi; }
+case "$3" in
+  generic) docker_run "$2" printf 'generic value *';;
+  validation) docker_run_command "$2" -- 'printf "validation value *"';;
+  single) docker_run_agent "$2" 'prompt value *' --agent claude-code;;
+  single-timeout) TIMEOUT_CMD=fixture_timeout; docker_run_agent "$2" 'prompt value *' --agent claude-code;;
+  claude-loop) docker_run_claude_loop "$2" 'prompt value *';;
+  agent-loop) docker_run_agent_loop "$2" 'prompt value *' --agent codex;;
+esac
+'''
+    result = subprocess.run(
+        [utils.BASH_EXEC, "-c", script, "_", utils._to_bash_path(utils.SHELL_DIR / "docker.sh"),
+         utils._to_bash_path(tmp_path), entry],
+        env={**env, "FIXTURE_ARGS": utils._to_bash_path(args_file), "POPULATED": str(int(populated))},
+        capture_output=True, timeout=AGENT_FIXTURE_TIMEOUT, check=False,
+    )
+    assert result.returncode == 0, result.stderr.decode("utf-8", errors="replace")
+    args = args_file.read_bytes().split(b"\0")[:-1]
+    assert b"fake-image" in args
+    assert args.count(b"") == int(populated) + int(entry.startswith("single"))
+    if populated:
+        assert b"runtime with spaces:*" in args
+        if entry != "validation":
+            assert b"FIXTURE=two words *" in args
+        if entry not in {"generic", "validation"}:
+            assert b"config with spaces:*" in args
+            assert b"tmpfs with spaces:*" in args
+        if entry.startswith("single") or entry == "claude-loop":
+            assert b"plugin dir *" in args
+    if entry not in {"generic", "validation"}:
+        assert b"prompt value *" in args
+
+
+def test_application_runtime_metadata_parses_without_bash4_builtins(tmp_path):
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    env = _isolated_fake_agent_env(fake_bin, "codex")
+    script = r'''
+source "$1"
+mapfile() { echo 'Bash 4-only builtin used' >&2; return 99; }
+build_env_args
+build_agent_runtime_mount_args
+printf '%s\0' ${ENV_ARGS[@]+"${ENV_ARGS[@]}"}
+'''
+    context = {"preview": {"application": {"id": "example-app", "version": "1.0.0"},
+                           "runtimeIdentityHash": "fixture-hash"}}
+    result = subprocess.run(
+        [utils.BASH_EXEC, "-c", script, "_", utils._to_bash_path(utils.SHELL_DIR / "docker.sh")],
+        env={**env, "COMET_APPLICATION_EVAL_CONTEXT": json.dumps(context)},
+        capture_output=True, timeout=AGENT_FIXTURE_TIMEOUT, check=False,
+    )
+    assert result.returncode == 0, result.stderr.decode("utf-8", errors="replace")
+    args = result.stdout.split(b"\0")[:-1]
+    assert b"COMET_EVAL_APPLICATION_ID=example-app" in args
+    assert b"COMET_EVAL_APPLICATION_VERSION=1.0.0" in args
+    assert b"COMET_EVAL_APPLICATION_HASH=fixture-hash" in args
 
 
 def test_claude_loop_timeout_force_removes_its_named_container(monkeypatch, tmp_path: Path):
@@ -407,13 +722,47 @@ def test_agent_loop_timeout_force_removes_its_named_container(monkeypatch, tmp_p
     assert calls[1][1] == ("cleanup-agent-loop", str(tmp_path))
 
 
+@pytest.mark.parametrize(
+    ("runner", "run_mode", "cleanup_mode"),
+    [
+        ("run_claude_loop_in_docker", "run-claude-loop", "cleanup-claude-loop"),
+        ("run_agent_loop_in_docker", "run-agent-loop", "cleanup-agent-loop"),
+    ],
+)
+def test_loop_timeout_cleans_child_before_draining_inherited_pipe(
+    monkeypatch, tmp_path: Path, runner: str, run_mode: str, cleanup_mode: str
+):
+    """A timed-out Bash wrapper must not wait for its output-holding child."""
+    shell_dir = tmp_path / "shell"
+    shell_dir.mkdir()
+    (shell_dir / "docker.sh").write_text(
+        "#!/usr/bin/env bash\n"
+        'case "$1" in\n'
+        f'  {run_mode}) sleep 5 & echo $! > "$2/child.pid"; wait ;;\n'
+        f'  {cleanup_mode}) touch "$2/cleaned"; '
+        'kill "$(cat "$2/child.pid")" 2>/dev/null || true ;;\n'
+        "esac\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(utils, "SHELL_DIR", shell_dir)
+
+    started = time.monotonic()
+    result = getattr(utils, runner)(tmp_path, ["prompt"], timeout=0.2)
+    elapsed = time.monotonic() - started
+
+    assert result.returncode == 124
+    assert (tmp_path / "cleaned").exists()
+    assert elapsed < 3
+
+
 def test_docker_subject_run_uses_controller_verified_immutable_image_identity():
     docker_sh = (utils.SHELL_DIR / "docker.sh").read_text(encoding="utf-8")
 
     assert "docker_execution_identity" in docker_sh
     assert "claude --version" in docker_sh
     assert "runtime_image_id" in docker_sh
-    assert 'image_id=$(resolve_runtime_image "$dir" "$expected_image_id")' in docker_sh
+    assert 'image_id=$(resolve_runtime_image "$dir" "$expected_image_id" "$agent")' in docker_sh
+    assert 'docker_run_agent "$@" --agent claude-code' in docker_sh
     assert '"$image_id"' in docker_sh
 
 
@@ -446,10 +795,14 @@ def test_codex_commands_use_explicit_openai_base_url_config():
     docker_sh = (utils.SHELL_DIR / "docker.sh").read_text(encoding="utf-8")
     loop_sh = (utils.SHELL_DIR / "run-claude-loop.sh").read_text(encoding="utf-8")
 
-    assert 'base_url = ' in (utils.SHELL_DIR / "agent-runtime-config.sh").read_text(encoding="utf-8")
-    assert 'model_provider = "comet-eval"' in (utils.SHELL_DIR / "agent-runtime-config.sh").read_text(encoding="utf-8")
-    assert 'openai_base_url=$OPENAI_BASE_URL' not in docker_sh
-    assert 'openai_base_url=$OPENAI_BASE_URL' not in loop_sh
+    assert "base_url = " in (utils.SHELL_DIR / "agent-runtime-config.sh").read_text(
+        encoding="utf-8"
+    )
+    assert 'model_provider = "comet-eval"' in (
+        utils.SHELL_DIR / "agent-runtime-config.sh"
+    ).read_text(encoding="utf-8")
+    assert "openai_base_url=$OPENAI_BASE_URL" not in docker_sh
+    assert "openai_base_url=$OPENAI_BASE_URL" not in loop_sh
 
 
 def test_agent_runtime_credentials_use_ephemeral_cli_config_roots():
@@ -474,9 +827,7 @@ def test_agent_runtime_credentials_use_ephemeral_cli_config_roots():
 def test_agent_runtime_config_is_agent_only_and_docker_does_not_inline_secrets():
     docker_sh = (utils.SHELL_DIR / "docker.sh").read_text(encoding="utf-8")
     config_sh = (utils.SHELL_DIR / "agent-runtime-config.sh").read_text(encoding="utf-8")
-    generic_run = docker_sh.split("docker_run() {", 1)[1].split(
-        "# Run Claude CLI in Docker", 1
-    )[0]
+    generic_run = docker_sh.split("docker_run() {", 1)[1].split("# Run Claude CLI in Docker", 1)[0]
 
     assert "COMET_EVAL_CODEBUDDY_CONFIG_DIR" in config_sh
     assert 'ENV_ARGS+=("-e" "$key")' in docker_sh
@@ -570,6 +921,38 @@ def test_user_authored_validation_commands_receive_no_agent_or_reporting_secrets
 
     assert "build_env_args" not in command_block
     assert "ENV_ARGS" not in command_block
+
+
+@pytest.mark.parametrize("command", ["docker_run", "docker_run_command", "docker_run_agent", "docker_run_claude_loop", "docker_run_agent_loop"])
+def test_eval_containers_share_case_scoped_comet_data_outside_the_workspace(tmp_path, command):
+    (tmp_path / "_eval_current_comet").mkdir()
+    log = tmp_path / "docker-args.txt"
+    script = '''
+source "$1"
+docker_build() { printf '%s' fake-image; }
+resolve_runtime_image() { printf '%s' fake-image; }
+prepare_agent_workspace_owner() { return 0; }
+build_env_args() { ENV_ARGS=(); }
+build_agent_runtime_mount_args() { RUNTIME_CONFIG_MOUNT_ARGS=(); RUNTIME_CONFIG_TMPFS_ARGS=(); }
+build_plugin_args() { PLUGIN_MOUNT_ARGS=(); PLUGIN_CLI_ARGS=(); }
+build_langfuse_plugin_args() { LANGFUSE_PLUGIN_MOUNT_ARGS=(); LANGFUSE_PLUGIN_CLI_ARGS=(); }
+build_trusted_oracle_mount_args() { TRUSTED_ORACLE_MOUNT_ARGS=(); }
+TIMEOUT_CMD=""
+docker() { printf '%s\\n' "$*" >> "$FIXTURE_ARGS"; }
+"$3" "$2" 'Test prompt' --agent claude-code --max-turns 1 || exit $?
+cleanup_eval_runtime_data "$2"
+'''
+    result = subprocess.run(
+        [utils.BASH_EXEC, "-c", script, "_", utils._to_bash_path(utils.SHELL_DIR / "docker.sh"), utils._to_bash_path(tmp_path), command],
+        env={**os.environ, "FIXTURE_ARGS": utils._to_bash_path(log)}, capture_output=True, text=True, timeout=AGENT_FIXTURE_TIMEOUT, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    calls = log.read_text()
+    assert "COMET_DATA_DIR=//opt/comet-eval-data" in calls
+    assert "comet-eval-data-" in calls
+    assert "://opt/comet-eval-data" in calls
+    assert "volume ls -q --filter" in calls
+    assert not (tmp_path / ".eval-runtime-volume").exists()
 
 
 def test_docker_harness_mounts_langfuse_official_plugin_and_enables_trace_image():
@@ -804,6 +1187,158 @@ printf '%s\n' '{"type":"result","subtype":"success","session_id":"session-1","re
     assert len({invocation["invocation_id"] for invocation in invocations}) == 2
 
 
+@pytest.mark.parametrize("pause_on_resume", [False, True])
+def test_claude_loop_timeout_keeps_completed_and_running_subject_events(
+    tmp_path: Path, pause_on_resume: bool
+):
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    pid_file = tmp_path / "agent.pid"
+    fake = fake_bin / "claude"
+    fake.write_text(
+        "#!/usr/bin/env bash\n"
+        'printf "%s\\n" \'{"type":"system","session_id":"subject-1"}\'\n'
+        'printf "%s\\n" \'{"type":"assistant","message":{"content":[{"type":"tool_use","id":"skill-1","name":"Skill","input":{"skill":"comet"}}]}}\'\n'
+        'if [[ "$PAUSE_ON_RESUME" == "1" && "$*" != *"--resume"* ]]; then\n'
+        '  printf "%s\\n" \'{"type":"result","result":"Question: Which approach should be used?"}\'\n'
+        "  exit 0\n"
+        "fi\n"
+        'echo "$BASHPID" > "$AGENT_PID_FILE"\n'
+        'echo "subject is still running" >&2\n'
+        "exec sleep 60\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    fake.chmod(0o755)
+    env = _isolated_fake_agent_env(fake_bin, "claude")
+    env["AGENT_PID_FILE"] = utils._to_bash_path(pid_file)
+    env["PAUSE_ON_RESUME"] = "1" if pause_on_resume else "0"
+    try:
+        with pytest.raises(subprocess.TimeoutExpired) as caught:
+            utils.run_shell(
+                "run-claude-loop.sh",
+                "Implement the task.",
+                "--max-turns",
+                "2",
+                "--decision-reply",
+                "Use the recommended approach.",
+                timeout=18 if os.name == "nt" else 3,
+                check=False,
+                env=env,
+                capture_to_file=True,
+            )
+        assert pid_file.exists(), caught.value.stderr
+        assert "subject is still running" in caught.value.stderr
+        from scaffold.python.logging import extract_events, parse_output
+
+        events = extract_events(parse_output(caught.value.stdout))
+        assert "comet" in events["skills_invoked"]
+        assert len(events["invocations"]) == (2 if pause_on_resume else 1)
+        if pause_on_resume:
+            assert events["invocations"][0]["exit_code"] == 0
+        assert events["invocations"][-1]["exit_code"] is None
+    finally:
+        if pid_file.exists():
+            subprocess.run(
+                [
+                    utils.BASH_EXEC,
+                    "-c",
+                    'kill "$1" 2>/dev/null || true',
+                    "_",
+                    pid_file.read_text().strip(),
+                ],
+                env=env,
+                capture_output=True,
+                check=False,
+                timeout=5,
+            )
+
+
+@pytest.mark.parametrize("times_out", [False, True])
+def test_docker_loop_streams_subject_evidence_without_simulator_output(
+    tmp_path: Path, times_out: bool
+):
+    environment = (
+        Path(__file__).resolve().parents[2] / "tasks/comet-classic-layout-lifecycle/environment"
+    )
+    image = _get_image_name(environment).removeprefix("image=")
+    try:
+        available = subprocess.run(
+            ["docker", "image", "inspect", image], capture_output=True, check=False, timeout=10
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        pytest.skip("Docker is unavailable")
+    if available.returncode:
+        pytest.skip("cached Classic Eval image is unavailable")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake = fake_bin / "claude"
+    fake.write_text(
+        """#!/usr/bin/env bash
+if [[ "$COMET_EVAL_AGENT_ROLE" == "simulator" ]]; then
+  printf '%s\n' '{"type":"system","session_id":"private-simulator"}'
+  printf '%s\n' '{"type":"result","result":"Proceed with the recommended approach."}'
+  exit 0
+fi
+printf '%s\n' '{"type":"system","session_id":"subject-1"}'
+printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"skill-1","name":"Skill","input":{"skill":"comet"}}]}}'
+if [[ "$*" != *"--resume"* ]]; then
+  printf '%s\n' '{"type":"result","result":"Question: Which approach should be used?"}'
+elif [[ "$FIXTURE_TIMEOUT" == "1" ]]; then
+  echo "subject is still running" >&2
+  exec sleep 60
+else
+  printf '%s\n' '{"type":"result","result":"Workflow completed through all phases and archived."}'
+fi
+""",
+        encoding="utf-8",
+        newline="\n",
+    )
+    fake.chmod(0o755)
+    result = subprocess.run(
+        [
+            "docker",
+            "run",
+            "--rm",
+            "--network",
+            "none",
+            "-v",
+            f"{tmp_path}:/fixture:ro",
+            "-v",
+            f"{utils.SHELL_DIR.parent}:/harness:ro",
+            "-e",
+            "PATH=/fixture/bin:/usr/local/bin:/usr/bin:/bin",
+            "-e",
+            f"FIXTURE_TIMEOUT={int(times_out)}",
+            image,
+            "timeout",
+            "3",
+            "bash",
+            "/harness/shell/run-claude-loop.sh",
+            "Implement the task.",
+            "--max-turns",
+            "2",
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == (124 if times_out else 0), result.stderr
+    from scaffold.python.logging import extract_events, parse_output
+
+    events = extract_events(parse_output(result.stdout))
+    assert "comet" in events["skills_invoked"]
+    assert len(events["invocations"]) == 2
+    assert events["invocations"][0]["exit_code"] == 0
+    assert events["invocations"][-1]["exit_code"] == (None if times_out else 0)
+    assert "private-simulator" not in result.stdout
+    if times_out:
+        assert "subject is still running" in result.stderr
+
+
 def test_claude_loop_surfaces_simulator_failure(tmp_path: Path):
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
@@ -991,6 +1526,48 @@ printf '%s\n' '{"type":"result","subtype":"success","session_id":"session-1","re
     assert not simulator_prompt.exists()
 
 
+def test_claude_loop_custom_simulator_receives_full_task_scenario_and_current_wait(tmp_path: Path):
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_claude = fake_bin / "claude"
+    fake_claude.write_text('''#!/usr/bin/env bash
+prompt=""
+while [[ $# -gt 0 ]]; do
+  if [[ "$1" == "-p" ]]; then prompt="$2"; break; fi
+  shift
+done
+if [[ -e "$PRIVATE_SIMULATOR_FILE" ]]; then exit 45; fi
+printf '%s\n' '{"type":"system","session_id":"isolated-session"}'
+if [[ "$COMET_EVAL_AGENT_ROLE" == "simulator" ]]; then
+  printf '%s' "$prompt" > "$SIMULATOR_CAPTURE"
+  if [[ "$prompt" == *"CASE_REJECT_IMPLEMENTATION"* && "$prompt" == *"CURRENT_WAIT_END"* ]]; then
+    printf '%s\n' '{"type":"result","result":"rejected"}'
+  else
+    printf '%s\n' '{"type":"result","result":"approved"}'
+  fi
+elif [[ "$prompt" == "rejected" || "$prompt" == "approved" ]]; then
+  python3 -c 'import json,sys;print(json.dumps({"type":"result","result":"Workflow completed through all phases and archived. Choice="+sys.argv[1]}))' "$prompt"
+else
+  python3 -c 'import json;print(json.dumps({"type":"result","result":"Please confirm the current Wait? "+"x"*3500+" CURRENT_WAIT_END authorize-implementation"}))'
+fi
+''', encoding="utf-8", newline="\n")
+    fake_claude.chmod(0o755)
+    private = tmp_path / "simulator-instructions.txt"
+    private.write_text("Choose approval or rejection according to the task scenario.", encoding="utf-8")
+    captured = tmp_path / "simulator-input.txt"
+    env = _isolated_fake_agent_env(fake_bin, "claude")
+    env["PRIVATE_SIMULATOR_FILE"] = utils._to_bash_path(private)
+    env["SIMULATOR_CAPTURE"] = utils._to_bash_path(captured)
+    task = "Original case context\n" + "y" * 3500 + "\nCASE_REJECT_IMPLEMENTATION: reject authorize-implementation."
+    result = subprocess.run([utils.BASH_EXEC, utils._to_bash_path(utils.SHELL_DIR / "run-claude-loop.sh"), task, "--max-turns", "2", "--simulator-prompt-file", utils._to_bash_path(private)], env=env, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=AGENT_FIXTURE_TIMEOUT, check=False)
+    assert result.returncode == 0, result.stderr
+    actual = captured.read_text(encoding="utf-8")
+    assert task in actual
+    assert "CURRENT_WAIT_END" in actual
+    assert "Choice=rejected" in result.stdout
+    assert not private.exists()
+
+
 def test_decision_point_detector_rejects_completion_statements():
     statement = "Implementation is complete and the artifacts provide the requested evidence."
     punctuation_summary = "Done. The counter recognizes ., !, and ? terminators."
@@ -1067,6 +1644,164 @@ def test_decision_point_detector_accepts_batch_labels_and_reply_confirmation():
     assert reply_confirmation.returncode == 0
 
 
+def test_decision_point_detector_accepts_archive_choice_request():
+    result = utils.run_shell(
+        "decision-point.sh",
+        "Archive is pending confirmation.\nA. Archive locally\nE. Leave pending\nReply one of A–E.",
+        check=False,
+    )
+
+    assert result.returncode == 0
+
+
+def test_decision_point_detector_accepts_numbered_archive_reply():
+    result = utils.run_shell(
+        "decision-point.sh",
+        "Archive is pending. Reply `Q10: A`, `Q10: D`, or `Q10: E`. "
+        "I will not archive until you choose.",
+        check=False,
+    )
+
+    assert result.returncode == 0
+
+
+@pytest.mark.parametrize("text", ["**Do you approve this spec?**", "**是否批准当前方案？**"])
+def test_decision_point_accepts_markdown_questions(text):
+    assert utils.run_shell("decision-point.sh", text, check=False).returncode == 0
+
+
+def test_completion_point_rejects_child_completion_with_parent_pending():
+    result = utils.run_shell(
+        "completion-point.sh",
+        "The child workflow is completed. The parent still has pending steps.",
+        check=False,
+    )
+    assert result.returncode == 1
+
+
+def test_completion_point_accepts_explicit_parent_completion_after_children():
+    result = utils.run_shell(
+        "completion-point.sh",
+        "The child workflow is completed. The parent workflow is completed.",
+        check=False,
+    )
+    assert result.returncode == 0
+
+
+def test_completion_point_rejects_future_parent_archive_after_child_completion():
+    result = utils.run_shell(
+        "completion-point.sh",
+        "The child workflow is completed. The parent will be archived tomorrow.",
+        check=False,
+    )
+    assert result.returncode == 1
+
+
+@pytest.mark.parametrize(
+    "state,lineage,version,digest,count,expected",
+    [
+        ("completed", [], "1", "fixed", 1, 0),
+        ("completed", [], "1", "fixed", 2, 0),
+        ("waiting", [], "1", "fixed", 2, 1),
+        (["completed", "waiting"], [], "1", "fixed", 2, 1),
+        ("completed", [], "1", "fixed", 0, 1),
+        ("waiting", [], "1", "fixed", 1, 1),
+        ("completed", ["parent"], "1", "fixed", 1, 1),
+        ("completed", [], "2", "fixed", 1, 1),
+        ("completed", [], "1", "changed", 1, 1),
+    ],
+)
+def test_application_completion_uses_owned_root_not_subject_text(
+    tmp_path, state, lineage, version, digest, count, expected
+):
+    package = tmp_path / "node_modules/@rpamis/comet"
+    package.mkdir(parents=True)
+    (package / "package.json").write_text(
+        json.dumps({"type": "module", "exports": {"./applications": "./applications.mjs"}})
+    )
+    record = {
+        "applicationId": "fixture",
+        "record": {
+            "application": {"version": version, "contentHash": digest},
+            "run": {"status": state, "lineage": lineage},
+        },
+        "error": None,
+    }
+    (package / "applications.mjs").write_text(
+        "export async function listWorkflowApplicationRunRecords(){return "
+        + json.dumps(
+            [
+                {
+                    **record,
+                    "record": {
+                        **record["record"],
+                        "run": {
+                            **record["record"]["run"],
+                            "runId": f"run-{index}",
+                            "status": state[index] if isinstance(state, list) else state,
+                        },
+                    },
+                }
+                for index in range(count)
+            ]
+        )
+        + ";}"
+    )
+    env = dict(
+        os.environ,
+        COMET_EVAL_APPLICATION_ID="fixture",
+        COMET_EVAL_APPLICATION_VERSION="1",
+        COMET_EVAL_APPLICATION_HASH="fixed",
+    )
+    result = subprocess.run(
+        [
+            utils.BASH_EXEC,
+            utils._to_bash_path(utils.SHELL_DIR / "completion-point.sh"),
+            "Workflow completed.",
+        ],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        timeout=10,
+    )
+    assert result.returncode == expected, result.stderr
+
+
+def test_docker_passes_only_fixed_application_identity_to_completion_probe(tmp_path):
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    env = _isolated_fake_agent_env(fake_bin, "claude")
+    env["COMET_APPLICATION_EVAL_CONTEXT"] = json.dumps(
+        {
+            "skillRoot": "host-private-path",
+            "preview": {
+                "application": {"id": "fixture", "version": "1"},
+                "runtimeIdentityHash": "fixed",
+            },
+        }
+    )
+    result = subprocess.run(
+        [
+            utils.BASH_EXEC,
+            "-c",
+            'source "$1"; ENV_ARGS=(); build_agent_runtime_mount_args; printf "%s\\0" "${ENV_ARGS[@]}"',
+            "_",
+            utils._to_bash_path(utils.SHELL_DIR / "docker.sh"),
+        ],
+        env=env,
+        capture_output=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    for item in (
+        "COMET_EVAL_APPLICATION_ID=fixture",
+        "COMET_EVAL_APPLICATION_VERSION=1",
+        "COMET_EVAL_APPLICATION_HASH=fixed",
+    ):
+        assert item.encode() in result.stdout.split(b"\0")
+    assert b"host-private-path" not in result.stdout
+
+
 def test_completion_point_detector_requires_explicit_non_negated_workflow_completion():
     archived = utils.run_shell(
         "completion-point.sh",
@@ -1121,6 +1856,288 @@ def test_completion_point_detector_requires_explicit_non_negated_workflow_comple
     assert negated_through_archive.returncode == 1
 
 
+def test_completion_point_does_not_treat_archive_confirmation_as_completion():
+    confirmation = utils.run_shell(
+        "completion-point.sh",
+        "Archive locally; do not push. Local archive completes the workflow fully. "
+        "Reply A to confirm the archive or E to leave it pending.",
+        check=False,
+    )
+
+    assert confirmation.returncode == 1
+
+
+def test_completion_point_rejects_conditional_archive_with_pending_state():
+    confirmation = utils.run_shell(
+        "completion-point.sh",
+        "Nothing has been archived yet. If you choose A, the change is archived. "
+        "I will not archive until you choose.",
+        check=False,
+    )
+
+    assert confirmation.returncode == 1
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Do not archive yet | Stop; keep the change verified and unarchived at `phase: archive` | Yes |",
+        "Change remains unarchived at docs/openspec/changes/example. Reply A to initialize Git and archive locally.",
+        "Native change `example` is unarchived at phase: archive. Please confirm local Archive.",
+        "The workflow is incomplete. Please confirm the remaining Archive step.",
+    ],
+)
+def test_completion_point_rejects_completion_words_inside_pending_words(text: str):
+    result = utils.run_shell("completion-point.sh", text, check=False)
+
+    assert result.returncode == 1
+
+
+def test_image_cache_changes_when_copied_package_manifest_changes(tmp_path: Path):
+    (tmp_path / "Dockerfile").write_text(
+        "FROM node:22\nCOPY current-comet-package.json /opt/comet-cli/package.json\n",
+        encoding="utf-8",
+    )
+    package = tmp_path / "current-comet-package.json"
+    package.write_text('{"dependencies":{"yaml":"1.0.0"}}\n', encoding="utf-8")
+    first = _get_image_name(tmp_path)
+
+    package.write_text(
+        '{"dependencies":{"yaml":"1.0.0","smol-toml":"1.8.0"}}\n',
+        encoding="utf-8",
+    )
+
+    assert _get_image_name(tmp_path) != first
+
+
+@pytest.mark.parametrize(
+    "environment_ref",
+    [
+        "local/tasks/comet-native-workflow/environment",
+        "local/tasks/comet-classic-layout-lifecycle/environment",
+        "scaffold/environments/workflow-application",
+    ],
+)
+def test_current_cli_queries_use_immutable_installation_without_copying(
+    tmp_path: Path,
+    environment_ref: str,
+):
+    environment = Path(__file__).resolve().parents[3] / environment_ref
+    image = _get_image_name(environment).removeprefix("image=")
+    try:
+        available = subprocess.run(
+            ["docker", "image", "inspect", image], capture_output=True, check=False, timeout=10
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        pytest.skip("Docker is unavailable")
+    if available.returncode:
+        pytest.skip("cached Native Eval image is unavailable")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    for name in (
+        "Dockerfile",
+        "current-comet.sh",
+        "current-comet-package.json",
+        "wordcount.py",
+        "test_wordcount.py",
+    ):
+        if (environment / name).is_file():
+            shutil.copy2(environment / name, workspace / name)
+    snapshot = workspace / "_eval_current_comet"
+    for name in ("bin", "dist", "assets"):
+        (snapshot / name).mkdir(parents=True)
+    (snapshot / "package.json").write_text(
+        '{"name":"@rpamis/comet","type":"module","exports":{"./runtime":"./dist/runtime.mjs"}}\n',
+        encoding="utf-8",
+    )
+    (snapshot / "dist/runtime.mjs").write_text(
+        "export const version = 'fixed';\n", encoding="utf-8"
+    )
+    (snapshot / "assets/manifest.json").write_text("{}\n", encoding="utf-8")
+    (snapshot / "bin/comet.js").write_text(
+        "import { parse } from 'yaml';\n"
+        "console.log(JSON.stringify({value:parse('value: fixed').value,args:process.argv.slice(2),pid:process.pid}));\n",
+        encoding="utf-8",
+    )
+    fake_bin = workspace / "fake-bin"
+    fake_bin.mkdir()
+    (fake_bin / "cp").write_text(
+        '#!/bin/sh\necho "unexpected per-query package copy" >&2\nexit 99\n',
+        encoding="utf-8",
+        newline="\n",
+    )
+    (fake_bin / "cp").chmod(0o755)
+    sdk_check = (
+        "node --input-type=module -e \"import {version} from '@rpamis/comet/runtime'; "
+        "if(version!=='fixed')process.exit(57)\"; "
+        if environment_ref.startswith("scaffold/")
+        else ""
+    )
+    result = utils.run_shell(
+        "docker.sh",
+        "run",
+        utils._to_bash_path(workspace),
+        "sh",
+        "-ec",
+        "export PATH=/workspace/fake-bin:/usr/local/bin:/usr/bin:/bin; "
+        'comet status "name with space"; comet status "name with space"; '
+        + sdk_check
+        + "if printf tampered 2>/tmp/install-error > /opt/comet-current/bin/comet.js; then exit 55; fi; "
+        'grep -Eq "Read-only file system|Permission denied" /tmp/install-error; '
+        "if printf tampered 2>/tmp/source-error > /workspace/_eval_current_comet/bin/comet.js; then exit 56; fi; "
+        'grep -q "Read-only file system" /tmp/source-error',
+        timeout=90,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    records = [json.loads(line) for line in result.stdout.splitlines() if line.startswith("{")]
+    assert len(records) == 2
+    assert [row["args"] for row in records] == [["status", "name with space"]] * 2
+    assert [row["value"] for row in records] == ["fixed", "fixed"]
+    assert records[0]["pid"] != records[1]["pid"]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows bind-mount ownership regression")
+def test_agent_workspace_owner_prepare_allows_hermetic_git_without_recursive_chown(
+    tmp_path: Path,
+):
+    environment = (
+        Path(__file__).resolve().parents[2] / "tasks/comet-classic-layout-lifecycle/environment"
+    )
+    image = _get_image_name(environment).removeprefix("image=")
+    if (
+        subprocess.run(
+            ["docker", "image", "inspect", image], capture_output=True, check=False
+        ).returncode
+        != 0
+    ):
+        pytest.skip("cached Classic Eval image is unavailable")
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    volume = f"{workspace}:/workspace"
+    setup = subprocess.run(
+        [
+            "docker",
+            "run",
+            "--rm",
+            "--user",
+            "root",
+            "-v",
+            volume,
+            image,
+            "sh",
+            "-ec",
+            "git init -q -b main /workspace; "
+            "chown -R agent:agent /workspace/.git; "
+            "touch /workspace/sentinel; chown root:root /workspace",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert setup.returncode == 0, setup.stderr
+
+    git_command = [
+        "docker",
+        "run",
+        "--rm",
+        "-v",
+        volume,
+        image,
+        "sh",
+        "-ec",
+        "GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 "
+        "git -C /workspace symbolic-ref --quiet --short HEAD",
+    ]
+    before = subprocess.run(git_command, capture_output=True, text=True, check=False)
+    assert before.returncode == 128
+    assert "dubious ownership" in before.stderr
+
+    prepare = subprocess.run(
+        [
+            utils.BASH_EXEC,
+            "-c",
+            'source "$1"; prepare_agent_workspace_owner "$2" "$3"',
+            "_",
+            utils._to_bash_path(utils.SHELL_DIR / "docker.sh"),
+            utils._to_bash_path(workspace),
+            image,
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert prepare.returncode == 0, prepare.stderr
+
+    after = subprocess.run(git_command, capture_output=True, text=True, check=False)
+    assert after.returncode == 0, after.stderr
+    assert after.stdout.strip() == "main"
+    ownership = subprocess.run(
+        [
+            "docker",
+            "run",
+            "--rm",
+            "-v",
+            volume,
+            image,
+            "sh",
+            "-ec",
+            "stat -c '%u:%g' /workspace /workspace/sentinel",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert ownership.returncode == 0, ownership.stderr
+    assert ownership.stdout.splitlines() == ["1001:1001", "0:0"]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows bind-mount ownership regression")
+def test_claude_loop_prepares_workspace_owner_before_starting_agent(tmp_path: Path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    calls = tmp_path / "docker-calls.txt"
+    script = """
+source "$1"
+resolve_runtime_image() { printf '%s' fake-image; }
+build_env_args() { ENV_ARGS=(); }
+build_agent_runtime_mount_args() { RUNTIME_CONFIG_MOUNT_ARGS=(); RUNTIME_CONFIG_TMPFS_ARGS=(); }
+build_plugin_args() { PLUGIN_MOUNT_ARGS=(); PLUGIN_CLI_ARGS=(); }
+build_langfuse_plugin_args() { LANGFUSE_PLUGIN_MOUNT_ARGS=(); LANGFUSE_PLUGIN_CLI_ARGS=(); }
+build_trusted_oracle_mount_args() { TRUSTED_ORACLE_MOUNT_ARGS=(); }
+docker() { printf '%s\\n' "$*" >> "$DOCKER_CALL_LOG"; }
+docker_run_claude_loop "$2" 'Test prompt' --max-turns 1
+"""
+    result = subprocess.run(
+        [
+            utils.BASH_EXEC,
+            "-c",
+            script,
+            "_",
+            utils._to_bash_path(utils.SHELL_DIR / "docker.sh"),
+            utils._to_bash_path(workspace),
+        ],
+        env={**os.environ, "DOCKER_CALL_LOG": utils._to_bash_path(calls)},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    runs = [
+        line for line in calls.read_text(encoding="utf-8").splitlines() if line.startswith("run ")
+    ]
+    assert len(runs) == 2
+    assert "--user root" in runs[0]
+    assert "--name comet-eval-loop-" in runs[1]
+
+
+def test_classic_layout_lifecycle_allows_full_model_workflow():
+    task = load_task("comet-classic-layout-lifecycle")
+
+    assert task.config.timeout_sec >= 2400
+
+
 def test_copied_scaffold_is_importable_by_validator_script(tmp_path: Path):
     validation_dir = tmp_path / "validation"
     validation_dir.mkdir()
@@ -1144,3 +2161,150 @@ def test_copied_scaffold_is_importable_by_validator_script(tmp_path: Path):
 
     assert result.returncode == 0, result.stderr
     assert result.stdout == "ok\n"
+
+
+@pytest.mark.parametrize("failure", ["timeout", "exception", "success"])
+def test_single_turn_always_cleans_its_unique_container(monkeypatch, tmp_path, failure):
+    calls = []
+    names = []
+
+    def run(script, *args, **kwargs):
+        calls.append((args, kwargs))
+        if args[0] == "run-agent":
+            name = args[args.index("--container-name") + 1]
+            assert re.fullmatch(r"comet-eval-turn-[a-f0-9]{32}", name)
+            names.append(name)
+            assert kwargs["capture_to_file"] is True
+            if failure == "timeout":
+                raise subprocess.TimeoutExpired([script, *args], 1)
+            if failure == "exception":
+                raise RuntimeError("original launch error")
+            return subprocess.CompletedProcess([script, *args], 0, "ok", "")
+        assert args == ("cleanup-agent-turn", names[-1])
+        assert kwargs["timeout"] <= 30
+        return subprocess.CompletedProcess([script, *args], 0, "", "")
+
+    monkeypatch.setattr(utils, "run_shell", run)
+    monkeypatch.setattr(utils, "check_docker_available", lambda: True)
+    if failure == "exception":
+        with pytest.raises(RuntimeError, match="original launch error"):
+            utils.run_agent_in_docker(tmp_path, "body")
+    else:
+        assert utils.run_agent_in_docker(tmp_path, "body").returncode == (
+            124 if failure == "timeout" else 0
+        )
+    assert len(calls) == 2
+
+
+def test_cleanup_failure_is_not_reported_as_success_or_retriable_timeout(monkeypatch, tmp_path):
+    def run(script, *args, **kwargs):
+        if args[0] == "run-agent":
+            raise subprocess.TimeoutExpired([script, *args], 1)
+        return subprocess.CompletedProcess([script, *args], 1, "", "permission denied")
+
+    monkeypatch.setattr(utils, "run_shell", run)
+    monkeypatch.setattr(utils, "check_docker_available", lambda: True)
+    with pytest.raises(RuntimeError, match="cleanup.*incomplete.*permission denied") as error:
+        utils.run_agent_in_docker(tmp_path, "body")
+    assert type(error.value).__name__ == "AgentContainerCleanupError"
+
+
+def test_two_turns_same_workspace_have_independent_names(monkeypatch, tmp_path):
+    names = []
+
+    def run(script, *args, **kwargs):
+        if args[0] == "run-agent":
+            names.append(args[args.index("--container-name") + 1])
+        return subprocess.CompletedProcess([script, *args], 0, "", "")
+
+    monkeypatch.setattr(utils, "run_shell", run)
+    monkeypatch.setattr(utils, "check_docker_available", lambda: True)
+    utils.run_agent_in_docker(tmp_path, "first")
+    utils.run_agent_in_docker(tmp_path, "second")
+    assert len(set(names)) == 2
+
+
+def test_shell_timeout_cleans_only_its_registered_turn(tmp_path):
+    name = "comet-eval-turn-" + "a" * 32
+    calls = tmp_path / "calls"
+    state = tmp_path / "state"
+    script = """
+source "$1"
+resolve_runtime_image() { printf '%s' fake-image; }
+prepare_agent_workspace_owner() { return 0; }
+build_env_args() { ENV_ARGS=(); }
+build_agent_runtime_mount_args() { RUNTIME_CONFIG_MOUNT_ARGS=(); RUNTIME_CONFIG_TMPFS_ARGS=(); }
+build_plugin_args() { PLUGIN_MOUNT_ARGS=(); PLUGIN_CLI_ARGS=(); }
+build_langfuse_plugin_args() { LANGFUSE_PLUGIN_MOUNT_ARGS=(); LANGFUSE_PLUGIN_CLI_ARGS=(); }
+build_trusted_oracle_mount_args() { TRUSTED_ORACLE_MOUNT_ARGS=(); }
+TIMEOUT_CMD=""
+docker() {
+  printf '%s\\n' "$*" >> "$FAKE_CALLS"
+  case "$1 $2" in
+    "run --rm") printf '%s' "$TURN_NAME" > "$FAKE_STATE"; printf 'partial subject output\\n'; return 124;;
+    "container ls") [[ ! -f "$FAKE_STATE" ]] || cat "$FAKE_STATE";;
+    "container inspect") printf '%s' "$TURN_NAME";;
+    "rm -f") [[ "$3" == "$TURN_NAME" ]] || return 40; rm -f "$FAKE_STATE";;
+    *) return 41;;
+  esac
+}
+docker_run_agent "$2" body --agent codex --container-name "$TURN_NAME"
+"""
+    result = subprocess.run(
+        [
+            utils.BASH_EXEC,
+            "-c",
+            script,
+            "_",
+            utils._to_bash_path(utils.SHELL_DIR / "docker.sh"),
+            utils._to_bash_path(tmp_path),
+        ],
+        env={
+            **os.environ,
+            "FAKE_CALLS": utils._to_bash_path(calls),
+            "FAKE_STATE": utils._to_bash_path(state),
+            "TURN_NAME": name,
+        },
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert result.returncode == 124, result.stderr
+    assert "partial subject output" in result.stdout
+    assert f"--name {name}" in calls.read_text()
+    assert f"--label comet.eval.turn={name}" in calls.read_text()
+    assert f"rm -f {name}" in calls.read_text()
+    assert not state.exists()
+
+
+@pytest.mark.parametrize("mode", ["mismatch", "daemon"])
+def test_shell_cleanup_refuses_unowned_or_uninspectable_container(tmp_path, mode):
+    name = "comet-eval-turn-" + "b" * 32
+    marker = tmp_path / "removed"
+    script = """
+source "$1"
+TIMEOUT_CMD=""
+docker() {
+ case "$1 $2" in
+  "container ls") if [[ "$FAKE_MODE" == daemon ]]; then echo 'daemon unavailable' >&2; return 125; fi; printf '%s' "$TURN_NAME";;
+  "container inspect") printf '%s' another-turn;;
+  "rm -f") touch "$FAKE_REMOVED";;
+ esac
+}
+cleanup_agent_turn "$TURN_NAME"
+"""
+    result = subprocess.run(
+        [utils.BASH_EXEC, "-c", script, "_", utils._to_bash_path(utils.SHELL_DIR / "docker.sh")],
+        env={
+            **os.environ,
+            "TURN_NAME": name,
+            "FAKE_MODE": mode,
+            "FAKE_REMOVED": utils._to_bash_path(marker),
+        },
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert result.returncode != 0
+    assert not marker.exists()
+    assert ("ownership" if mode == "mismatch" else "daemon unavailable") in result.stderr

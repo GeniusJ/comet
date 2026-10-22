@@ -1,3 +1,5 @@
+import { resolveWorkspaceRuntimeRootSync } from '../workflow-contract/workspace-runtime.js';
+import { normalizeCometHookTargets } from '../../platform/process/hook-adapter.js';
 import path from 'path';
 
 import {
@@ -18,21 +20,18 @@ import {
 } from '../comet-native/native-hook-guard.js';
 import { memoizedHookRead } from '../../platform/process/hook-read-cache.js';
 import { readWorkflowProjectConfig } from '../workflow-contract/project-config-reader.js';
-import { readCometCurrentSelection } from './current-selection.js';
+import { readHookCurrentSelection } from './current-selection.js';
 import { readCachedProjectConfig } from './entry-reads.js';
-import { scopeCometHookTargets } from '../workflow-contract/hook-target-scope.js';
+import {
+  cometHookRuntimeTargetCandidates,
+  isCometHookTargetWithin,
+  scopeCometHookTargets,
+} from '../workflow-contract/hook-target-scope.js';
 import { configuredHookWritePath } from '../workflow-contract/hook-write-policy.js';
 import type { CometHookDecision, CometHookRequest } from './hook-types.js';
 import type { CometWorkflow } from './types.js';
 import { collectCometHookContext, collectCometPluginContext } from './plugin-context.js';
-
-// Wrap the hot reads so that within one Hook decision the router and the
-// delegated Classic/Native Guard share a single config + selection read
-// instead of each re-opening the same files.
-const readCachedCurrentSelection = memoizedHookRead(
-  'readCometCurrentSelection',
-  (projectRoot: string) => readCometCurrentSelection(projectRoot),
-);
+import { readSelectedWorkflowApplication } from '../workflow-application/index.js';
 
 export interface ActiveHookChange {
   workflow: CometWorkflow;
@@ -191,7 +190,7 @@ export async function resolveHookWorkflowOwner(
   const enabled = enabledWorkflows(config);
   let current;
   try {
-    current = await readCachedCurrentSelection(projectRoot);
+    current = await readHookCurrentSelection(projectRoot);
   } catch (error) {
     return {
       status: 'stale',
@@ -202,6 +201,7 @@ export async function resolveHookWorkflowOwner(
 
   if (current.status === 'selected') {
     const selection = current.selection;
+    if (selection.workflow === 'application') return { status: 'none' };
     if (!enabled.includes(selection.workflow)) {
       return {
         status: 'stale',
@@ -315,6 +315,49 @@ export async function resolveHookWorkflowOwner(
   }
 }
 
+/** 项目配置和当前需求尚未找到时，也必须保护本机 Runtime。
+ * 缓存键保留目标、cwd 和相对项目根，worktree 重新归属后必须重新检查。
+ */
+const readRuntimeWriteTargets = memoizedHookRead(
+  'inspectCometRuntimeWriteTargets',
+  async function (
+    projectRoot: string,
+    request: CometHookRequest,
+    relativeProjectRoot: string,
+  ): Promise<CometHookDecision | null> {
+    if (request.intent !== 'write' || request.targets.length === 0) return null;
+    const runtimeRoot = resolveWorkspaceRuntimeRootSync(projectRoot);
+    const legacyRuntimeRoot = path.join(projectRoot, '.comet', 'runtime');
+    for (const target of normalizeCometHookTargets(request.targets)) {
+      for (const absolute of cometHookRuntimeTargetCandidates(
+        relativeProjectRoot,
+        target,
+        request.cwd,
+      )) {
+        if (
+          (await isCometHookTargetWithin(runtimeRoot, absolute)) ||
+          (await isCometHookTargetWithin(legacyRuntimeRoot, absolute))
+        ) {
+          return {
+            allowed: false,
+            reason:
+              'Comet Runtime-owned files are maintained by Runtime commands. Run comet status in the guarded project and follow its continuation; do not edit local execution state directly.',
+          };
+        }
+      }
+    }
+    return null;
+  },
+);
+
+export async function inspectCometRuntimeWriteTargets(
+  projectRoot: string,
+  request: CometHookRequest,
+  relativeProjectRoot = projectRoot,
+): Promise<CometHookDecision | null> {
+  return readRuntimeWriteTargets(projectRoot, request, relativeProjectRoot);
+}
+
 export async function inspectCometHook(
   projectRoot: string,
   request: CometHookRequest,
@@ -354,6 +397,8 @@ export async function inspectCometHook(
 
   let projectRequest: CometHookRequest;
   try {
+    const runtimeDecision = await inspectCometRuntimeWriteTargets(projectRoot, request);
+    if (runtimeDecision) return runtimeDecision;
     const scoped = await (dependencies.scopeTargets ?? scopeCometHookTargets)(
       projectRoot,
       request.targets,
@@ -374,6 +419,41 @@ export async function inspectCometHook(
   }
 
   try {
+    const selected = await readSelectedWorkflowApplication(projectRoot);
+    if (selected) {
+      const { application, run } = selected;
+      const identity = { applicationId: application.identity.id, runId: run.runId };
+      const targets = projectRequest.targets.map((target) =>
+        path.relative(projectRoot, target).replaceAll('\\', '/'),
+      );
+      if (
+        targets.some(
+          (target) =>
+            target === '.comet/current-change.json' ||
+            target === '.comet/runtime' ||
+            target.startsWith('.comet/runtime/'),
+        )
+      )
+        return {
+          allowed: false,
+          reason: '应用选择与 SDK Run 由公开 Runtime 入口维护',
+          ...identity,
+        };
+      if (
+        ['completed', 'cancelled'].includes(run.status) &&
+        !(application.manifest.base === 'standalone' && application.implementation.inspectHook) &&
+        !(run.status === 'cancelled' && application.manifest.base.startsWith('classic-'))
+      )
+        return { allowed: true, reason: '当前应用运行已结束', ...identity };
+      if (!application.implementation.inspectHook)
+        return {
+          allowed: false,
+          reason: '当前应用没有已固定的 Hook Guard，请补齐适配后继续',
+          ...identity,
+        };
+      const decision = await application.implementation.inspectHook(run, projectRequest);
+      return { ...decision, ...identity };
+    }
     const resolution = await resolveHookWorkflowOwner(projectRoot, dependencies);
     if (resolution.status === 'none') {
       const nativeUnownedDecision = await inspectNativeUnownedHookTargets(

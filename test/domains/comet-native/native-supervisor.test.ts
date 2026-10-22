@@ -305,6 +305,12 @@ describe('Native Supervisor v2 state', () => {
       });
       expect(requested.continuation.action).toBe('await-verifier');
 
+      expect(
+        execFileSync('git', ['status', '--porcelain', '--untracked-files=all'], {
+          cwd: integrationRoot,
+          encoding: 'utf8',
+        }),
+      ).toBe('');
       const verifiedParent = await applyNativeRunnerInput({
         paths,
         name: 'parent',
@@ -2053,6 +2059,12 @@ children:
           ],
         },
       });
+      expect(
+        execFileSync('git', ['status', '--porcelain', '--untracked-files=all'], {
+          cwd: supervisor.integration.worktree,
+          encoding: 'utf8',
+        }),
+      ).toBe('');
       const failed = await applyNativeRunnerInput({
         paths,
         name: 'parent',

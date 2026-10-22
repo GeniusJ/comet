@@ -7,9 +7,57 @@ import {
   formatCliOutputEnvelope,
   isCliOutputEnvelope,
   projectCliAgentObservation,
+  formatCliCommandArgs,
 } from '../../../domains/workflow-contract/output-envelope.js';
 
 describe('output envelope contract', () => {
+  it('references current work within the same response without duplicating complete inputs', () => {
+    const data = {
+      continuation: { mode: 'execute', current: { actions: [{ input: 'large current input' }] } },
+    };
+    const agent = projectCliAgentObservation(data);
+    expect(agent.continuation).toMatchObject({
+      mode: 'execute',
+      currentRef: 'data.continuation.current',
+    });
+    expect(agent.continuation).not.toHaveProperty('current');
+    expect(data.continuation.current.actions[0].input).toBe('large current input');
+  });
+  it.each(['execute', 'wait', 'ask', 'reconcile', 'done'])(
+    'preserves domain mode %s without deriving another decision',
+    (mode) => {
+      expect(
+        projectCliAgentObservation(
+          {
+            runId: 'bound-run',
+            revision: 12,
+            status: 'running',
+            continuation: { mode, commandArgs: null, requiredInputs: [], cwd: '/bound workspace' },
+          },
+          '/invocation',
+        ),
+      ).toMatchObject({
+        run: { id: 'bound-run', revision: 12 },
+        workspace: { cwd: '/bound workspace' },
+        continuation: { mode, cwd: '/bound workspace' },
+      });
+    },
+  );
+
+  it('quotes command parameters instead of turning placeholders or input into shell syntax', () => {
+    expect(
+      formatCliCommandArgs(['comet', '--summary', "don't run $HOME; now", '<input>', '']),
+    ).toBe(`comet --summary 'don'"'"'t run $HOME; now' '<input>' ''`);
+  });
+
+  it('renders waiting instructions without inventing a user decision', () => {
+    const envelope = { summary: 'Waiting.', next: { instruction: 'Wait for the original task.' } };
+    expect(isCliOutputEnvelope(envelope)).toBe(true);
+    expect(formatCliOutputEnvelope(envelope)).toContain('NEXT: Wait for the original task.');
+    expect(
+      isCliOutputEnvelope({ ...envelope, next: { ...envelope.next, command: 'comet next' } }),
+    ).toBe(false);
+  });
   it('projects current action and prepared cwd without copying evidence payloads', () => {
     const observation = projectCliAgentObservation(
       {
@@ -32,6 +80,67 @@ describe('output envelope contract', () => {
 
   it('renders a summary-only envelope as one line', () => {
     expect(formatCliOutputEnvelope({ summary: 'Done.' })).toBe('Done.\n');
+  });
+
+  it('projects Classic SDK nextAction and current Run identity without copying the Run payload', () => {
+    const nextAction = {
+      kind: 'action',
+      actionId: 'current-action',
+      attempt: 2,
+      inputHash: 'current-input',
+      stepId: 'full.build.execute',
+    };
+    expect(
+      projectCliAgentObservation({
+        phase: 'build',
+        run: {
+          id: 'change',
+          revision: 17,
+          status: 'running',
+          actions: [{ id: 'large-action-payload' }],
+          evidenceWaits: [{ artifact: 'large-evidence-payload' }],
+        },
+        nextAction,
+      }),
+    ).toEqual({
+      phase: 'build',
+      status: 'running',
+      stateVersion: null,
+      workspace: { cwd: null },
+      continuation: { ...nextAction, cwd: null },
+      run: { id: 'change', revision: 17, status: 'running' },
+    });
+  });
+
+  it('preserves explicit continuation, workflow state version, and prepared workspace precedence', () => {
+    const result = projectCliAgentObservation(
+      {
+        state: { phase: 'verify', status: 'active', stateVersion: 3 },
+        run: { id: 'change', revision: 19, status: 'waiting' },
+        continuation: { commandArgs: ['comet', 'native', 'next', 'change'], cwd: '/hint' },
+        nextAction: { kind: 'must-not-replace-continuation' },
+        preparation: { projectRoot: '/prepared' },
+      },
+      '/invocation',
+    );
+    expect(result).toMatchObject({
+      phase: 'verify',
+      status: 'active',
+      stateVersion: 3,
+      run: { revision: 19, status: 'waiting' },
+      workspace: { cwd: '/prepared' },
+      continuation: { commandArgs: ['comet', 'native', 'next', 'change'], cwd: '/prepared' },
+    });
+    expect(result.continuation).not.toHaveProperty('kind');
+  });
+
+  it('uses the supplied continuation cwd when there is no prepared or invocation cwd', () => {
+    expect(
+      projectCliAgentObservation({ entry: { nextAction: { kind: 'decision', cwd: '/selected' } } }),
+    ).toMatchObject({
+      workspace: { cwd: '/selected' },
+      continuation: { kind: 'decision', cwd: '/selected' },
+    });
   });
 
   it('renders the NEXT marker before the relay block', () => {

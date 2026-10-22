@@ -65,6 +65,13 @@ import {
   type DispatchResult,
 } from './native-cli-shared.js';
 import type { NativeProjectPaths } from './native-types.js';
+import {
+  assertChangeNotSdkOwned,
+  readSdkChangeOwner,
+} from '../workflow-contract/change-runtime-owner.js';
+import { readProjectConfig } from './native-config.js';
+import { resolveNativeChangeRuntimeOwner } from './native-runtime-ownership.js';
+import { advanceNativeSdkChange } from './native-sdk-next.js';
 
 const EXPECTED_CONTINUATION_ACTIONS = new Set<NativePortableExpectedContinuationAction>([
   'prepare-shape-confirmation',
@@ -74,6 +81,7 @@ const EXPECTED_CONTINUATION_ACTIONS = new Set<NativePortableExpectedContinuation
   'revise-implementation',
   'revise-requirements',
   'retry-verifier',
+  'continue-builder',
   'resolve-verifier-blocker',
 ]);
 
@@ -179,6 +187,7 @@ export async function nativeNextCommand(
 ): Promise<DispatchResult> {
   const name = requiredPositional(args, 'change name');
   const summary = takeOption(args, '--summary');
+  const proposalHash = takeOption(args, '--proposal-hash');
   const runnerInputFile = takeOption(args, '--runner-input');
   const validateOnly = takeFlag(args, '--validate-only');
   const confirmed = takeFlag(args, '--confirmed');
@@ -195,6 +204,7 @@ export async function nativeNextCommand(
   const reviseImplementation = takeFlag(args, '--revise-implementation');
   const reviseRequirements = takeFlag(args, '--revise-requirements');
   const retryVerifier = takeFlag(args, '--retry-verifier');
+  const continueBuilder = takeFlag(args, '--continue-builder');
   const resolveVerifierBlocker = takeFlag(args, '--resolve-verifier-blocker');
   const coordinationModeText = takeOption(args, '--coordination-mode');
   const coordinationMode = coordinationModeText as NativeSupervisorCoordinationMode | undefined;
@@ -220,11 +230,12 @@ export async function nativeNextCommand(
       reviseImplementation,
       reviseRequirements,
       retryVerifier,
+      continueBuilder,
       resolveVerifierBlocker,
     ].filter(Boolean).length > 1
   ) {
     throw new NativeUsageError(
-      '--confirmed, --accept-result, --revise-implementation, --revise-requirements, --retry-verifier, and --resolve-verifier-blocker are mutually exclusive',
+      '--confirmed, --accept-result, --revise-implementation, --revise-requirements, --retry-verifier, --continue-builder, and --resolve-verifier-blocker are mutually exclusive',
     );
   }
   if (
@@ -233,6 +244,7 @@ export async function nativeNextCommand(
       reviseImplementation ||
       reviseRequirements ||
       retryVerifier ||
+      continueBuilder ||
       resolveVerifierBlocker ||
       runnerInputFile !== undefined)
   ) {
@@ -245,7 +257,151 @@ export async function nativeNextCommand(
   // invocation from silently accepting one of those old fields.
   assertNoArguments(args);
 
+  if (
+    (await readSdkChangeOwner(projectRoot, 'native', name)) &&
+    (await readProjectConfig(projectRoot)) === null
+  ) {
+    throw new Error(`Native SDK Run ${name} requires .comet/config.yaml before next`);
+  }
   const configured = await configuredPaths(projectRoot);
+  const owner = await resolveNativeChangeRuntimeOwner(configured.paths, name);
+  if (owner?.format === 'sdk') {
+    if (
+      runnerInputFile !== undefined ||
+      validateOnly ||
+      maxParallelText !== undefined ||
+      finish !== undefined
+    ) {
+      throw new NativeUsageError(
+        'This Native SDK next action does not accept legacy transition options',
+      );
+    }
+    if (resolveVerifierBlocker) {
+      if (
+        summary === undefined ||
+        proposalHash === undefined ||
+        expectedContinuation?.action !== 'resolve-verifier-blocker'
+      ) {
+        throw new NativeUsageError(
+          'SDK blocked 恢复需要 --summary、--proposal-hash、--expected-state-version 和 --expected-action resolve-verifier-blocker',
+        );
+      }
+      return advanceNativeSdkChange(projectRoot, name, {
+        summary,
+        proposalHash,
+        expectedStateVersion: expectedContinuation.stateVersion,
+        expectedAction: 'resolve-verifier-blocker',
+      });
+    }
+    if (reviseRequirements) {
+      if (summary === undefined || expectedContinuation?.action !== 'revise-requirements') {
+        throw new NativeUsageError(
+          'SDK requirements revision requires --summary, --expected-state-version, and --expected-action revise-requirements',
+        );
+      }
+      return advanceNativeSdkChange(projectRoot, name, {
+        summary,
+        ...(proposalHash === undefined ? {} : { proposalHash }),
+        expectedStateVersion: expectedContinuation.stateVersion,
+        expectedAction: 'revise-requirements',
+      });
+    }
+    if (confirmed) {
+      if (
+        summary === undefined ||
+        proposalHash !== undefined ||
+        expectedContinuation?.action !== 'confirm-shape'
+      ) {
+        throw new NativeUsageError(
+          'SDK Shape confirmation requires --summary, --expected-state-version, and --expected-action confirm-shape',
+        );
+      }
+      return advanceNativeSdkChange(projectRoot, name, {
+        summary,
+        expectedStateVersion: expectedContinuation.stateVersion,
+        expectedAction: 'confirm-shape',
+        ...(coordinationMode === undefined ? {} : { coordinationMode }),
+      });
+    }
+    if (acceptResult || reviseImplementation || retryVerifier) {
+      const action = acceptResult
+        ? 'accept-result'
+        : reviseImplementation
+          ? 'revise-implementation'
+          : 'retry-verifier';
+      if (
+        summary === undefined ||
+        proposalHash === undefined ||
+        expectedContinuation?.action !== action
+      ) {
+        throw new NativeUsageError(
+          `SDK Verify decision requires --summary, --proposal-hash, --expected-state-version, and --expected-action ${action}`,
+        );
+      }
+      return advanceNativeSdkChange(projectRoot, name, {
+        summary,
+        proposalHash,
+        expectedStateVersion: expectedContinuation.stateVersion,
+        expectedAction: action,
+      });
+    }
+    if (continueBuilder) {
+      if (
+        summary === undefined ||
+        proposalHash === undefined ||
+        expectedContinuation?.action !== 'continue-builder'
+      ) {
+        throw new NativeUsageError(
+          'SDK Builder continuation requires --summary, --proposal-hash, --expected-state-version, and --expected-action continue-builder',
+        );
+      }
+      return advanceNativeSdkChange(projectRoot, name, {
+        summary,
+        proposalHash,
+        expectedStateVersion: expectedContinuation.stateVersion,
+        expectedAction: 'continue-builder',
+      });
+    }
+    if (proposalHash !== undefined || coordinationMode !== undefined) {
+      throw new NativeUsageError(
+        'This Native SDK next action does not accept legacy transition options',
+      );
+    }
+    if (
+      expectedContinuation !== undefined &&
+      expectedContinuation.action !== 'prepare-shape-confirmation'
+    ) {
+      return {
+        command: 'next',
+        exitCode: 73,
+        error: {
+          code: 'conflict',
+          message: 'Native SDK 机器推进动作不匹配；用户决定须使用对应的确认或修订参数。',
+        },
+      };
+    }
+    if (summary !== undefined || expectedContinuation !== undefined) {
+      return advanceNativeSdkChange(projectRoot, name, {
+        ...(summary === undefined ? {} : { summary }),
+        ...(expectedContinuation === undefined
+          ? {}
+          : {
+              expectedStateVersion: expectedContinuation.stateVersion,
+              expectedAction: 'prepare-shape-confirmation' as const,
+            }),
+      });
+    }
+    return advanceNativeSdkChange(projectRoot, name);
+  }
+  if (proposalHash !== undefined) {
+    throw new NativeUsageError('--proposal-hash is only valid for a Native SDK Verify decision');
+  }
+  if (continueBuilder) {
+    throw new NativeUsageError(
+      '--continue-builder is only valid for a Native SDK Builder decision',
+    );
+  }
+  await assertChangeNotSdkOwned(projectRoot, 'native', name);
   const finishJournal = await readNativeWorkspaceFinishJournal(configured.paths, name);
   if (!(await isNativePortableChange(configured.paths, name))) {
     if (finishJournal) {
@@ -256,6 +412,8 @@ export async function nativeNextCommand(
         phase: 'archive' as const,
         status: 'blocked' as const,
         disposition: 'blocked' as const,
+
+        mode: 'reconcile' as const,
         requiresUserDecision: false,
         action: 'archive' as const,
         commandArgs: finishJournal.result?.recoveryArgs ?? [
@@ -800,6 +958,8 @@ async function nativeWorkspaceMismatchResult(
     continuation: {
       ...continuation,
       disposition: 'blocked',
+
+      mode: 'reconcile',
       requiresUserDecision: false,
       action: 'repair',
       commandArgs: null,

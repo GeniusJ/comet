@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { withClassicCommandContext } from '../../../domains/comet-classic/classic-command-context.js';
 import { selectCurrentChange } from '../../../domains/comet-classic/classic-current-change.js';
+import { classicGuardCommand } from '../../../domains/comet-classic/classic-guard.js';
 import { classicStateCommand } from '../../../domains/comet-classic/classic-state-command.js';
 import { readClassicArtifactLayout } from '../../../domains/comet-classic/classic-layout.js';
 import { assertClassicOpenSpecRootHealthy } from '../../../domains/comet-classic/classic-openspec-root.js';
@@ -120,6 +121,265 @@ describe('Classic workspace preparation and routing', () => {
       fs.access(path.join(prepared.projectRoot, '.comet', 'current-change.json')),
     ).resolves.toBeUndefined();
     await expect(fs.access(path.join(root, '.comet', 'current-change.json'))).rejects.toThrow();
+  });
+
+  it('keeps a copied change local when its worktree branch needs rebinding', async () => {
+    await seedChange(root, 'copied-change', 'main');
+    git(root, 'add', 'openspec');
+    git(root, 'commit', '-m', 'seed coordinator');
+    await selectCurrentChange(root, 'copied-change');
+    const prepared = await prepareClassicWorkspace({
+      projectRoot: root,
+      name: 'copied-change',
+      isolation: 'worktree',
+    });
+    worktrees.push(prepared.projectRoot);
+    const stateFile = path.join(root, 'openspec/changes/copied-change/.comet.yaml');
+    const original = await fs.readFile(stateFile, 'utf8');
+    expect(
+      await resolveClassicWorkspace({ projectRoot: prepared.projectRoot, name: 'copied-change' }),
+    ).toMatchObject({ projectRoot: prepared.projectRoot, routed: false });
+    await expect(selectCurrentChange(prepared.projectRoot, 'copied-change')).rejects.toThrow(
+      'bound to branch',
+    );
+    const rebound = await classicStateCommand(['rebind', 'copied-change'], {
+      json: false,
+      projectRoot: prepared.projectRoot,
+      invocationCwd: prepared.projectRoot,
+    });
+    expect(rebound.exitCode).toBe(0);
+    expect((await selectCurrentChange(prepared.projectRoot, 'copied-change')).branch).toBe(
+      'comet/copied-change',
+    );
+    expect(await fs.readFile(stateFile, 'utf8')).toBe(original);
+    expect((await selectCurrentChange(root, 'copied-change')).branch).toBe('main');
+    const router = path.resolve('assets/skills/comet/scripts/comet-hook-router.mjs');
+    for (const workspace of [root, prepared.projectRoot]) {
+      expect(() =>
+        execFileSync(process.execPath, [router, '--platform', 'codex', '--project-root', root], {
+          cwd: root,
+          input: JSON.stringify({
+            tool_name: 'Edit',
+            cwd: workspace,
+            tool_input: {
+              file_path: path.join(workspace, 'openspec/changes/copied-change/tasks.md'),
+            },
+          }),
+          stdio: ['pipe', 'pipe', 'pipe'],
+        }),
+      ).not.toThrow();
+    }
+  });
+
+  it('selects an SDK-owned Classic change in its linked worktree from the primary worktree', async () => {
+    const prepared = await prepareClassicWorkspace({
+      projectRoot: root,
+      name: 'sdk-linked',
+      isolation: 'worktree',
+    });
+    worktrees.push(prepared.projectRoot);
+    const initialized = await classicStateCommand(
+      ['init', 'sdk-linked', 'full', '--isolation', 'worktree', '--runtime', 'sdk'],
+      { json: true, invocationCwd: prepared.projectRoot, projectRoot: prepared.projectRoot },
+    );
+    expect(initialized.exitCode, initialized.stderr).toBe(0);
+    await expect(
+      fs.access(path.join(prepared.projectRoot, 'openspec/changes/sdk-linked/comet-state.yaml')),
+    ).resolves.toBeUndefined();
+
+    const resolved = await resolveClassicWorkspace({ projectRoot: root, name: 'sdk-linked' });
+    expect(resolved).toMatchObject({
+      projectRoot: prepared.projectRoot,
+      branch: 'comet/sdk-linked',
+      isolation: 'worktree',
+      routed: true,
+    });
+
+    const selected = await classicStateCommand(['select', 'sdk-linked'], {
+      json: true,
+      invocationCwd: root,
+      projectRoot: root,
+    });
+    expect(selected.exitCode, selected.stderr).toBe(0);
+    expect(selected.data).toMatchObject({
+      change: 'sdk-linked',
+      phase: 'open',
+      run: { runId: 'sdk-linked' },
+    });
+    await expect(
+      fs.access(path.join(prepared.projectRoot, '.comet/current-change.json')),
+    ).resolves.toBeUndefined();
+    await expect(fs.access(path.join(root, '.comet/current-change.json'))).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
+
+    const phase = await classicStateCommand(['get', 'sdk-linked', 'phase'], {
+      json: false,
+      invocationCwd: root,
+      projectRoot: root,
+    });
+    expect(phase.exitCode, phase.stderr).toBe(0);
+    expect(phase.stdout).toBe('open\n');
+    const next = await classicStateCommand(['next', 'sdk-linked'], {
+      json: true,
+      invocationCwd: root,
+      projectRoot: root,
+    });
+    expect(next.exitCode, next.stderr).toBe(0);
+    expect(next.data).toMatchObject({
+      change: 'sdk-linked',
+      nextAction: { kind: 'action', stepId: 'full.open' },
+    });
+    const entry = await classicStateCommand(['check', 'sdk-linked', 'open'], {
+      json: true,
+      invocationCwd: root,
+      projectRoot: root,
+    });
+    expect(entry.exitCode, entry.stderr).toBe(0);
+    expect(entry.data).toMatchObject({
+      change: 'sdk-linked',
+      checks: { blocked: false },
+    });
+  });
+
+  it('recovers an SDK-owned Classic change in a linked worktree from the primary worktree', async () => {
+    const prepared = await prepareClassicWorkspace({
+      projectRoot: root,
+      name: 'sdk-recovery',
+      isolation: 'worktree',
+    });
+    worktrees.push(prepared.projectRoot);
+    const initialized = await classicStateCommand(
+      ['init', 'sdk-recovery', 'full', '--isolation', 'worktree', '--runtime', 'sdk'],
+      { json: true, invocationCwd: prepared.projectRoot, projectRoot: prepared.projectRoot },
+    );
+    expect(initialized.exitCode, initialized.stderr).toBe(0);
+
+    const recovered = await classicStateCommand(['check', 'sdk-recovery', 'open', '--recover'], {
+      json: true,
+      invocationCwd: root,
+      projectRoot: root,
+    });
+    expect(recovered.exitCode, recovered.stderr).toBe(0);
+    expect(recovered.data).toMatchObject({
+      change: 'sdk-recovery',
+      phase: 'open',
+      nextAction: { kind: 'action', stepId: 'full.open' },
+    });
+  });
+
+  it('checks SDK-owned Classic artifacts in the linked worktree from the primary worktree', async () => {
+    const prepared = await prepareClassicWorkspace({
+      projectRoot: root,
+      name: 'sdk-artifacts',
+      isolation: 'worktree',
+    });
+    worktrees.push(prepared.projectRoot);
+    const initialized = await classicStateCommand(
+      ['init', 'sdk-artifacts', 'full', '--isolation', 'worktree', '--runtime', 'sdk'],
+      { json: true, invocationCwd: prepared.projectRoot, projectRoot: prepared.projectRoot },
+    );
+    expect(initialized.exitCode, initialized.stderr).toBe(0);
+    const changeDir = path.join(prepared.projectRoot, 'openspec', 'changes', 'sdk-artifacts');
+    for (const artifact of ['proposal.md', 'design.md', 'tasks.md']) {
+      await fs.writeFile(path.join(changeDir, artifact), `# ${artifact}\n`);
+    }
+
+    const result = await classicStateCommand(['artifacts', 'sdk-artifacts'], {
+      json: true,
+      invocationCwd: root,
+      projectRoot: root,
+    });
+    expect(result.exitCode, result.stderr).toBe(0);
+    expect(result.data).toMatchObject({
+      source: 'legacy',
+      problems: [],
+    });
+    expect(result.data).toHaveProperty(
+      'files',
+      ['proposal.md', 'design.md', 'tasks.md'].map((artifact) => path.join(changeDir, artifact)),
+    );
+  });
+
+  it('runs an inferred SDK Build check in the linked worktree when invoked from the primary worktree', async () => {
+    const name = 'sdk-linked-build';
+    const prepared = await prepareClassicWorkspace({
+      projectRoot: root,
+      name,
+      isolation: 'worktree',
+    });
+    worktrees.push(prepared.projectRoot);
+    const targetOptions = {
+      json: false,
+      invocationCwd: prepared.projectRoot,
+      projectRoot: prepared.projectRoot,
+    };
+    const primaryOptions = { json: false, invocationCwd: root, projectRoot: root };
+    expect(
+      (
+        await classicStateCommand(
+          ['init', name, 'hotfix', '--isolation', 'worktree', '--runtime', 'sdk'],
+          targetOptions,
+        )
+      ).exitCode,
+    ).toBe(0);
+    const changeDir = path.join(prepared.projectRoot, 'openspec', 'changes', name);
+    await fs.writeFile(path.join(changeDir, 'proposal.md'), '# Change\n');
+    await fs.writeFile(path.join(changeDir, 'design.md'), '# Design\n');
+    await fs.writeFile(path.join(changeDir, 'tasks.md'), '- [ ] Implement the change\n');
+    const preview = await classicGuardCommand([name, 'open'], targetOptions);
+    expect(preview.exitCode, preview.stderr).toBe(0);
+    const opened = await classicGuardCommand(
+      [
+        name,
+        'open',
+        '--apply',
+        '--approval-hash',
+        (preview.data as { approvalHash: string }).approvalHash,
+      ],
+      targetOptions,
+    );
+    expect(opened.exitCode, opened.stderr).toBe(0);
+    await fs.writeFile(path.join(changeDir, 'tasks.md'), '- [x] Implement the change\n');
+    await fs.writeFile(
+      path.join(prepared.projectRoot, 'package.json'),
+      JSON.stringify({ scripts: { build: 'node -e "console.log(\'linked-build-ok\')"' } }),
+    );
+
+    const built = await classicGuardCommand([name, 'build', '--apply'], primaryOptions);
+    expect(built.exitCode, built.stderr).toBe(0);
+    expect(built.data).toMatchObject({ change: name, phase: 'verify' });
+    expect((await classicStateCommand(['get', name, 'phase'], primaryOptions)).stdout).toBe(
+      'verify\n',
+    );
+    await expect(fs.access(path.join(changeDir, 'comet-state.yaml'))).resolves.toBeUndefined();
+  });
+
+  it('selects a local legacy Classic change before a same-named SDK change in another worktree', async () => {
+    const prepared = await prepareClassicWorkspace({
+      projectRoot: root,
+      name: 'same-name',
+      isolation: 'worktree',
+    });
+    worktrees.push(prepared.projectRoot);
+    const initialized = await classicStateCommand(
+      ['init', 'same-name', 'full', '--isolation', 'worktree', '--runtime', 'sdk'],
+      { json: true, invocationCwd: prepared.projectRoot, projectRoot: prepared.projectRoot },
+    );
+    expect(initialized.exitCode, initialized.stderr).toBe(0);
+    await seedChange(root, 'same-name', 'main');
+
+    const selected = await classicStateCommand(['select', 'same-name'], {
+      json: true,
+      invocationCwd: root,
+      projectRoot: root,
+    });
+    expect(selected.exitCode, selected.stderr).toBe(0);
+    expect(selected.data).not.toHaveProperty('run');
+    await expect(fs.access(path.join(root, '.comet/current-change.json'))).resolves.toBeUndefined();
+    await expect(
+      fs.access(path.join(prepared.projectRoot, '.comet/current-change.json')),
+    ).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
   it('preserves an uncommitted project configuration when preparing a worktree', async () => {
@@ -317,10 +577,13 @@ describe('Classic workspace preparation and routing', () => {
 
   it('initializes a new Classic state with the prepared workspace binding', async () => {
     const result = await withClassicCommandContext({ projectRoot: root, invocationCwd: root }, () =>
-      classicStateCommand(['init', 'serial-change', 'full', '--isolation', 'current'], {
-        json: false,
-        invocationCwd: root,
-      }),
+      classicStateCommand(
+        ['init', 'serial-change', 'full', '--isolation', 'current', '--runtime', 'compat'],
+        {
+          json: false,
+          invocationCwd: root,
+        },
+      ),
     );
     expect(result.exitCode).toBe(0);
     const state = await fs.readFile(

@@ -32,6 +32,9 @@ import {
   readNativeWorkspaceFinishArchive,
   writeNativeWorkspaceFinishJournal,
 } from './native-workspace-finish.js';
+import { readSdkChangeOwner } from '../workflow-contract/change-runtime-owner.js';
+import { resolveNativeSdkCommandRoot } from './native-runtime-ownership.js';
+import { archiveNativeSdkChange } from './native-sdk-archive-command.js';
 import {
   assertNoArguments,
   configuredPaths,
@@ -74,6 +77,7 @@ export async function nativeArchiveCommand(
 ): Promise<DispatchResult> {
   const name = requiredPositional(args, 'change name');
   const dryRun = takeFlag(args, '--dry-run');
+  const recover = takeFlag(args, '--recover');
   const expectedPreflightHash = takeOption(args, '--expect-preflight');
   const confirmed = takeFlag(args, '--confirmed');
   if (dryRun && confirmed)
@@ -93,6 +97,7 @@ export async function nativeArchiveCommand(
       '--expected-state-version requires --confirmed --finish and a non-negative integer',
     );
   }
+  const legacySpecBackup = takeOption(args, '--legacy-spec-backup');
   const serialFirstOption = takeOption(args, '--serial-first');
   const commitMessage = takeOption(args, '--commit-message');
   const mergeMessage = takeOption(args, '--merge-message');
@@ -126,6 +131,30 @@ export async function nativeArchiveCommand(
     finish !== 'keep'
   ) {
     throw new NativeUsageError('--finish must be merge, push, pull-request, or keep');
+  }
+  assertNoArguments(args);
+  const commandRoot = await resolveNativeSdkCommandRoot(projectRoot, name);
+  if (await readSdkChangeOwner(commandRoot, 'native', name)) {
+    return archiveNativeSdkChange({
+      projectRoot: commandRoot,
+      name,
+      dryRun,
+      recover,
+      confirmed,
+      ...(expectedPreflightHash === undefined ? {} : { expectedPreflightHash }),
+      ...(finishOption === undefined ? {} : { finish: finishOption }),
+      ...(serialFirstOption === undefined ? {} : { serialFirst: serialFirstOption }),
+      ...(commitMessage === undefined ? {} : { commitMessage }),
+      ...(mergeMessage === undefined ? {} : { mergeMessage }),
+      ...(legacySpecBackup === undefined ? {} : { legacySpecBackup }),
+    });
+  }
+  if (legacySpecBackup !== undefined)
+    throw new NativeUsageError(
+      '--legacy-spec-backup is only available for SDK-owned Native changes',
+    );
+  if (recover) {
+    throw new NativeUsageError('--recover is only available for SDK-owned Native changes');
   }
   const configured = await configuredPaths(projectRoot);
   const portableActive = await isNativePortableChange(configured.paths, name);
@@ -274,6 +303,8 @@ export async function nativeArchiveCommand(
           workspaceFinishResult: blockedResult,
           continuation: {
             disposition: 'blocked',
+
+            mode: 'reconcile',
             reason: message,
             commandArgs: blockedResult.recoveryArgs,
             inputOptions: [],
@@ -330,6 +361,8 @@ export async function nativeArchiveCommand(
             workspaceFinishResult: error.result,
             continuation: {
               disposition: 'blocked',
+
+              mode: 'reconcile',
               reason: error.message,
               commandArgs: error.result.recoveryArgs,
               inputOptions: [],
@@ -427,6 +460,8 @@ export async function nativeArchiveCommand(
             archiveRecovery: true,
             continuation: {
               disposition: 'continue',
+
+              mode: 'execute',
               reason: 'Resume the interrupted Native Archive transaction.',
               commandArgs: ['comet', 'native', 'archive', name, '--confirmed', ...messageOptions],
               inputOptions: [],
@@ -517,6 +552,8 @@ export async function nativeArchiveCommand(
         ? {
             ...previewContinuation,
             disposition: 'await-user' as const,
+
+            mode: 'ask' as const,
             action: 'none' as const,
             commandArgs: null,
             requiredInputs: ['choose-first-archive'],
@@ -748,6 +785,8 @@ export async function nativeArchiveCommand(
           workspaceFinishResult: null,
           continuation: {
             disposition: 'await-user',
+
+            mode: 'ask',
             reason: error.message,
             commandArgs: [...commandArgs, ...messageOptions],
             inputOptions: error.peers.length > 0 ? ['serial-first-change'] : [],
@@ -820,6 +859,8 @@ export async function nativeArchiveCommand(
             workspaceFinishResult,
             continuation: {
               disposition: 'blocked',
+
+              mode: 'reconcile',
               reason: message,
               commandArgs: workspaceFinishResult.recoveryArgs,
               inputOptions: [],
@@ -876,6 +917,8 @@ export async function nativeArchiveCommand(
             workspaceFinishResult: error.result,
             continuation: {
               disposition: 'blocked',
+
+              mode: 'reconcile',
               reason: error.message,
               commandArgs: error.result.recoveryArgs,
               inputOptions: [],

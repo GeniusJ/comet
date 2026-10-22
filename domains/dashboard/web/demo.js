@@ -2444,6 +2444,124 @@ const demoProjectKnowledgeRecords = [
   },
 ];
 
+function demoContextUsage(records, source) {
+  const projectKnowledge = source === 'project-knowledge';
+  const tasks = projectKnowledge
+    ? [
+        ['核对 Dashboard 数据读取链路', 32],
+        ['检查新模块是否已有架构约定', 36],
+        ['复用文件预览的路径边界约束', 29],
+        ['查阅项目构建与测试入口', 41],
+        ['补充知识来源与验证记录', 34],
+        ['验证项目配置的兼容行为', 52],
+        ['梳理详情读取的缓存策略', 45],
+        ['核对归档文档中的接口约定', 68],
+      ]
+    : [
+        ['修复 Dashboard 的历史记录加载', 18],
+        ['检查当前阶段是否有适用记忆', 9],
+        ['更新项目测试约定', 12],
+        ['检查构建阶段的适用偏好', 26],
+        ['整理模块接口文档', 17],
+        ['验证命令行输出', 38],
+        ['修复工作区选择', 24],
+        ['补充任务验收记录', 42],
+      ];
+  const requests = projectKnowledge ? 30 : 24;
+  const hits = projectKnowledge ? 24 : 18;
+  const feedbackCount = projectKnowledge ? 15 : 9;
+  const successes = projectKnowledge ? 12 : 7;
+  const observedAt = Date.now() - 1000;
+  const samples = Array.from({ length: requests }, (_, index) => {
+    const hitIndex = index === 1 ? -1 : index === 0 ? 0 : index - 1;
+    const hit = hitIndex >= 0 && hitIndex < hits;
+    const [task, elapsedMs] = tasks[index % tasks.length];
+    const outcome =
+      hitIndex < successes
+        ? 'used-successfully'
+        : hitIndex === successes
+          ? 'corrected'
+          : hitIndex === successes + 1
+            ? 'ignored'
+            : projectKnowledge && hitIndex === successes + 2
+              ? 'overridden'
+              : undefined;
+    return {
+      episodeId: `demo-${source}-sample-${index}`,
+      task,
+      counted: true,
+      elapsedMs,
+      limited: false,
+      occurredAt: new Date(
+        observedAt - (index < 8 ? index * 3600000 : 86400000 + (index - 8) * 10800000),
+      ).toISOString(),
+      candidateCount: hit ? 1 : 0,
+      items: hit
+        ? [
+            {
+              applicationId: `demo-${source}-application-${index}`,
+              candidateId: records[index % records.length].id,
+              title: records[index % records.length].title ?? task,
+              delivery: hitIndex < (projectKnowledge ? 16 : 12) ? 'full' : 'manifest',
+              outcome,
+            },
+          ]
+        : [],
+    };
+  });
+  return {
+    demo: true,
+    available: true,
+    days: 7,
+    sampleLimit: 500,
+    truncated: false,
+    trackingStartedAt: '2026-08-23T08:00:00.000Z',
+    requests,
+    hits,
+    hitRate: hits / requests,
+    limitedRequests: projectKnowledge ? 0 : 1,
+    fullDeliveries: projectKnowledge ? 16 : 12,
+    recommendations: hits,
+    feedbackCount,
+    feedbackRate: feedbackCount / hits,
+    successes,
+    corrections: 1,
+    failures: 0,
+    ignored: 1,
+    overridden: projectKnowledge ? 1 : 0,
+    successRate: successes / (successes + 1),
+    p95Ms: projectKnowledge ? 68 : 42,
+    lastQueryMs: tasks[0][1],
+    samples,
+    recentTasks: tasks.map(([task, elapsedMs], index) => ({
+      episodeId: `demo-${source}-task-${index}`,
+      task,
+      phase: index % 2 ? 'verify' : 'build',
+      occurredAt: new Date(observedAt - index * 3600000).toISOString(),
+      counted: true,
+      elapsedMs,
+      candidateCount: index === 1 ? 0 : index === 0 ? records.length : 1,
+      limited: false,
+      items: records.slice(0, index === 1 ? 0 : index === 0 ? 2 : 1).map((record) => ({
+        candidateId: record.id,
+        title: record.title ?? record.category,
+        delivery: index % 2 ? 'manifest' : (record.lastApplication?.delivery ?? 'full'),
+        whyApplied: record.lastApplication?.whyApplied ?? '适用于当前阶段',
+        outcome: [
+          'used-successfully',
+          undefined,
+          'used-successfully',
+          'corrected',
+          'used-successfully',
+          projectKnowledge ? 'overridden' : undefined,
+          'used-successfully',
+          'ignored',
+        ][index],
+      })),
+    })),
+  };
+}
+
 export const DEMO_PLUGIN_PAGES = [
   {
     pluginId: 'comet.personal-memory',
@@ -2454,6 +2572,7 @@ export const DEMO_PLUGIN_PAGES = [
     projectPaused: false,
     diagnostics: [],
     data: {
+      contextUsage: demoContextUsage(demoMemoryRecords, 'personal-memory'),
       status: {
         learningEnabled: true,
         retrievalEnabled: true,
@@ -2495,6 +2614,7 @@ export const DEMO_PLUGIN_PAGES = [
     projectPaused: false,
     diagnostics: [],
     data: {
+      contextUsage: demoContextUsage(demoProjectKnowledgeRecords, 'project-knowledge'),
       provider: 'local',
       configured: true,
       localLimits: { maxFileMb: 1, maxTotalMb: 32 },
@@ -2715,9 +2835,8 @@ export const DEMO_PROJECT_CONFIG = {
 DEMO_SNAPSHOT.changes.active.forEach(addCometArtifacts);
 DEMO_SNAPSHOT.changes.archived.forEach(addCometArtifacts);
 
-// Demo-only data for sidebar visualizations that do not have a dashboard
-// collector yet. Shapes are intentionally close to BundleAuthoringState and
-// RepositoryEvalResult so real collection can replace this without redesigning UI.
+// 静态侧栏示例沿用现有展示字段；应用文件使用当前 SDK 包结构。
+// 这些内容不是实际 Run、Agent 平台调用或模型验收证据。
 export const DEMO_SKILL_VISUALS = {
   compose: {
     summary: {
@@ -2742,14 +2861,14 @@ export const DEMO_SKILL_VISUALS = {
         ],
         generatedControlPlane: [
           'SKILL.md',
-          'reference/workflow-protocol.json',
-          'reference/composition-report.md',
-          'reference/skill-review.md',
-          'comet/eval.yaml',
-          'scripts/comet-check.mjs',
+          'application.json',
+          'application.mjs',
+          'installation.json',
+          'skills/candidate-review/SKILL.md',
+          'skills/candidate-review/scripts/review.mjs',
         ],
         requiredConfirmations: [
-          { label: 'Skill Creator proposal confirmed', required: true, confirmed: true },
+          { label: 'Creator plan confirmed', required: true, confirmed: true },
           { label: 'Eval result attached', required: true, confirmed: true },
           { label: 'Review approved', required: true, confirmed: true },
           { label: 'Executable disclosure reviewed', required: false, confirmed: false },
@@ -2784,18 +2903,18 @@ export const DEMO_SKILL_VISUALS = {
         reusedSkills: [
           { skill: 'brainstorming', status: 'available', sourceCount: 2 },
           { skill: 'writing-skills', status: 'available', sourceCount: 1 },
-          { skill: 'skill-creator', status: 'available', sourceCount: 1 },
+          { skill: 'comet-any', status: 'available', sourceCount: 1 },
         ],
         generatedControlPlane: [
-          'reference/authoring-lanes.json',
-          'reference/resolved-skills.json',
-          'reference/composition-report.md',
-          'reference/decision-points.md',
-          'scripts/comet-plan.mjs',
+          'application.json',
+          'installation.json',
+          'application.mjs',
+          'bindings.mjs',
+          'skills/report-review/SKILL.md',
         ],
         requiredConfirmations: [
           { label: 'Resolved Skill choices', required: true, confirmed: true },
-          { label: 'Authoring lanes complete', required: true, confirmed: true },
+          { label: 'Application compiled and loaded', required: true, confirmed: true },
           { label: 'Run quick eval', required: true, confirmed: true },
         ],
         callChain: [
@@ -2882,19 +3001,19 @@ export const DEMO_SKILL_VISUALS = {
             id: 'route-conformance',
             passed: true,
             passRate: 0.96,
-            evidence: ['workflow-protocol.json', 'route-conformance.json'],
+            evidence: ['application.json', 'route-conformance.json'],
           },
           {
             id: 'control-plane',
             passed: true,
             passRate: 0.92,
-            evidence: ['comet/eval.yaml', 'scripts/comet-check.mjs'],
+            evidence: ['application.mjs', 'installation.json'],
           },
           {
             id: 'publish-readiness',
             passed: true,
             passRate: 0.88,
-            evidence: ['reference/skill-review.md', 'review-summary.json'],
+            evidence: ['installation-preview.json', 'review-summary.json'],
           },
         ],
         bundle: {
@@ -2917,7 +3036,7 @@ export const DEMO_SKILL_VISUALS = {
         level: 'quick',
         draftHash: 'c'.repeat(64),
         evalManifestHash: 'd'.repeat(64),
-        tasks: ['authoring-lanes', 'entry-smoke', 'install-preview'],
+        tasks: ['application-loading', 'entry-smoke', 'install-preview'],
         treatments: ['create-skill-maker-review-flow'],
         passAtK: { 1: 1 },
         weightedScore: { overall: 0.9 },
@@ -2926,13 +3045,13 @@ export const DEMO_SKILL_VISUALS = {
         reports: ['quick-eval-report.html'],
         passed: true,
         summary:
-          'Quick eval passed authoring-lane coverage, entry smoke, and install-preview checks.',
+          'Quick eval passed SDK application loading, entry smoke, and install-preview checks.',
         entries: [
           {
-            id: 'authoring-lanes',
+            id: 'application-loading',
             passed: true,
             passRate: 0.9,
-            evidence: ['authoring-lanes.json', 'skill-review.md'],
+            evidence: ['application.json', 'application.mjs', 'installation.json'],
           },
           {
             id: 'install-preview',

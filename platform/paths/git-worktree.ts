@@ -120,7 +120,7 @@ export function createGitWorktreeReadCache(): {
         await Promise.all(
           paths.map(async (target) => {
             try {
-              const [root, output] = await Promise.all([
+              const probes = await Promise.allSettled([
                 runExternalCommandAsync('git', ['-C', target, 'rev-parse', '--show-toplevel'], {
                   timeoutMs: 1000,
                   maxBufferBytes: 16384,
@@ -131,6 +131,12 @@ export function createGitWorktreeReadCache(): {
                   { timeoutMs: 1000, maxBufferBytes: 262144 },
                 ),
               ]);
+              // 两个探测都结束后才能回退；失败的探测不能留下仍占用目录的子进程。
+              const failure = probes.find((probe) => probe.status === 'rejected');
+              if (failure?.status === 'rejected') throw failure.reason;
+              const [root, output] = probes.map(
+                (probe) => (probe as PromiseFulfilledResult<string>).value,
+              );
               const worktrees = parseGitWorktrees(output.trim());
               if (worktrees.some((entry) => samePath(entry.root, root.trim()))) {
                 roots.set(
@@ -223,22 +229,10 @@ function inspectGitWorktree(projectPath: string): GitWorktreeContext {
       readScope.getStore()?.get(canonicalPathForComparison(currentWorktreeRoot)) ??
       readGitWorktrees(projectPath);
     const context = gitWorktreeContextFromEntries(currentWorktreeRoot, entries);
-    if (readScope.getStore() && context) return context;
-    const primaryWorktreeRoot = entries[0]?.root ?? currentWorktreeRoot;
-    let currentBranch: string | null = null;
-    try {
-      currentBranch = runGit(projectPath, ['symbolic-ref', '--quiet', '--short', 'HEAD']) || null;
-    } catch {
-      // Detached HEAD is a valid Git worktree state, but it cannot satisfy a
-      // Native branch binding.
-    }
-    return {
-      isGitWorktree: true,
-      isSecondaryWorktree: !samePath(currentWorktreeRoot, primaryWorktreeRoot),
-      currentWorktreeRoot,
-      primaryWorktreeRoot,
-      currentBranch,
-    };
+    // Use one fresh worktree-list observation for both identity and branch.
+    // A missing entry must fail closed rather than borrow another worktree's branch.
+    if (!context) throw new Error('Current worktree is missing from Git worktree list');
+    return context;
   } catch {
     return {
       isGitWorktree: false,

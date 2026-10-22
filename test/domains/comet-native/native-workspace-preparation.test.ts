@@ -297,6 +297,11 @@ describe('Native workspace preparation', () => {
 
     const exclude = await fs.readFile(path.join(projectRoot, '.git', 'info', 'exclude'), 'utf8');
     expect(exclude).toContain('/.worktrees/example/');
+    expect(exclude.split(/\r?\n/u)).toContain('/.comet/runtime');
+    await fs.writeFile(
+      path.join(projectRoot, '.git', 'info', 'exclude'),
+      '# legacy exclusions\n/.worktrees/example/\n',
+    );
 
     const existingRoot = path.join(projectRoot, 'existing-worktree');
     await fs.mkdir(existingRoot);
@@ -313,8 +318,11 @@ describe('Native workspace preparation', () => {
       }),
     ).resolves.toMatchObject({
       projectRoot: existingRoot,
-      preparation: { createdWorktree: false },
+      preparation: { createdWorktree: false, gitExcludeUpdated: true },
     });
+    expect(await fs.readFile(path.join(projectRoot, '.git', 'info', 'exclude'), 'utf8')).toBe(
+      '# legacy exclusions\n/.worktrees/example/\n/.comet/runtime\n',
+    );
 
     worktree.listGitWorktrees
       .mockReturnValueOnce([{ root: path.join(projectRoot, 'stale'), branch: 'comet/stale' }])

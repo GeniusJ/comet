@@ -1,6 +1,6 @@
 {
   "name": "@rpamis/comet",
-  "version": "0.4.5",
+  "version": "0.5.0",
   "description": "Agent Skill Harness For Turning Ideas Into Evaluated Workflows",
   "keywords": [
     "comet",
@@ -18,6 +18,41 @@
   "license": "MIT",
   "author": "benym",
   "type": "module",
+  "exports": {
+    "./applications/compiler": {
+      "types": "./dist/domains/workflow-generation/index.d.ts",
+      "import": "./dist/domains/workflow-generation/index.js"
+    },
+    "./applications/classic": {
+      "types": "./dist/domains/comet-classic/classic-application.d.ts",
+      "import": "./dist/domains/comet-classic/classic-application.js"
+    },
+    "./applications/native": {
+      "types": "./dist/domains/comet-native/native-application.d.ts",
+      "import": "./dist/domains/comet-native/native-application.js"
+    },
+    "./applications": {
+      "types": "./dist/domains/workflow-application/index.d.ts",
+      "import": "./dist/domains/workflow-application/index.js"
+    },
+    "./runtime": {
+      "types": "./dist/domains/engine/runtime.d.ts",
+      "import": "./dist/domains/engine/runtime.js"
+    },
+    "./plugins": {
+      "types": "./dist/domains/comet-plugin/sdk.d.ts",
+      "import": "./dist/domains/comet-plugin/sdk.js"
+    },
+    "./plugins/comet": {
+      "types": "./dist/domains/comet-plugin/comet.d.ts",
+      "import": "./dist/domains/comet-plugin/comet.js"
+    },
+    "./*": "./*",
+    "./applications/creator": {
+      "types": "./dist/domains/workflow-creation/index.d.ts",
+      "import": "./dist/domains/workflow-creation/index.js"
+    }
+  },
   "publishConfig": {
     "access": "public"
   },
@@ -54,9 +89,13 @@
     "build:classic-runtime": "node scripts/build/build-classic-runtime.mjs",
     "build:native-runtime": "node scripts/build/build-native-runtime.mjs",
     "build:entry-runtime": "node scripts/build/build-entry-runtime.mjs",
-    "check:generated": "node scripts/build/build-classic-runtime.mjs --check && node scripts/build/build-native-runtime.mjs --check && node scripts/build/build-entry-runtime.mjs --check",
+    "check:generated": "node scripts/build/build-runtime-schemas.mjs --check && node scripts/build/build-classic-runtime.mjs --check && node scripts/build/build-native-runtime.mjs --check && node scripts/build/build-entry-runtime.mjs --check",
+    "check:sdk-api": "node scripts/release/check-sdk-api.mjs",
+    "check:sdk-fixtures": "node scripts/release/check-sdk-fixtures.mjs",
+    "update:sdk-api": "node scripts/release/check-sdk-api.mjs --update",
     "dev": "tsc --watch",
     "test": "vitest run",
+    "test:sdk": "vitest run test/domains/engine test/domains/workflow-application test/domains/workflow-generation test/domains/workflow-creation test/domains/eval/application-eval.test.ts test/domains/comet-plugin/plugin-sdk.test.ts test/domains/comet-classic/classic-sdk test/domains/comet-classic/classic-application.test.ts test/domains/comet-native/native-sdk test/domains/comet-native/native-application.test.ts test/domains/comet-native/native-cli-v4-surface.test.ts test/app/runtime-command.test.ts test/app/runtime-application.test.ts test/app/runtime-application-compact.test.ts test/app/native-runtime-dispatch.test.ts test/app/application-distribution.test.ts test/app/application-eval.test.ts test/scripts/sdk-api.test.ts test/scripts/sdk-fixtures.test.ts",
     "test:native-parallel": "vitest run test/domains/comet-native/native-parallel-worktree.test.ts",
     "test:script-smoke": "vitest run test/domains/comet-classic/comet-scripts.test.ts",
     "test:openspec-upstream": "node test/helpers/openspec-upstream.mjs",
@@ -80,7 +119,8 @@
     "prepack": "node scripts/release/npm-readme.mjs apply",
     "postpack": "node scripts/release/npm-readme.mjs restore",
     "prepublishOnly": "node scripts/release/prepublish-check.js && node build.js",
-    "postinstall": "node scripts/install/postinstall.js"
+    "postinstall": "node scripts/install/postinstall.js",
+    "benchmark:workflow-scale": "node scripts/benchmark/workflow-scale-benchmark.mjs"
   },
   "lint-staged": {
     "app/**/*.{ts,tsx,js,mjs,cjs,json,md,yaml,yml}": "prettier --write",
@@ -118,6 +158,7 @@
   "devDependencies": {
     "@ant-design/cssinjs": "2.1.2",
     "@eslint/js": "^10.0.1",
+    "@microsoft/api-extractor": "7.59.3",
     "@playwright/test": "^1.61.1",
     "@tailwindcss/vite": "^4.3.1",
     "@types/node": "^26.4.0",
@@ -137,11 +178,12 @@
     "tailwindcss": "^4.3.1",
     "typescript": "^5.9.3",
     "typescript-eslint": "^8.59.3",
-    "vite": "8.2.2",
+    "vite": "8.2.4",
     "vitest": "^4.1.11"
   },
   "dependencies": {
     "@ant-design/icons": "^6.3.2",
+    "@babel/parser": "7.29.8",
     "@inquirer/ansi": "^2.0.7",
     "@inquirer/core": "^12.0.1",
     "@inquirer/figures": "^2.0.8",
@@ -152,8 +194,10 @@
     "antd": "^6.6.2",
     "commander": "^15.0.0",
     "dompurify": "^3.4.16",
+    "es-module-lexer": "2.3.2",
     "highlight.js": "^11.12.0",
-    "marked": "^18.0.11",
+    "jsonc-parser": "3.3.1",
+    "marked": "18.0.11",
     "mermaid": "11.17.2",
     "smol-toml": "^1.9.0",
     "yaml": "^2.9.0"

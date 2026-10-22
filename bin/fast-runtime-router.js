@@ -11,6 +11,7 @@ const NATIVE_COMMANDS = new Set([
   'show',
   'status',
   'select',
+  'cancel',
   'next',
   'archive',
   'doctor',
@@ -27,10 +28,27 @@ function hasHelpFlag(args) {
  * the same argv contract. Returning null preserves Commander for all other
  * commands, including help and unknown-command diagnostics.
  */
-export function resolveFastRuntime(argv) {
+export function resolveFastRuntime(argv, environment = process.env) {
   if (argv.length === 0 || hasHelpFlag(argv)) return null;
 
   const [group, command, ...tail] = argv;
+  if (group === 'classic' && CLASSIC_COMMANDS.has(command)) {
+    return {
+      assetPath: 'dist/app/commands/classic.js',
+      args: tail,
+      classicCommand: command,
+    };
+  }
+
+  if (group === 'runtime' && command === 'dispatch') {
+    if (argv.includes('--version') || argv.includes('-v')) return null;
+    return {
+      assetPath: 'dist/app/cli/runtime-command.js',
+      args: argv,
+      runtimeDispatch: true,
+    };
+  }
+
   if (CLASSIC_COMMANDS.has(group))
     return {
       assetPath: 'dist/app/commands/classic.js',
@@ -62,6 +80,19 @@ export function resolveFastRuntime(argv) {
   }
 
   if (group === 'native' && command && NATIVE_COMMANDS.has(command)) {
+    // 保留上下文注入和学习记录；普通只读命令继续使用独立 bundle。
+    if (
+      ['next', 'archive'].includes(command) ||
+      environment.COMET_TASK?.trim() ||
+      tail.includes('--summary') ||
+      tail.some((arg) => arg.startsWith('--comet-'))
+    ) {
+      return {
+        assetPath: 'dist/app/commands/native.js',
+        args: [command, ...tail],
+        nativeFacade: true,
+      };
+    }
     return {
       assetPath: `assets/skills/comet-native/scripts/comet-native-${command}.mjs`,
       args: tail,
@@ -83,7 +114,13 @@ export async function tryRunFastRuntime(argv = process.argv.slice(2)) {
   const route = resolveFastRuntime(argv);
   if (!route) return false;
 
-  const runtimeUrl = assetUrl(route.assetPath);
+  // 聚合入口只替代完整 facade 的加载方式；未构建时保留开发目录回退。
+  const bundledFacadeUrl = route.nativeFacade
+    ? assetUrl('dist/app/commands/native.bundle.js')
+    : undefined;
+  const runtimeUrl = bundledFacadeUrl && existsSync(fileURLToPath(bundledFacadeUrl))
+    ? bundledFacadeUrl
+    : assetUrl(route.assetPath);
   const runtimePath = fileURLToPath(runtimeUrl);
   if (!existsSync(runtimePath)) return false;
 
@@ -95,6 +132,16 @@ export async function tryRunFastRuntime(argv = process.argv.slice(2)) {
       import(classicRuntimeUrl.href),
     ]);
     process.exitCode = await runClassicFacade(route.classicCommand, route.args, runClassicCli);
+    return true;
+  }
+  if (route.nativeFacade) {
+    const { runNativeFacade } = await import(runtimeUrl.href);
+    process.exitCode = await runNativeFacade(route.args);
+    return true;
+  }
+  if (route.runtimeDispatch) {
+    const { runRuntimeCli } = await import(runtimeUrl.href);
+    await runRuntimeCli(route.args);
     return true;
   }
   if (route.configuredEntry) {

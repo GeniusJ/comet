@@ -1,3 +1,4 @@
+import { readSkillWithCompat } from '../../helpers/skill-content.js';
 import { promises as fs } from 'fs';
 import path from 'path';
 import { describe, expect, it } from 'vitest';
@@ -6,7 +7,7 @@ const skillRoot = path.resolve('assets', 'skills');
 const zhSkillRoot = path.resolve('assets', 'skills-zh');
 
 async function readSkill(root: string, name: string): Promise<string> {
-  return fs.readFile(path.join(root, name, 'SKILL.md'), 'utf8');
+  return readSkillWithCompat(root, name);
 }
 
 function descriptionOf(skill: string): string {
@@ -74,11 +75,12 @@ describe('Chinese Classic efficiency contracts', () => {
     expect(entry).toContain('新 full change 交 `/comet-open`');
     expect(entry).toContain('hotfix/tweak 分别交 `/comet-hotfix`、`/comet-tweak`');
     expect(entry).not.toContain('新 change 统一交 `/comet-open`');
-    expect(entry).toContain('用户选择升级后才运行');
-    expect(entry).toContain('comet state transition <name> preset-escalate');
+    expect(entry).toContain('用户选择升级后');
+    expect(entry).toContain('当前 Run 的 continuation 或 Compat 对应命令');
     for (const preset of ['hotfix', 'tweak']) {
       const skill = await readSkill(zhSkillRoot, `comet-${preset}`);
       expect(skill).toContain(`comet state init <name> ${preset}`);
+      expect(skill).toContain('preset-escalate');
     }
   });
 
@@ -852,55 +854,36 @@ describe('Comet workflow optimization contracts', () => {
     [
       '中文',
       zhSkillRoot,
-      '必须先区分四类情况：用户决策、自动处理、停止条件和手动衔接',
-      '清晰的首次调用、可确定修复的 guard 失败、单一合法下一步和 `NEXT: manual` 都不得制造确认点',
-      'internal Node Skill 的 description 允许普通任务直接触发',
-      '首次调用，无 workflow 状态',
-      'Node guard 失败且原因不明',
+      '用户明确确认当前方案后',
+      '用户明确批准当前预览后',
+      '摘要只是方案标识',
+      '不要替用户审批或选择跳过',
     ],
     [
       'English',
       skillRoot,
-      'First distinguish four categories: user decision, automatic handling, stop condition, and manual handoff',
-      'A clear first invocation, an objectively repairable guard failure, a sole valid next action, and `NEXT: manual` must not manufacture confirmation',
-      'an internal Node Skill description allows ordinary tasks to trigger it',
-      'First invocation, no workflow state exists',
-      'Node fails its guard and the cause is unclear',
+      'After the user explicitly approves the current plan',
+      'After the user explicitly approves the current preview',
+      'A hash only identifies the plan',
+      'Do not approve or skip for the user',
     ],
   ])(
-    '%s creator templates preserve trigger boundaries and decision classification',
-    async (
-      _language,
-      root,
-      pauseClassification,
-      entryClassification,
-      reviewerBoundary,
-      staleFirstPause,
-      staleGuardPause,
-    ) => {
-      const creatorRoot = path.join(root, 'comet-any', 'reference');
-      const pauseAuthor = await fs.readFile(
-        path.join(creatorRoot, 'subagents', 'pause-points-author.md'),
+    '%s creator preserves current user decisions and action identity',
+    async (_language, root, planApproval, installApproval, hashBoundary, decisionBoundary) => {
+      const skill = await readSkill(root, 'comet-any');
+      const reference = await fs.readFile(
+        path.join(root, 'comet-any/reference/sdk-creation.md'),
         'utf8',
       );
-      const entryAuthor = await fs.readFile(
-        path.join(creatorRoot, 'subagents', 'workflow-entry-author.md'),
-        'utf8',
-      );
-      const reviewer = await fs.readFile(
-        path.join(creatorRoot, 'subagents', 'skill-reviewer.md'),
-        'utf8',
-      );
-      const example = await fs.readFile(path.join(creatorRoot, 'authored-zone-example.md'), 'utf8');
-
-      expect(pauseAuthor).toContain(pauseClassification);
-      expect(entryAuthor).toContain(entryClassification);
-      expect(reviewer).toContain(reviewerBoundary);
-      expect(example).not.toContain(staleFirstPause);
-      expect(example).not.toContain(staleGuardPause);
+      expect(skill).toContain(planApproval);
+      expect(skill).toContain(installApproval);
+      expect(skill).toContain(hashBoundary);
+      expect(reference).toContain(decisionBoundary);
+      for (const term of ['runId', 'waitId', 'proposalHash', 'attempt', 'inputHash', 'claimToken'])
+        expect(reference).toContain(term);
+      expect(skill).not.toContain('authoring DAG');
     },
   );
-
   it('keeps Classic isolation choices user-controlled while making parallel worktree guidance explicit', async () => {
     const variants = [
       {

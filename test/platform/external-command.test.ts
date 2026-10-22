@@ -13,6 +13,25 @@ import {
 describe('external command provider', () => {
   let tempRoot: string | undefined;
 
+  it('forwards bounded diagnostics without mixing them into successful JSON output', async () => {
+    let diagnostics = '';
+    const result = await runExternalCommandAsync(
+      process.execPath,
+      [
+        '-e',
+        'process.stderr.write("provider unavailable"); process.stdout.write("{\\\"context\\\":[]}")',
+      ],
+      {
+        onStderr: (chunk) => {
+          diagnostics += chunk;
+        },
+        timeoutMs: 5000,
+      },
+    );
+    expect(JSON.parse(result)).toEqual({ context: [] });
+    expect(diagnostics).toBe('provider unavailable');
+  });
+
   it('keeps timers responsive while an asynchronous child is running', async () => {
     let completed = false;
     const probe = runExternalCommandAsync(
@@ -34,6 +53,51 @@ describe('external command provider', () => {
         timeoutMs: 50,
       }),
     ).rejects.toMatchObject({ name: 'ExternalCommandError', timedOut: true });
+  });
+
+  it('enforces the synchronous deadline even when SIGTERM is ignored', () => {
+    const started = Date.now();
+    expect(() =>
+      runExternalCommand(
+        process.execPath,
+        ['-e', "process.on('SIGTERM', () => {}); setTimeout(() => process.exit(0), 1800)"],
+        { timeoutMs: 150 },
+      ),
+    ).toThrow(ExternalCommandError);
+    expect(Date.now() - started).toBeLessThan(900);
+  });
+
+  it('terminates the asynchronous command process group before late descendant effects', async () => {
+    tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'comet-external-tree-'));
+    const marker = path.join(tempRoot, 'late');
+    const grandchild =
+      "setTimeout(() => require('node:fs').writeFileSync(process.argv[1], 'late'), 600)";
+    await expect(
+      runExternalCommandAsync(
+        process.execPath,
+        [
+          '-e',
+          `require('node:child_process').spawn(process.execPath, ['-e', ${JSON.stringify(grandchild)}, process.argv[1]], { stdio: 'ignore' }); setInterval(() => {}, 1000)`,
+          marker,
+        ],
+        { timeoutMs: 200 },
+      ),
+    ).rejects.toMatchObject({ timedOut: true });
+    await new Promise((resolve) => setTimeout(resolve, 800));
+    await expect(fs.access(marker)).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('does not start a side effect for an already aborted asynchronous command', async () => {
+    tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'comet-external-abort-'));
+    const marker = path.join(tempRoot, 'started');
+    await expect(
+      runExternalCommandAsync(
+        process.execPath,
+        ['-e', "require('node:fs').writeFileSync(process.argv[1], 'bad')", marker],
+        { signal: AbortSignal.abort() },
+      ),
+    ).rejects.toBeInstanceOf(ExternalCommandError);
+    await expect(fs.access(marker)).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
   afterEach(async () => {

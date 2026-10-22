@@ -1,3 +1,4 @@
+import { resolveClassicStateFile, ClassicStateFileConflictError } from './classic-state-file.js';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { parseDocument } from 'yaml';
@@ -28,6 +29,9 @@ import {
 import { WORKFLOW_PROJECT_CONFIG_MAX_BYTES } from '../workflow-contract/project-config.js';
 import { atomicWriteContainedText } from '../workflow-contract/contained-atomic-write.js';
 import { classicLayoutPaths, readClassicArtifactLayout } from './classic-layout.js';
+import { findClassicSdkWorkspace } from './classic-sdk-status.js';
+import { classicSdkEntryData } from './classic-sdk-output.js';
+import { readSdkChangeOwner } from '../workflow-contract/change-runtime-owner.js';
 
 async function ensureWorkspaceConfig(sourceRoot: string, targetRoot: string): Promise<void> {
   if (samePath(sourceRoot, targetRoot)) return;
@@ -394,11 +398,13 @@ async function readCandidate(
   worktree: GitWorktreeEntry | null,
   name: string,
 ): Promise<ClassicWorkspaceCandidate | null> {
+  if (await readSdkChangeOwner(projectRoot, 'classic', name, { readOnly: true })) return null;
   let changeDirectory: string | null = null;
   try {
     const active = await inspectClassicActiveChangeDirectory(name, projectRoot);
     if (active.stateExists) changeDirectory = active.directory;
-  } catch {
+  } catch (error) {
+    if (error instanceof ClassicStateFileConflictError) throw error;
     // An invalid active copy should not hide a valid archived pending-delivery copy.
   }
   if (changeDirectory === null) {
@@ -407,14 +413,15 @@ async function readCandidate(
     let archivedDocument;
     try {
       archivedDocument = parseDocument(
-        await fs.readFile(path.join(archived.directory, '.comet.yaml'), 'utf8'),
+        await fs.readFile(await resolveClassicStateFile(archived.directory), 'utf8'),
       );
       const archivedRecord = (archivedDocument.toJS() ?? {}) as Record<string, unknown>;
       if (archivedRecord.archived !== true) return null;
       const delivery = await readClassicDelivery(projectRoot, archived.directory);
       if (['complete', 'local-verified'].includes(delivery.verification.status)) return null;
       changeDirectory = archived.directory;
-    } catch {
+    } catch (error) {
+      if (error instanceof ClassicStateFileConflictError) throw error;
       return null;
     }
   }
@@ -423,9 +430,10 @@ async function readCandidate(
   let document;
   try {
     document = parseDocument(
-      await fs.readFile(path.join(candidateDirectory, '.comet.yaml'), 'utf8'),
+      await fs.readFile(await resolveClassicStateFile(candidateDirectory), 'utf8'),
     );
-  } catch {
+  } catch (error) {
+    if (error instanceof ClassicStateFileConflictError) throw error;
     return null;
   }
   const record = (document.toJS() ?? {}) as Record<string, unknown>;
@@ -511,14 +519,51 @@ export async function resolveClassicWorkspace(options: {
 }): Promise<ClassicWorkspaceResolution> {
   const requestedRoot = path.resolve(options.projectRoot);
   const { candidates } = await workspaceCandidates(requestedRoot, options.name);
+  const localLegacy = candidates.some((candidate) =>
+    samePath(candidate.projectRoot, requestedRoot),
+  );
+  const sdkWorkspace = localLegacy
+    ? null
+    : await findClassicSdkWorkspace(requestedRoot, options.name);
+  const sdkResolution = async (): Promise<ClassicWorkspaceResolution> => {
+    if (!sdkWorkspace) throw new Error(`Classic SDK change '${options.name}' was not found`);
+    return {
+      ...(await classicSdkEntryData(options.name, sdkWorkspace)),
+      schema: 'comet.classic.workspace-resolution.v1',
+      branch:
+        sdkWorkspace.state.boundBranch ??
+        inspectGitWorktree(sdkWorkspace.projectRoot).currentBranch,
+      isolation: sdkWorkspace.state.isolation,
+      routed: !samePath(sdkWorkspace.projectRoot, requestedRoot),
+      recreatedWorktree: false,
+    };
+  };
+  if (sdkWorkspace && samePath(sdkWorkspace.projectRoot, requestedRoot)) return sdkResolution();
   if (candidates.length === 0) {
+    if (sdkWorkspace) return sdkResolution();
     throw new Error(
       `Classic change '${options.name}' was not found in any registered Git worktree`,
     );
   }
+  if (
+    sdkWorkspace &&
+    !candidates.some((candidate) => samePath(candidate.projectRoot, requestedRoot))
+  ) {
+    throw new Error(
+      `Classic change '${options.name}' exists in both SDK and legacy worktrees; select its owning workspace explicitly`,
+    );
+  }
 
   const aligned = candidates.filter(candidateIsAligned);
-  const requested = aligned.find((candidate) => samePath(candidate.projectRoot, requestedRoot));
+  // 当前 checkout 的副本必须先处理自己的分支绑定，不能因漂移跳到主仓库。
+  const requestedContext = inspectGitWorktree(requestedRoot);
+  const linked =
+    requestedContext.primaryWorktreeRoot !== null &&
+    !samePath(requestedRoot, requestedContext.primaryWorktreeRoot);
+  const requested = candidates.find(
+    (candidate) =>
+      samePath(candidate.projectRoot, requestedRoot) && (candidateIsAligned(candidate) || linked),
+  );
   const selected = requested ?? aligned[0];
   if (selected) {
     return {
@@ -580,7 +625,8 @@ export async function resolveClassicWorkspace(options: {
 export async function classicWorkspaceCommandResult(
   action: 'prepare' | 'resolve',
   value: ClassicWorkspacePreparation | ClassicWorkspaceResolution,
-): Promise<{ exitCode: number; stdout: string; data: unknown }> {
+  json = false,
+): Promise<{ exitCode: number; stdout?: string; data: unknown }> {
   const data = { action, ...value };
-  return { exitCode: 0, stdout: `${JSON.stringify(data)}\n`, data };
+  return { exitCode: 0, ...(json ? {} : { stdout: `${JSON.stringify(data)}\n` }), data };
 }

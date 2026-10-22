@@ -1,119 +1,47 @@
 ---
 name: comet-any
-description: "通过 Comet Creator 创建或升级 Comet Classic workflow Skill。不用于一般 Skill 的编写、整理或评审。"
+description: '根据目标调查 Skills，创作 Native 扩展、Classic 编排或独立应用的完整入口 Skill 与业务 Rule；确认后由 SDK 装配 Runtime、接入 Hook 并预览安装。不用于一般 Skill 的整理或评审。'
 disable-model-invocation: true
 ---
 
-# Comet Any - Skill Creator
+# Comet Any
 
-`/comet-any` 是 Comet 的 Skill 创建向导。用户只需要描述想要的工作流；本 Skill 负责读取真实 Skill、提出方案、等待确认、生成可验证的 Comet-native Skill Bundle，并通过内部 CLI 完成 eval、review、publish readiness 和安装预览。
+根据用户目标调查真实 Skills，创作组合应用的正文、流程和业务实现。通过 `comet creator` 保存方案与进度，每完成一个阶段就读取当前动作，推进到完成、需要用户决定或外部能力阻塞。
 
-普通用户第一层只看到三种起点：
+Agent 编写入口 Skill、业务 Rule、执行端口与验证器；SDK 保留正文，追加执行协议和通用保护规则，并装配 Runtime。业务 Rule 描述业务约束，Runtime 与 Guard 控制动作、批准和写入权限。安装使用 SDK 正式分发。
 
-- `基于 /comet-classic 的五阶段定制`：覆盖 `open / design / build / verify / archive` 五阶段的 Skill 编排，但不修改 `/comet-classic` 永久入口本身。
-- `创建全新 workflow Skill`：从目标和候选 Skills 生成新的 `workflow-kernel`。
-- `整理已有 Skill`：读取已有 Skill，补齐 Workflow Node、Skill Binding、Output Schema、Guardrail、Handoff、eval 和 readiness。
+## 开始或继续
 
-后端 Bundle、Factory、composition 仍是内部审计词；不要把它们作为普通用户的第一屏概念。
+1. 已知创作名称时运行 `comet creator status <name> --project <项目> --json`，再执行 `comet creator next <name> --project <项目> --json`。保留原名称与 Run；中断后先查询原 Action，不重复发起已完成工作。
+2. 新创作先读取 `comet creator guide --project <项目> --json`。从用户描述确定目标与安装位置；只有无法调查且会改变结果的选择才询问用户。使用 `comet creator start <name> --project <项目> --goal <用户目标> --install-target <相对目录> --host codex|claude-code --json` 启动。
+3. 首次领取或提交动作前，读取[创作动作与恢复](reference/sdk-creation.md)。使用返回的 Action、attempt、inputHash 和本次宿主会话标识；当前动作没有所需能力时明确阻塞，保留现场。
 
-## 核心模型
+## 分析与方案
 
-所有路径都必须编译到同一种 Workflow Contract：
+`analyze` 由宿主调查和创作。需要委派时，传递原目标、当前动作、工作范围和固定依赖。
 
-- `Workflow Node`：流程中的可恢复节点，例如 `open`、`design`、`plan`、`execute`、`subagent-execute`、`review`、`verify`、`archive`。
-- `Node Responsibility`：该 Node 在 Agent workflow 中承担的职责，用来解释它为什么存在、需要产出什么、能否替换。
-- `Skill Binding`：某个 Node 的实现 Skill 或辅助 Skill。
-- `Required Skill Call`：要求 Node 内必须调用某个 Skill，不替换 Node implementation。例如 `execute` 和 `subagent-execute` 必须调用 `elementui`，`review` 必须调用 `whitebox-code-standard`。
-- `Output Schema`：Node 必须产出的文件、状态或 evidence。Output Schema 必须挂到具体 Workflow Node 才算生效；只定义在 `workflow.outputSchemas` 里不会触发 guard、eval 或 readiness。脚本、eval、readiness 只依赖挂到 Node 的 Output Schema，不依赖 Skill 名称。
-- `Guardrail`：阻断或放行 Node 推进的检查。
-- `Handoff`：子代理或跨 Node 交接时必须带回的 evidence。
-- `workflow-protocol.json`：生成包的唯一运行事实源，kind 为 `comet-five-phase-overlay` 或 `workflow-kernel`。
+1. 用 `comet creator candidates --project <项目> --json` 发现候选；读取候选的 `SKILL.md`、脚本和必要资源。检查实际输入、输出、授权、宿主能力、结束条件、失败与恢复；不按名称推测能力，不改第三方原文件。
+2. 对方案中必须使用的 Skill：
 
-## 受保护边界
+   **立即执行：** 使用 Skill 工具加载 <skill-name> 技能。禁止跳过此步骤。
 
-`comet-five-phase-overlay` 保留 Comet Classic 五阶段主流程和 `.comet.yaml` 状态语义。普通模式下：
+   技能加载后，依据实际内容填写适配契约与内容摘要；自行审批或发布的 Skill 须声明相应能力与副作用。
 
-- `comet-five-phase-overlay` 的主状态只来自 Classic layout resolver 绑定的 `<classic-change-dir>/.comet.yaml`；没有 active change 或多个 active changes 时必须阻塞并请用户选择。
-- 不得创建 `.comet/runs/<workflow>/state.json` 作为 Comet overlay 主状态。Bundle 草稿、eval evidence 和 publish readiness 可以有自己的证据文件，但不能替代 `.comet.yaml`。
-- `control` Node 不允许 override：`open`、`execute`、`verify`、`archive`。
-- `producer` Node 可以 override：`design`、`plan`，但必须满足对应 Output Schema。
-- `handoff` 和 `guardrail` Node 可以 require / augment。
-- 用户坚持替换 control Node 时，改走高级 `workflow-kernel`，并要求重新声明 state、Output Schema 和 Guardrail。
-- 所有 Node 都必须用 responsibility 说明职责，不使用内部坐标作为用户理解流程的方式。
+3. 选择用户需要的起点：Native 增加步骤、指导和审查；Classic 在 full、hotfix、tweak 的允许位置编排；独立流程声明顺序、分支、汇合、子流程和有界修复。将用户交互、共同理解确认和实施步骤纳入 Runtime。
+4. 编写完整入口 Skill：frontmatter 的 name 等于应用 id，description 写清触发场景；正文说明输入、依赖 Skill 的调用、交互与审批、产物、验收、失败和恢复。业务 Rule 约束具体业务行为；详细材料按需放入 references，并写明读取条件。
+5. 按参考中的 `documents` 结构回传正文，与流程和业务端口组成当前方案。逐阶段填写 `manifest.artifactContracts`：有必需文件时声明真实引用、内容条件和必要的业务验证器；没有强制文件时填写 `noArtifactsReason`。每个必需产物阶段提供 `artifactTests` 正常样例，业务验证器还需提供通过通用文件检查的异常样例。条件不明确时先澄清，不能用自报完成代替。具体结构见[创作动作与恢复](reference/sdk-creation.md)。缺少正文、实现、验证器、依赖或能力时补齐分析；已有方案则走 revise 后重新确认。
 
-## 工作步骤
+## 确认、验证与交付
 
-1. 恢复现有状态：先运行 `comet creator guide --project . --json`，展示恢复摘要和下一步。
-2. 读取项目偏好：读取 `.comet/skill-preferences.yaml`，用 `comet creator candidates --json` 发现真实本地 Skill，再用 `comet skill show <name> --json` 读取候选的真实内容与 hash。不得只按名字推测能力。
-3. 生成方案：把用户目标表达为 Workflow Nodes、Skill Bindings、Output Schemas、Guardrails、Handoffs 和 Evidence。
-4. 展示确认页：说明每个 Node 的职责、绑定 Skill、Required Skill Call、Output Schema、可执行披露和 readiness 影响。确认页必须为每个新增 binding 或 schema 显示 enforcement：`guarded`、`handoff-guarded`、`evidence-only` 或 `advisory`。
-5. 等待用户确认：未确认前不得写 Bundle draft；存在 missing / ambiguous Skill 时必须暂停。
-6. 初始化后端状态：确认后调用 `comet creator init <name> --file <plan.json> --confirmed-proposal --json`。
-7. 运行创作管线并生成 Bundle：先运行 `comet creator authoring-plan <name> --depth quick|full --json` 取得 lane DAG。按 DAG 派发 lane——wave1（`script`、`reference`、`pause-points`）并发派发，wave2（`workflow-entry`、`skill-core`）在 script 契约之后并发派发，`skill-review` 作为汇聚 barrier。每个 lane 的产出用 `comet creator authoring-record <name> --lane <id> --file <out.json> --json` 记录（经 schema 校验；BLOCKED/NEEDS_CONTEXT 会被拒绝）。随后运行 `comet creator generate <name> --json`：把记录的内容叶子草稿（entry/node SKILL.md、decision-points、recovery）合并进包，而确定性脊梁（protocol/scripts/manifest）保持模板化，并渲染真实审查证据。产出 entry Skill、Node Skills、`reference/workflow-protocol.json`、六个 scripts、rules、hooks 与 `comet/eval.yaml`。
-8. 验证：展示 quick/full eval 工作量，运行或记录当前 draft hash 的 eval evidence；失败、skip 或证据 hash 过期时不得进入 ready。
-9. Review / readiness：读取 `comet publish review <name> --platform <reference-platform> --json`，展示 `Readiness:`、`Blockers:`、`Warnings:`、`Evidence:`。
-10. Publish / install preview：人工批准后才能 publish；安装前必须先运行 preview，并展示 `No files were written`。
+1. `next` 到达方案确认时，展示完整正文、内容摘要、实际步骤、Skill 绑定、产物、检查、失败路径与能力限制，并说明编译后可选择 Eval。
+2. 用户明确确认当前方案后，提交当前 `confirm-plan` 的用户决定。摘要只是方案标识；得到摘要不等于获得授权。拒绝则保留现场；修改方案走 `revise`，受影响的确认与验证重新执行。
+3. 连续调用 `next` 完成编译、实际加载和阶段产物验收。SDK 在隔离目录检查正常样例能完成，并自动构造缺文件、空文件、内容变化等反例，核对原 Action 未被推进。业务异常样例须被实际验证器拒绝。这些本地检查必须通过才可安装，跳过模型 Eval 不会跳过它们。失败时保留现场，修正方案或产物后沿原 Action 恢复。
+4. 到达 `confirm-eval` 时，展示 Agent、模型、用例数、交互轮数和总时限，让用户选择 evaluate、skip 或 revise。evaluate 后调用 `next` 执行并保存报告；重试复用原用例，修订应用后优先沿用。失败或未完成时停在 `review-eval`，展示报告与未覆盖路径，让用户选择 retry、revise 或明确 skip；跳过仍保留实际状态。
+5. 安装前展示导出目录、平台入口、固定依赖、Runtime、Rule/Hook 配置、冲突与 Eval 状态；预览不写安装目标。`install-target` 使用与平台入口分开的导出目录，例如 `.comet/creator/exports/<应用名>`。只在用户明确批准当前预览后提交 `confirm-install`，由 Creator 导出并正式安装。预览失败或安装中断时，按参考中的恢复步骤处理；目标、依赖、文件、配置或评估报告变化后重新确认。
+6. 交付包与入口位置、实际检查、Eval 报告、未执行项和限制。分别列出真实 Skill 加载、Rule 配置、Hook 执行、SDK Run 和业务断言的结果；配置安装成功不代表 Hook 已生效。
 
-## 方案示例
+## 恢复边界
 
-组件库和白盒审查场景应生成类似 plan：
-
-```json
-{
-  "goal": "基于 /comet-classic 的五阶段定制，要求组件库和白盒审查。",
-  "skillCreatorIntent": "customize-comet",
-  "workflow": {
-    "kind": "comet-five-phase-overlay",
-    "name": "team-comet",
-    "goal": "要求组件库和白盒审查。",
-    "nodes": {
-      "execute": {
-        "requiredSkillCalls": [
-          {
-            "skill": "elementui",
-            "reason": "Use project component library during direct implementation."
-          }
-        ]
-      },
-      "subagent-execute": {
-        "requiredSkillCalls": [
-          {
-            "skill": "elementui",
-            "scope": "handoff"
-          }
-        ]
-      },
-      "review": {
-        "requiredSkillCalls": [
-          {
-            "skill": "whitebox-code-standard",
-            "scope": "review"
-          }
-        ]
-      }
-    }
-  }
-}
-```
-
-## 硬性规则
-
-- 必须先展示方案确认页，再生成。
-- 确认页必须为每个新增 binding 或 schema 显示 enforcement：`guarded`、`handoff-guarded`、`evidence-only` 或 `advisory`。
-- Required Skill Call 不替换 Node implementation。
-- producer override 必须声明 `satisfies` 的 Output Schema。
-- Output Schema 必须挂到具体 Workflow Node 才算生效；只定义在 `workflow.outputSchemas` 里不会触发 guard、eval 或 readiness。
-- control Node 普通模式不得 override。
-- eval、review、publish readiness 必须读取同一份 `workflow-protocol.json`。
-- readiness blockers 必须阻止 publish：缺少当前 draft hash 的 eval evidence、人工 approval、required capability 或 executable disclosure 任一项都不能进入 ready。
-- 子代理 Handoff 必须要求子代理加载 Required Skill Call 并回传 evidence。
-- 脚本只读取 protocol 和 state，不把 Skill 名称当成校验依据。
-- 安装前必须询问用户，不得自动安装。
-
-## 参考资料
-
-- `comet-any/reference/authoring-protocol.json`
-- `comet-any/reference/authored-zone-example.md`
-- `comet-any/reference/bundle-authoring.md`
-- `comet-any/reference/authoring-subagents.md`
-- `comet-any/reference/eval-provider.md`
+- 使用原 Run ID、当前 Action/Wait 和输入摘要继续，不复用陈旧请求。
+- 未知执行先核对原实验、进程或产物；无法确认时保留现场并阻塞，不盲目重试。
+- 凭据仅通过执行环境注入，不写入方案、源码、生成包、Run 或报告。

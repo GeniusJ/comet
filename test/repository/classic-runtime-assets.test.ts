@@ -1,5 +1,4 @@
 import { describe, expect, it } from 'vitest';
-import { existsSync } from 'fs';
 import { promises as fs } from 'fs';
 import path from 'path';
 import os from 'os';
@@ -96,8 +95,20 @@ describe('Classic runtime release assets', () => {
     expect(manifestReferences).toEqual(
       englishFiles.map((fileName) => `comet-classic/reference/${fileName}`),
     );
-    expect(existsSync(path.resolve('assets', 'skills', 'comet', 'reference'))).toBe(false);
-    expect(existsSync(path.resolve('assets', 'skills-zh', 'comet', 'reference'))).toBe(false);
+    const layout = await readJson<{ sharedSkillReferences: string[] }>(
+      path.resolve('config', 'repository-layout.json'),
+    );
+    expect(layout.sharedSkillReferences).toEqual([
+      'comet/reference/edit-review.md',
+      'comet/reference/host-check.md',
+      'comet/reference/task-learning.md',
+    ]);
+    for (const root of ['skills', 'skills-zh']) {
+      const shared = (await fs.readdir(path.resolve('assets', root, 'comet', 'reference'))).sort();
+      expect(shared.map((file) => `comet/reference/${file}`)).toEqual(layout.sharedSkillReferences);
+    }
+    for (const reference of layout.sharedSkillReferences)
+      expect(manifest.skills).toContain(reference);
   });
 
   it('lists every shipped Classic script in the assets manifest', async () => {
@@ -118,11 +129,14 @@ describe('Classic runtime release assets', () => {
     const scriptFiles = new Set(
       (await fs.readdir(scriptsDirectory)).filter((fileName) => fileName.endsWith('.mjs')),
     );
-    const importPattern = /from\s+['"]\.\/([^'"]+)['"]/g;
+    await initModuleLexer;
 
     for (const fileName of scriptFiles) {
       const source = await fs.readFile(path.join(scriptsDirectory, fileName), 'utf-8');
-      const imports = [...source.matchAll(importPattern)].map((match) => match[1]);
+      const [moduleImports] = parseModuleImports(source);
+      const imports = moduleImports.flatMap((entry) =>
+        entry.n?.startsWith('./') ? [entry.n.slice(2)] : [],
+      );
 
       for (const importName of imports) {
         expect(scriptFiles.has(importName), `${fileName} imports missing ${importName}`).toBe(true);
@@ -141,3 +155,4 @@ describe('Classic runtime release assets', () => {
     expect(packageJson.files).toContain('scripts/install/postinstall.js');
   });
 });
+import { init as initModuleLexer, parse as parseModuleImports } from 'es-module-lexer';

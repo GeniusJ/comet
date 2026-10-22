@@ -1,7 +1,15 @@
+import { compactCliStdout } from '../workflow-contract/compact-output.js';
 import { pathToFileURL } from 'url';
+import { withCometRuntimeProgress } from '../../platform/process/runtime-metrics.js';
+import { observeRuntimeOperation } from '../../platform/process/runtime-performance.js';
+import { ClassicProjectConfigError, discoverClassicProject } from './classic-layout.js';
 import { classicCommandHelp } from './classic-cli-help.js';
 import type { CliOutputEnvelope } from '../workflow-contract/output-envelope.js';
-import { projectCliAgentObservation } from '../workflow-contract/output-envelope.js';
+import {
+  projectCliAgentObservation,
+  formatCliCommandArgs,
+  type CliActionContinuation,
+} from '../workflow-contract/output-envelope.js';
 import { classicIssue } from './classic-issues.js';
 
 export interface ClassicCommandResult {
@@ -63,7 +71,7 @@ const DEFAULT_HANDLERS: ClassicCommandHandlers = {
   guard: async (args, options) =>
     (await import('./classic-guard.js')).classicGuardCommand(args, options),
   handoff: async (args, options) =>
-    (await import('./classic-handoff.js')).classicHandoffCommand(args, options),
+    (await import('./classic-handoff-command.js')).classicHandoffCommand(args, options),
   archive: async (args, options) =>
     (await import('./classic-archive.js')).classicArchiveCommand(args, options),
   'hook-guard': async (args, options) =>
@@ -115,14 +123,104 @@ async function dispatch(
   }
 
   try {
-    return await handler(args, options);
+    const invoke = () => handler(args, options);
+    const result =
+      command === 'hook-guard'
+        ? await invoke()
+        : await observeRuntimeOperation(
+            {
+              projectRoot: () =>
+                options.projectRoot ??
+                discoverClassicProject(options.invocationCwd ?? process.cwd()),
+              workflow: 'classic',
+              command,
+              errorExitCode: (error) => (error instanceof ClassicProjectConfigError ? 1 : 70),
+            },
+            invoke,
+          );
+    return await withSdkErrorContext(command, args, options, result);
   } catch (error) {
-    return {
-      exitCode: 70,
+    return withSdkErrorContext(command, args, options, {
+      exitCode: error instanceof ClassicProjectConfigError ? 1 : 70,
       stderr: error instanceof Error ? error.message : String(error),
       data: { issues: [classicIssue(error)] },
-    };
+    });
   }
+}
+
+async function withSdkErrorContext(
+  command: ClassicCommandName,
+  args: string[],
+  options: ClassicCommandOptions,
+  result: ClassicCommandResult,
+): Promise<ClassicCommandResult> {
+  const data =
+    result.data && typeof result.data === 'object' ? (result.data as Record<string, unknown>) : {};
+  if (result.exitCode === 0 || data.continuation) return result;
+  const change = ['state', 'check', 'workspace'].includes(command)
+    ? args[1]
+    : ['guard', 'archive'].includes(command)
+      ? args[0]
+      : undefined;
+  if (!change) return result;
+  try {
+    const { classicSdkErrorData, classicSdkGuardAttempt, classicSdkBlockedContinuation } =
+      await import('./classic-sdk-output.js');
+    const root =
+      options.projectRoot ?? (await discoverClassicProject(options.invocationCwd ?? process.cwd()));
+    const current = await classicSdkErrorData(root, change);
+    if (!current) return result;
+    const guardPhase =
+      command === 'guard' ? args[1] : command === 'archive' ? 'archive' : undefined;
+    return {
+      ...result,
+      data: {
+        ...data,
+        ...current,
+        ...(guardPhase
+          ? {
+              continuation: classicSdkBlockedContinuation(
+                current.continuation,
+                classicSdkGuardAttempt(current.run, guardPhase),
+                result.stderr?.trim() || 'Guard did not complete',
+              ),
+            }
+          : {}),
+      },
+    };
+  } catch {
+    return result;
+  }
+}
+
+/** 所有命令用同一续行事实生成文本提示；不根据 command 或 phase 另猜路由。 */
+function withSdkContinuation(result: ClassicCommandResult): ClassicCommandResult {
+  const data = result.data as
+    { continuation?: CliActionContinuation & { skill?: string } } | undefined;
+  const continuation = data?.continuation;
+  if (!continuation?.mode) return result;
+  const next =
+    continuation.mode === 'ask'
+      ? { ask_user: continuation.instruction ?? 'Obtain the current user decision.' }
+      : continuation.mode === 'execute' && continuation.skill
+        ? { command: `/${continuation.skill}` }
+        : continuation.commandArgs
+          ? { command: formatCliCommandArgs(continuation.commandArgs) }
+          : { instruction: continuation.instruction ?? continuation.mode };
+  const summary =
+    result.envelope?.summary ??
+    result.stdout?.trim().split('\n')[0] ??
+    result.stderr?.trim().split('\n')[0] ??
+    'Classic Run updated.';
+  const hint =
+    'command' in next ? next.command : 'ask_user' in next ? next.ask_user : next.instruction;
+  return {
+    ...result,
+    envelope: { ...result.envelope, summary, next },
+    ...(!result.stdout?.includes('NEXT:')
+      ? { stdout: `${result.stdout ?? ''}NEXT: ${hint}\n` }
+      : {}),
+  };
 }
 
 function jsonResult(
@@ -161,19 +259,29 @@ export async function runClassicCli(
   const boundary = argv.indexOf('--');
   const owns = (index: number) => boundary < 0 || index < boundary;
   const json = argv[0] !== 'openspec' && argv.some((arg, index) => owns(index) && arg === '--json');
-  const args = argv.filter((argument, index) => !json || !owns(index) || argument !== '--json');
-  const command = args.shift();
-  const result = await dispatch(
-    command,
-    args,
-    {
-      json,
-      invocationCwd: runOptions.invocationCwd ?? process.cwd(),
-      ...(runOptions.projectRoot ? { projectRoot: runOptions.projectRoot } : {}),
-    },
-    handlers,
+  const compact =
+    argv[0] !== 'openspec' && argv.some((arg, index) => owns(index) && arg === '--compact');
+  if (compact && !json) return { exitCode: 64, stderr: '--compact requires --json\n' };
+  const args = argv.filter(
+    (argument, index) =>
+      !owns(index) || !((json && argument === '--json') || (compact && argument === '--compact')),
   );
-  return json ? jsonResult(command, result) : result;
+  const command = args.shift();
+  const invoke = () =>
+    dispatch(
+      command,
+      args,
+      {
+        json,
+        invocationCwd: runOptions.invocationCwd ?? process.cwd(),
+        ...(runOptions.projectRoot ? { projectRoot: runOptions.projectRoot } : {}),
+      },
+      handlers,
+    );
+  const result = command === 'hook-guard' ? await invoke() : await withCometRuntimeProgress(invoke);
+  const projected = withSdkContinuation(result);
+  const rendered = json ? jsonResult(command, projected) : projected;
+  return compact ? { ...rendered, stdout: compactCliStdout(rendered.stdout, true) } : rendered;
 }
 
 export async function main(argv: readonly string[] = process.argv.slice(2)): Promise<number> {

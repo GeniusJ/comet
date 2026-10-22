@@ -1,3 +1,4 @@
+import { resolveClassicRunDirectory } from '../../../domains/comet-classic/classic-runtime-paths.js';
 import { spawnSync } from 'child_process';
 import { promises as fs } from 'fs';
 import os from 'os';
@@ -92,7 +93,18 @@ describe('Classic guard command', () => {
           runClassicCli(args),
         );
       expect(
-        (await cli('state', 'init', 'demo', 'hotfix', '--isolation', 'current')).exitCode,
+        (
+          await cli(
+            'state',
+            'init',
+            'demo',
+            'hotfix',
+            '--isolation',
+            'current',
+            '--runtime',
+            'compat',
+          )
+        ).exitCode,
       ).toBe(0);
       const changeDir = path.join(dir, 'openspec/changes/demo');
       const stateFile = path.join(changeDir, '.comet.yaml');
@@ -140,7 +152,7 @@ describe('Classic guard command', () => {
       withClassicCommandContext({ projectRoot: dir, invocationCwd: dir }, () =>
         runClassicCli(args),
       );
-    expect((await cli('state', 'init', 'auto', 'full')).exitCode).toBe(0);
+    expect((await cli('state', 'init', 'auto', 'full', '--runtime', 'compat')).exitCode).toBe(0);
     const changeDir = path.join(dir, 'openspec/changes/auto');
     const statePath = path.join(changeDir, '.comet.yaml');
     const state = {
@@ -194,9 +206,20 @@ describe('Classic guard command', () => {
       withClassicCommandContext({ projectRoot: dir, invocationCwd: dir }, () =>
         runClassicCli(args),
       );
-    expect((await cli('state', 'init', 'demo', 'hotfix', '--isolation', 'current')).exitCode).toBe(
-      0,
-    );
+    expect(
+      (
+        await cli(
+          'state',
+          'init',
+          'demo',
+          'hotfix',
+          '--isolation',
+          'current',
+          '--runtime',
+          'compat',
+        )
+      ).exitCode,
+    ).toBe(0);
     const changeDir = path.join(dir, 'openspec/changes/demo');
     const stateFile = path.join(changeDir, '.comet.yaml');
     const state = parse(await fs.readFile(stateFile, 'utf8'));
@@ -234,9 +257,20 @@ describe('Classic guard command', () => {
       withClassicCommandContext({ projectRoot: dir, invocationCwd: dir }, () =>
         runClassicCli(args),
       );
-    expect((await cli('state', 'init', 'demo', 'hotfix', '--isolation', 'current')).exitCode).toBe(
-      0,
-    );
+    expect(
+      (
+        await cli(
+          'state',
+          'init',
+          'demo',
+          'hotfix',
+          '--isolation',
+          'current',
+          '--runtime',
+          'compat',
+        )
+      ).exitCode,
+    ).toBe(0);
     const changeDir = path.join(dir, 'openspec/changes/demo');
     const stateFile = path.join(changeDir, '.comet.yaml');
     const state = parse(await fs.readFile(stateFile, 'utf8'));
@@ -265,9 +299,20 @@ describe('Classic guard command', () => {
       withClassicCommandContext({ projectRoot: dir, invocationCwd: dir }, () =>
         runClassicCli(args),
       );
-    expect((await cli('state', 'init', 'demo', 'hotfix', '--isolation', 'current')).exitCode).toBe(
-      0,
-    );
+    expect(
+      (
+        await cli(
+          'state',
+          'init',
+          'demo',
+          'hotfix',
+          '--isolation',
+          'current',
+          '--runtime',
+          'compat',
+        )
+      ).exitCode,
+    ).toBe(0);
     const changeDir = path.join(dir, 'openspec/changes/demo');
     const stateFile = path.join(changeDir, '.comet.yaml');
     const state = parse(await fs.readFile(stateFile, 'utf8'));
@@ -321,7 +366,18 @@ describe('Classic guard command', () => {
         runClassicCli(args),
       );
     expect(
-      (await cli('state', 'init', 'legacy-argv', 'hotfix', '--isolation', 'current')).exitCode,
+      (
+        await cli(
+          'state',
+          'init',
+          'legacy-argv',
+          'hotfix',
+          '--isolation',
+          'current',
+          '--runtime',
+          'compat',
+        )
+      ).exitCode,
     ).toBe(0);
     const changeDir = path.join(dir, 'openspec/changes/legacy-argv');
     const stateFile = path.join(changeDir, '.comet.yaml');
@@ -373,9 +429,20 @@ describe('Classic guard command', () => {
       withClassicCommandContext({ projectRoot: dir, invocationCwd: dir }, () =>
         runClassicCli(args),
       );
-    expect((await cli('state', 'init', 'demo', 'hotfix', '--isolation', 'current')).exitCode).toBe(
-      0,
-    );
+    expect(
+      (
+        await cli(
+          'state',
+          'init',
+          'demo',
+          'hotfix',
+          '--isolation',
+          'current',
+          '--runtime',
+          'compat',
+        )
+      ).exitCode,
+    ).toBe(0);
     const changeDir = path.join(dir, 'openspec/changes/demo');
     const stateFile = path.join(changeDir, '.comet.yaml');
     const state = parse(await fs.readFile(stateFile, 'utf8'));
@@ -402,7 +469,7 @@ describe('Classic guard command', () => {
 
   it('blocks the open guard when artifacts are missing and leaves state unchanged', async () => {
     const dir = await makeProject();
-    expect(run(dir, 'state', 'init', 'demo', 'full').status).toBe(0);
+    expect(run(dir, 'state', 'init', 'demo', 'full', '--runtime', 'compat').status).toBe(0);
 
     const result = run(dir, 'guard', 'demo', 'open');
     expect(result.status).toBe(1);
@@ -422,7 +489,7 @@ describe('Classic guard command', () => {
 
   it('passes the open guard and applies the transition when artifacts exist', async () => {
     const dir = await makeProject();
-    run(dir, 'state', 'init', 'demo', 'hotfix');
+    run(dir, 'state', 'init', 'demo', 'hotfix', '--runtime', 'compat');
     run(dir, 'state', 'set', 'demo', 'isolation', 'branch');
     const changeDir = path.join(dir, 'openspec', 'changes', 'demo');
     await fs.writeFile(path.join(changeDir, 'proposal.md'), 'proposal\n');
@@ -443,7 +510,7 @@ describe('Classic guard command', () => {
       classic_profile: 'hotfix',
       classic_migration: 1,
     });
-    const runState = await readRunState(changeDir);
+    const runState = await readRunState(await resolveClassicRunDirectory(changeDir));
     expect(runState).not.toBeNull();
     expect(runState!.skill).toBe('comet-classic');
     expect(runState!.currentStep).toBe('hotfix.build.complete');
@@ -464,7 +531,12 @@ describe('Classic guard command', () => {
         { field: 'phase', from: 'open', to: 'build' },
       ],
     });
-    const trajectory = (await fs.readFile(path.join(changeDir, runState!.trajectoryRef), 'utf8'))
+    const trajectory = (
+      await fs.readFile(
+        path.join(await resolveClassicRunDirectory(changeDir), runState!.trajectoryRef),
+        'utf8',
+      )
+    )
       .trim()
       .split(/\r?\n/u)
       .map((line) => JSON.parse(line) as { type: string });
@@ -475,7 +547,7 @@ describe('Classic guard command', () => {
     'resolves delta specs from nested cwd with design authority %s',
     async (designPath) => {
       const dir = await makeProject();
-      expect(run(dir, 'state', 'init', 'demo', 'full').status).toBe(0);
+      expect(run(dir, 'state', 'init', 'demo', 'full', '--runtime', 'compat').status).toBe(0);
 
       const changeDir = path.join(dir, 'openspec', 'changes', 'demo');
       await fs.mkdir(path.join(changeDir, 'specs', 'feature'), { recursive: true });
@@ -515,7 +587,7 @@ describe('Classic guard command', () => {
 
   it('fails closed for an unknown phase without running checks', async () => {
     const dir = await makeProject();
-    run(dir, 'state', 'init', 'demo', 'full');
+    run(dir, 'state', 'init', 'demo', 'full', '--runtime', 'compat');
 
     const result = run(dir, 'guard', 'demo', 'lint');
     expect(result.status).not.toBe(0);
@@ -525,7 +597,7 @@ describe('Classic guard command', () => {
 
   it('returns resolver diagnostics in json mode', async () => {
     const dir = await makeProject();
-    expect(run(dir, 'state', 'init', 'demo', 'full').status).toBe(0);
+    expect(run(dir, 'state', 'init', 'demo', 'full', '--runtime', 'compat').status).toBe(0);
     await fs.writeFile(
       path.join(dir, 'openspec', 'changes', 'demo', 'proposal.md'),
       '# Proposal\n',

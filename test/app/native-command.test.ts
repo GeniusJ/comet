@@ -6,9 +6,11 @@ const recordCometWorkflowResult = vi.fn();
 const collectCometPluginContext = vi.fn();
 
 vi.mock('../../domains/comet-native/native-cli.js', () => ({ runNativeCli, runNativeCliDetailed }));
-vi.mock('../../domains/comet-entry/plugin-context.js', () => ({
-  recordCometWorkflowResult,
-  collectCometPluginContext,
+vi.mock('../../app/commands/comet-task-context.js', () => ({
+  recordCometTaskWorkflowResults: async (results: readonly unknown[]) => {
+    for (const result of results) await recordCometWorkflowResult(result);
+  },
+  collectCometTaskContext: collectCometPluginContext,
 }));
 
 describe('Native command facade', () => {
@@ -96,6 +98,23 @@ describe('Native command facade', () => {
         workflow: 'native',
         changeId: 'change-name',
         command: 'archive',
+        success: true,
+      }),
+    );
+  });
+
+  it('records a successful next without integration flags', async () => {
+    runNativeCli.mockResolvedValue({ exitCode: 0, stdout: 'advanced\n', stderr: '' });
+    const { runNativeFacade } = await import('../../app/commands/native.js');
+
+    await runNativeFacade(['next', 'change-name']);
+
+    expect(recordCometWorkflowResult).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({
+        workflow: 'native',
+        changeId: 'change-name',
+        command: 'next',
+        eventType: 'episode.completed',
         success: true,
       }),
     );

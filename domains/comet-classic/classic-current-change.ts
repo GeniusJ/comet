@@ -1,3 +1,4 @@
+import { ClassicStateFileConflictError } from './classic-state-file.js';
 import {
   clearCometCurrentSelection,
   clearCometCurrentSelectionIf,
@@ -7,11 +8,16 @@ import {
   type CometCurrentSelection,
 } from '../workflow-contract/current-selection.js';
 import { memoizedHookRead } from '../../platform/process/hook-read-cache.js';
+import { readSdkChangeOwner } from '../workflow-contract/change-runtime-owner.js';
 import {
   driftStaleReason,
+  evaluateBranchBinding,
+  isGitWorkTree,
+  liveGitBranch,
   resolveBranchBinding,
   unboundDetachedMessage,
 } from './classic-branch-binding.js';
+import { inspectClassicSdkRun } from './classic-sdk-status.js';
 import {
   assertOpenSpecChangeName,
   findClassicArchiveChangeDirectory,
@@ -30,6 +36,13 @@ const readCachedCurrentSelection = memoizedHookRead(
   (projectRoot: string) => readCometCurrentSelection(projectRoot),
 );
 
+// Guard 的 SDK 状态与 selection 分支校验必须基于同一个请求内快照。
+const inspectHookSdkRun = memoizedHookRead(
+  'classicHookSdkRun',
+  (projectRoot: string, name: string) =>
+    inspectClassicSdkRun(projectRoot, name, { readOnly: true }),
+);
+
 export type CurrentChangeSelection = CometCurrentSelection;
 
 export type CurrentChangeResolution =
@@ -39,6 +52,33 @@ export type CurrentChangeResolution =
 
 export function currentChangeFile(projectRoot: string): string {
   return cometCurrentSelectionFile(projectRoot);
+}
+
+async function sdkSelectionBranch(projectRoot: string, changeName: string): Promise<string | null> {
+  const { run, state } = await inspectHookSdkRun(projectRoot, changeName);
+  if (run.status === 'cancelled') {
+    throw new Error(`Cannot select current change '${changeName}': Run is cancelled`);
+  }
+  if (state.archived || run.status === 'completed') {
+    throw new Error(`Cannot select current change '${changeName}': change is archived`);
+  }
+  const currentBranch = liveGitBranch(projectRoot);
+  const binding = evaluateBranchBinding({
+    isolation: state.isolation,
+    boundBranch: state.boundBranch,
+    currentBranch,
+    gitWorkTree: isGitWorkTree(projectRoot),
+  });
+  if (binding.status === 'drift') {
+    throw new Error(driftStaleReason(changeName, binding.boundBranch, currentBranch));
+  }
+  if (binding.status === 'unbound-detached') {
+    throw new Error(unboundDetachedMessage(changeName));
+  }
+  if (binding.status === 'needs-heal') {
+    throw new Error(`Classic SDK change '${changeName}' has no bound branch in its Run`);
+  }
+  return currentBranch;
 }
 
 async function validateActiveChange(projectRoot: string, changeName: string): Promise<string> {
@@ -62,6 +102,7 @@ async function validateSelectableChange(projectRoot: string, changeName: string)
   try {
     return await validateActiveChange(projectRoot, changeName);
   } catch (activeError) {
+    if (activeError instanceof ClassicStateFileConflictError) throw activeError;
     const archived = await findClassicArchiveChangeDirectory(changeName, projectRoot);
     if (!archived) throw activeError;
     const projection = await readClassicState(archived.directory, { migrate: false });
@@ -81,6 +122,16 @@ export async function selectCurrentChange(
   changeName: string,
 ): Promise<CurrentChangeSelection> {
   assertOpenSpecChangeName(changeName);
+  if (await readSdkChangeOwner(projectRoot, 'classic', changeName, { readOnly: true })) {
+    const selection: CurrentChangeSelection = {
+      schema: 'comet.selection.v2',
+      workflow: 'classic',
+      change: changeName,
+      branch: await sdkSelectionBranch(projectRoot, changeName),
+    };
+    await writeCometCurrentSelection(projectRoot, selection);
+    return selection;
+  }
   let localInspection: Awaited<ReturnType<typeof inspectClassicActiveChangeDirectory>> = {
     label: '',
     directory: '',
@@ -140,6 +191,20 @@ export async function resolveCurrentChange(projectRoot: string): Promise<Current
   }
 
   const selection = current.selection;
+  try {
+    if (await readSdkChangeOwner(projectRoot, 'classic', selection.change, { readOnly: true })) {
+      const branch = await sdkSelectionBranch(projectRoot, selection.change);
+      if (selection.branch !== null && branch !== selection.branch) {
+        return {
+          status: 'stale',
+          reason: `current change '${selection.change}' was selected on branch '${selection.branch}', current branch is '${branch ?? 'detached HEAD'}'`,
+        };
+      }
+      return { status: 'selected', selection };
+    }
+  } catch (error) {
+    return { status: 'stale', reason: error instanceof Error ? error.message : String(error) };
+  }
   let changeDir: string;
   try {
     changeDir = await validateActiveChange(projectRoot, selection.change);

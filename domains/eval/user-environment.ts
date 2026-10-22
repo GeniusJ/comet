@@ -25,7 +25,7 @@ function parseValue(raw: string): string {
   return trimmed.replace(/\s+#.*$/u, '').trim();
 }
 
-function parseDotenv(source: string): Array<[string, string]> {
+export function parseDotenv(source: string): Array<[string, string]> {
   const values: Array<[string, string]> = [];
   for (const line of source.split(/\r?\n/u)) {
     const trimmed = line.trim();
@@ -52,6 +52,7 @@ function readEvalEnvironmentTemplate(): string {
 export function loadUserEvalEnvironment(
   environment: NodeJS.ProcessEnv = process.env,
   homeDirectory: string = os.homedir(),
+  options: { create?: boolean } = {},
 ): UserEvalEnvironmentStatus {
   const envPath = path.join(homeDirectory, '.comet', 'eval', '.env');
   let source: string;
@@ -60,6 +61,7 @@ export function loadUserEvalEnvironment(
     source = readFileSync(envPath, 'utf8');
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    if (options.create === false) return { path: envPath, created: false };
 
     source = readEvalEnvironmentTemplate();
     mkdirSync(path.dirname(envPath), { recursive: true, mode: 0o700 });

@@ -1,3 +1,5 @@
+import { resolveClassicRunDirectory } from '../../../domains/comet-classic/classic-runtime-paths.js';
+import { resolveWorkspaceRuntimeRoot } from '../../../domains/workflow-contract/workspace-runtime.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as childProcess from 'node:child_process';
 import {
@@ -71,7 +73,10 @@ it('archives documents in a non-Git coordinator without claiming a child reposit
       delivery: { action: 'archive-only' },
       verification: { status: 'complete', archiveVerified: true },
     });
-    const receiptDir = path.join(root, '.comet', 'classic-deliveries');
+    const receiptDir = path.join(
+      await resolveWorkspaceRuntimeRoot(root),
+      'classic-delivery-receipts',
+    );
     const [receiptName] = await readdir(receiptDir);
     const receiptFile = path.join(receiptDir, receiptName);
     const receipt = JSON.parse(await readFile(receiptFile, 'utf8'));
@@ -243,9 +248,12 @@ describe('Classic structured progress', () => {
   it('persists a cross-task work package and human projection without completing tasks', async () => {
     expect((await writeClassicCheckpoint(root, change, input(), tasks)).stale).toBe(false);
     expect((await readClassicCheckpoint(root, change, tasks)).checkpoint).toEqual(input());
-    expect(await readFile(path.join(change, '.comet/subagent-progress.md'), 'utf8')).toContain(
-      'Tasks: a, b',
-    );
+    expect(
+      await readFile(
+        path.join(await resolveClassicRunDirectory(change, root), '.comet/subagent-progress.md'),
+        'utf8',
+      ),
+    ).toContain('Tasks: a, b');
     expect((await readClassicCheckpoint(root, change, tasks.replace('[ ]', '[x]'))).stale).toBe(
       false,
     );
@@ -293,7 +301,11 @@ describe('Classic structured progress', () => {
 
   it('refuses to silently replace unknown or corrupt persisted checkpoint schemas', async () => {
     await mkdir(path.join(change, '.comet'));
-    const file = path.join(change, '.comet/coordination.json');
+    const file = path.join(
+      await resolveClassicRunDirectory(change, root),
+      '.comet/coordination.json',
+    );
+    await mkdir(path.dirname(file), { recursive: true });
     for (const value of ['{', 'null', JSON.stringify({ ...input(), schemaVersion: 2 })]) {
       await writeFile(file, value);
       await expect(readClassicCheckpoint(root, change, tasks)).rejects.toThrow();
@@ -304,7 +316,11 @@ describe('Classic structured progress', () => {
 
   it('keeps Engine checkpoint bytes isolated from coordination reads and writes', async () => {
     await mkdir(path.join(change, '.comet'));
-    const engineFile = path.join(change, '.comet/checkpoint.json');
+    const engineFile = path.join(
+      await resolveClassicRunDirectory(change, root),
+      '.comet/checkpoint.json',
+    );
+    await mkdir(path.dirname(engineFile), { recursive: true });
     const engineSource = JSON.stringify({
       runId: 'engine-run',
       currentStep: 'build',
@@ -319,11 +335,19 @@ describe('Classic structured progress', () => {
     expect((await readClassicCheckpoint(root, change, tasks)).checkpoint).toEqual(input());
     expect(await readFile(engineFile, 'utf8')).toBe(engineSource);
     expect(
-      JSON.parse(await readFile(path.join(change, '.comet/coordination.json'), 'utf8')),
+      JSON.parse(
+        await readFile(
+          path.join(await resolveClassicRunDirectory(change, root), '.comet/coordination.json'),
+          'utf8',
+        ),
+      ),
     ).toEqual(input());
-    expect(await readFile(path.join(change, '.comet/subagent-progress.md'), 'utf8')).toContain(
-      'Generated from coordination.json',
-    );
+    expect(
+      await readFile(
+        path.join(await resolveClassicRunDirectory(change, root), '.comet/subagent-progress.md'),
+        'utf8',
+      ),
+    ).toContain('Generated from coordination.json');
     await writeFile(engineFile, '{broken engine checkpoint');
     expect((await readClassicCheckpoint(root, change, tasks)).checkpoint).toEqual(input());
     await writeClassicCheckpoint(root, change, { ...input(), stage: 'task-review' }, tasks);
@@ -495,9 +519,10 @@ describe('Classic structured progress', () => {
         commit,
         prUrl: 'https://github.com/example/project/pull/1',
       });
-      const receiptDir = ignored
-        ? path.join(root, '.comet/classic-deliveries')
-        : path.join(root, '.git/comet/classic-deliveries');
+      const receiptDir = path.join(
+        await resolveWorkspaceRuntimeRoot(root),
+        'classic-delivery-receipts',
+      );
       const { readdir } = await import('node:fs/promises');
       expect(await readdir(receiptDir)).toHaveLength(1);
     },
@@ -536,6 +561,7 @@ describe('Classic structured progress', () => {
   });
 
   async function archivedDelivery(action: 'push' | 'pr', includePrUrl = true) {
+    await writeFile(path.join(root, '.git', 'info', 'exclude'), '/.comet/runtime\n');
     await writeClassicDelivery(
       root,
       change,
@@ -686,9 +712,15 @@ describe('Classic structured progress', () => {
   );
 
   it('records an archive commit while the real state lock is held, without ignoring other changes', async () => {
+    await writeFile(path.join(root, '.gitignore'), 'changes/demo/.comet-state.lock\n');
     const commit = await archivedDelivery('push');
     await withClassicStateLock(change, async () => {
-      expect(await readFile(path.join(change, '.comet-state.lock'), 'utf8')).toBeTruthy();
+      expect(
+        await readFile(
+          path.join(await resolveClassicRunDirectory(change, root), '.comet-state.lock'),
+          'utf8',
+        ),
+      ).toBeTruthy();
       const result = await writeClassicDelivery(
         root,
         change,

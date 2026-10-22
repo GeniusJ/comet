@@ -20,6 +20,16 @@ else:
     msvcrt = None
 
 
+def test_experiment_records_setup_and_teardown_errors_separately_from_case_failures():
+    plugin = conftest.ExperimentPlugin(SimpleNamespace(option=SimpleNamespace(numprocesses=0)))
+    plugin.logger = SimpleNamespace(metadata={})
+    manager = pytest.PytestPluginManager()
+    manager.register(plugin)
+    for phase in ("setup", "call", "teardown"):
+        manager.hook.pytest_runtest_logreport(report=SimpleNamespace(when=phase, failed=True))
+    assert plugin.logger.metadata.get("pytest_errors") == 2
+
+
 @pytest.mark.parametrize(
     ("files", "expected"),
     [
@@ -89,6 +99,24 @@ def test_current_cli_snapshot_uses_explicit_source_root(tmp_path, monkeypatch):
     identity = json.loads((snapshot / "build-identity.json").read_text())
     assert identity["compilerVersion"] == "test-compiler"
     assert identity["sourceHash"]
+
+
+def test_published_cli_snapshot_does_not_require_typescript_or_repository_sources(tmp_path, monkeypatch):
+    source = tmp_path / "published"
+    files = {"package.json": '{}', "bin/comet.js": '// published entry', "assets/manifest.json": '{}', "assets/skills/comet/SKILL.md": '# Published', "dist/app/cli/index.js": '// published cli', "dist/domains/dashboard/native-adapter.js": '// published adapter'}
+    for relative, content in files.items():
+        target = source / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+    environment = tmp_path / "environment"
+    environment.mkdir()
+    (environment / conftest.CURRENT_COMET_CLI_MARKER).touch()
+    monkeypatch.setenv("BENCH_COMET_SOURCE_ROOT", str(source))
+    monkeypatch.setattr(conftest, "_build_current_comet_dist", lambda *_: pytest.fail("Published consumers must not compile repository sources"))
+    workspace = tmp_path / "workspace"
+    conftest._copy_current_comet_cli_snapshot(environment, workspace)
+    assert (workspace / "_eval_current_comet/dist/app/cli/index.js").read_text() == '// published cli'
+    assert json.loads((workspace / "_eval_current_comet/build-identity.json").read_text())["compilerVersion"] == "published-dist"
 
 
 @pytest.mark.skipif(msvcrt is None, reason="Windows locking API only")
@@ -216,6 +244,57 @@ evaluation:
     assert captured["model"] == "model-from-dotenv"
     assert config.option.eval_manifest is None
     assert config._comet_frozen_task_set.source == "generated-cache"
+
+
+def test_generated_case_collection_inherits_authoritative_interaction_without_rewriting_frozen_cases(tmp_path, monkeypatch):
+    from scaffold.python.manifests import load_eval_manifest
+    skill = tmp_path / "skill"
+    skill.mkdir()
+    (skill / "SKILL.md").write_text("Use the fixed Runtime.", encoding="utf-8")
+    original = tmp_path / "original.yaml"
+    original.write_text("""apiVersion: comet.eval/v1alpha1
+kind: SkillEvalManifest
+metadata: {name: original}
+skill: {name: fixed-skill, source: skill, profile: generic}
+interaction:
+  mode: auto_user
+  maxTurns: 16
+  simulatorPrompt: Answer the actual current workflow questions.
+  decisionPatterns: [APPROVAL_REQUIRED]
+  decisionReply: approved
+  continuePrompt: Continue the current Run.
+execution: {agent: codex, model: primary-model}
+judge: {agent: codex, model: judge-model}
+evaluation: {}
+""", encoding="utf-8")
+    generated = tmp_path / "generated.yaml"
+    generated.write_text("""apiVersion: comet.eval/v1alpha1
+kind: SkillEvalManifest
+metadata: {name: generated}
+skill: {name: fixed-skill, source: skill, profile: generic}
+evaluation:
+  tasks:
+    - {name: frozen-one, prompt: Run the actual workflow., expect: {files: [CONTEXT.md]}}
+    - {name: frozen-two, prompt: Refuse approval., expect: {files: [rejected.md]}}
+""", encoding="utf-8")
+    original_bytes = generated.read_bytes()
+    expected = load_eval_manifest(original)
+    assert load_eval_manifest(generated).interaction.mode == "none"
+    options = {"--eval-manifest": str(original), "--skill-path": str(skill), "--project-root": str(tmp_path)}
+    config = SimpleNamespace(option=SimpleNamespace(collectonly=False, eval_manifest=str(original)), getoption=lambda name: options.get(name))
+    monkeypatch.setattr("scaffold.python.utils.load_eval_environment", lambda: None)
+    monkeypatch.setattr(conftest, "ensure_generated_manifest", lambda *args, **kwargs: SimpleNamespace(manifest_path=generated))
+    conftest._ensure_auto_generated_manifest(config)
+    for task in config._comet_resolved_tasks.values():
+        assert task.config.interaction == expected.interaction
+        assert conftest._resolve_interaction_config(task, "generic", config).mode == "auto_user"
+        assert conftest._resolve_interaction_config(task, "generic", config).max_turns == 16
+    assert config._comet_resolution_manifest.execution == expected.execution
+    assert config._comet_resolution_manifest.judge == expected.judge
+    assert conftest._resolve_eval_execution(config).model == "primary-model"
+    assert conftest._resolve_eval_judge(config).model == "judge-model"
+    assert generated.read_bytes() == original_bytes
+    assert config.option.eval_manifest == str(original)
 
 
 def test_taskless_collect_only_marks_generation_pending_without_agent_or_disk_work(
@@ -611,6 +690,23 @@ def test_resolve_interaction_config_prefers_cli_mode():
     assert interaction.mode == "none"
     assert interaction.max_turns == 5
     assert interaction.simulator_prompt == "Use CLI override."
+
+
+@pytest.mark.parametrize(
+    ("override", "expected"),
+    [(None, 1500), (3600, 3600)],
+)
+def test_agent_timeout_uses_explicit_run_override(override, expected):
+    config = SimpleNamespace(getoption=lambda name: override if name == "--agent-timeout" else None)
+
+    assert conftest._resolve_agent_timeout(config, task_timeout=900, floor=1500) == expected
+
+
+def test_agent_timeout_rejects_nonpositive_override():
+    config = SimpleNamespace(getoption=lambda name: 0 if name == "--agent-timeout" else None)
+
+    with pytest.raises(pytest.UsageError, match="positive"):
+        conftest._resolve_agent_timeout(config, task_timeout=900, floor=1500)
 
 
 def test_resolve_interaction_config_uses_profile_default_prompt():
@@ -1345,3 +1441,102 @@ def test_docker_prebuild_consumes_only_frozen_task_environments(tmp_path: Path, 
     assert conftest._docker_environment_dirs_for_request(request, tasks_dir) == [
         environments[name] for name in selected
     ]
+
+
+@pytest.mark.parametrize(
+    "mode,repetitions",
+    [
+        ("ordinary", [1, 2]),
+        ("parallel", [2, 1]),
+        ("failed-rerun", [2]),
+    ],
+)
+def test_controller_repetition_reaches_raw_events_and_reports(
+    tmp_path, monkeypatch, mode, repetitions
+):
+    """Run the production fixtures, replacing only external execution and artifacts."""
+    if mode == "failed-rerun":
+        monkeypatch.setenv("COMET_EVAL_MANAGED", "1")
+        monkeypatch.setenv("COMET_EVAL_CASE_SELECTION", "selected-cases.json")
+    else:
+        monkeypatch.delenv("COMET_EVAL_MANAGED", raising=False)
+        monkeypatch.delenv("COMET_EVAL_CASE_SELECTION", raising=False)
+    execution = conftest.ResolvedExecution("claude-code", None, None, {})
+    monkeypatch.setattr(conftest, "_resolve_eval_execution", lambda config: execution)
+    monkeypatch.setattr(conftest, "build_agent_environment", lambda execution: {})
+    monkeypatch.setattr(
+        conftest,
+        "run_agent_in_docker",
+        lambda *args, **kwargs: SimpleNamespace(
+            stdout="fixture output",
+            stderr="",
+            returncode=0,
+        ),
+    )
+    monkeypatch.setattr(conftest, "_save_artifacts", lambda *args, **kwargs: None)
+    recorded = []
+    logger = SimpleNamespace(
+        base_dir=tmp_path, add_result=lambda name, result: recorded.append(result)
+    )
+    plugin = conftest.ExperimentPlugin(SimpleNamespace(option=SimpleNamespace(numprocesses=0)))
+    monkeypatch.setattr(conftest, "_plugin", plugin)
+    for rep in repetitions:
+        if mode == "parallel":
+            # Each worker has independent counters, and cases need not run in order.
+            plugin.run_counter.clear()
+        marker = SimpleNamespace(kwargs={"repetition": rep})
+        node = SimpleNamespace(
+            nodeid=f"tasks/test_tasks.py::test_task_treatment[task-BASE-r{rep}]",
+            callspec=SimpleNamespace(params={"task_name": "task", "treatment_name": "BASE"}),
+            get_closest_marker=lambda name: marker if name == "eval_case" else None,
+        )
+        request = SimpleNamespace(node=node, config=None)
+        assert conftest._expected_cases_from_items([node]) == [("task", "BASE", rep)]
+        run = conftest.run_claude.__wrapped__(tmp_path, logger, request)
+        result = run("fixture prompt")
+        record = conftest.record_result.__wrapped__(tmp_path, logger, request)
+        record(
+            {"task": "task", "treatment": "BASE"},
+            ["ok"],
+            [],
+            run_id=f"run-{rep}",
+            returncode=result.returncode,
+            stdout=result.stdout,
+            stderr=result.stderr,
+        )
+
+    reports = [
+        json.loads(path.read_text()) for path in sorted((tmp_path / "reports").glob("*.json"))
+    ]
+    assert sorted(report["rep"] for report in reports) == sorted(repetitions)
+    for report in reports:
+        rep = report["rep"]
+        assert report["events_summary"]["sample"] == rep
+        assert report["events_summary"]["task"] == "task"
+        assert report["events_summary"]["treatment"] == "BASE"
+        assert report["name"] == f"task-BASE-r{rep}"
+        assert (
+            tmp_path / "raw" / f"task_BASE_r{rep}_rep{rep}_stdout.json"
+        ).read_text() == "fixture output"
+        event = json.loads((tmp_path / "events" / f"task_BASE_r{rep}_rep{rep}.json").read_text())
+        assert event["sample"] == rep
+    assert sorted(result.events_summary["sample"] for result in recorded) == sorted(repetitions)
+
+
+@pytest.mark.parametrize("repetition", [None, True, 0, -1, "2"])
+def test_invalid_controller_repetition_is_not_replaced_by_a_counter(repetition):
+    node = SimpleNamespace(
+        get_closest_marker=lambda name: SimpleNamespace(kwargs={"repetition": repetition})
+    )
+    with pytest.raises(pytest.UsageError, match="positive integer"):
+        conftest._get_repetition(node, advance=True)
+
+
+def test_unmarked_repetition_preserves_legacy_counter(monkeypatch):
+    plugin = conftest.ExperimentPlugin(SimpleNamespace(option=SimpleNamespace(numprocesses=0)))
+    monkeypatch.setattr(conftest, "_plugin", plugin)
+    node = SimpleNamespace(nodeid="test_legacy", get_closest_marker=lambda name: None)
+    assert conftest._get_repetition(node, advance=True) == 1
+    assert conftest._get_repetition(node) == 1
+    assert conftest._get_repetition(node, advance=True) == 2
+    assert conftest._get_repetition(node) == 2

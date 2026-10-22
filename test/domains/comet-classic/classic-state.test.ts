@@ -1,3 +1,4 @@
+import { resolveClassicRunDirectory } from '../../../domains/comet-classic/classic-runtime-paths.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as engineState from '../../../domains/engine/state.js';
 import { healBoundBranch } from '../../../domains/comet-classic/classic-branch-binding.js';
@@ -72,6 +73,7 @@ describe('Classic state projection', () => {
 
   beforeEach(async () => {
     changeDir = await fs.mkdtemp(path.join(os.tmpdir(), 'comet-classic-state-'));
+    await fs.mkdir(path.join(changeDir, '.git'));
     stateFile = path.join(changeDir, '.comet.yaml');
   });
 
@@ -115,7 +117,11 @@ describe('Classic state projection', () => {
     ).rejects.toThrow('simulated I/O failure');
     expect(await readClassicState(changeDir)).toMatchObject(before);
     expect(
-      await fs.stat(path.join(changeDir, '.comet-state-transaction.json')).catch(() => null),
+      await fs
+        .stat(
+          path.join(await resolveClassicRunDirectory(changeDir), '.comet-state-transaction.json'),
+        )
+        .catch(() => null),
     ).toBeNull();
   });
 
@@ -136,14 +142,44 @@ describe('Classic state projection', () => {
         run: { ...before.run, currentStep: 'full.verify.run', iteration: 4 },
       }),
     ).rejects.toThrow('first failure');
-    expect(await fs.stat(path.join(changeDir, '.comet-state-transaction.json'))).toBeTruthy();
+    expect(
+      await fs.stat(
+        path.join(await resolveClassicRunDirectory(changeDir), '.comet-state-transaction.json'),
+      ),
+    ).toBeTruthy();
     spy.mockRestore();
     await healBoundBranch(changeDir, 'main');
     before.classic.boundBranch = 'main';
     expect(await readClassicState(changeDir)).toMatchObject(before);
     expect(
-      await fs.stat(path.join(changeDir, '.comet-state-transaction.json')).catch(() => null),
+      await fs
+        .stat(
+          path.join(await resolveClassicRunDirectory(changeDir), '.comet-state-transaction.json'),
+        )
+        .catch(() => null),
     ).toBeNull();
+  });
+
+  it('keeps an old transaction bound to its original filename', async () => {
+    await writeClassicState(changeDir, { classic: classicState(), run: runState() });
+    const runtime = await resolveClassicRunDirectory(changeDir);
+    const source = await fs.readFile(stateFile, 'utf8');
+    const journal = path.join(runtime, '.comet-state-transaction.json');
+    const beforeRun = await engineState.readRunState(runtime);
+    await fs.writeFile(
+      journal,
+      JSON.stringify({
+        schema: 'comet.classic.state-transaction.v1',
+        beforeYaml: source,
+        afterYaml: source,
+        beforeRun,
+        afterRun: { ...beforeRun, iteration: 99 },
+      }),
+    );
+    await fs.rename(stateFile, path.join(changeDir, 'comet-state.yaml'));
+    await expect(readClassicState(changeDir)).rejects.toThrow(/different state filename/u);
+    expect(await engineState.readRunState(runtime)).toEqual(beforeRun);
+    expect(await fs.readFile(journal, 'utf8')).toContain('state-transaction.v1');
   });
 
   it('round-trips every Classic field and Run projection', async () => {

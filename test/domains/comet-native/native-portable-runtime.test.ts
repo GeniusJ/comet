@@ -3,7 +3,9 @@ import { execFileSync } from 'node:child_process';
 import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { Lexer } from 'marked';
+import { readNativePortableAcceptance } from '../../../domains/comet-native/native-portable-requirements.js';
 
 import {
   defaultProjectConfig,
@@ -32,7 +34,6 @@ import {
   recordNativePortableVerifierFailure,
   retryNativePortableCheckPlan,
   sameNativeCheckPlan,
-  retryNativePortableVerifier,
   returnNativePortableChangeToBuild,
   submitNativePortableBuilderCandidate,
   submitNativePortableVerifierResult,
@@ -41,13 +42,16 @@ import { sameNativeCheckPlan as sameNativeCheckPlanModule } from '../../../domai
 import { confirmNativePortableShape } from '../../helpers/native-portable-confirmed-transition.js';
 import { ensureCliBuilt } from '../../helpers/ensure-cli-built.js';
 import {
-  processIsAlive,
   spawnNativePortableProcess,
   waitForCondition,
   waitForProcessExit,
 } from '../../helpers/native-portable-process.js';
 import { createNativeRunnerChannel } from '../../../domains/comet-native/native-runner-protocol.js';
 import { recoverNativePortableChange } from '../../../domains/comet-native/native-portable-recovery.js';
+import {
+  inspectProcessLiveness,
+  inspectProcessTreeLiveness,
+} from '../../../platform/process/process-identity.js';
 import type { NativeProjectPaths } from '../../../domains/comet-native/native-types.js';
 import { withCometRuntimeMetrics } from '../../../platform/process/runtime-metrics.js';
 
@@ -236,6 +240,130 @@ describe('Native portable Runtime vertical path', () => {
       await expect(
         executeNativePortableCheckPlan({ paths, name: state.name, plans }),
       ).rejects.toThrow('Native check input changed after the candidate was built');
+    },
+  );
+
+  it.each([
+    ['main.ts', 'export const value = 1;\n', '// Explain the output.\n', false],
+    ['main.ts', 'export const value = 1;\n', '// Explain the output.\n', true],
+    ['settings.json', '{"value":1}', '', false],
+    ['settings.json', '{"value":1}', '', true],
+    ['settings.yaml', 'value: 1\n', '# Explain the output.\n', false],
+    ['settings.toml', 'value = 1\n', '# Explain the output.\n', true],
+    ['README.md', 'value 1\n', 'Explain the output.\n', false],
+    ['worker.py', 'value = 1\n', '# Explain the output.\n', false],
+    ['worker.py', 'value = 1\n', '# Explain the output.\n', true],
+    ['refactor.ts', 'export function value() { return 1; }', '', false],
+    ['refactor.ts', 'export function value() { return 1; }', '', true],
+    ['labels.json', '{"value":"Ready 1"}', '', false],
+  ] as const)(
+    'reruns byte-bound checks without returning to Build after non-behavioral edits (%s, dirty: %s)',
+    async (ref, initial, prefix, dirty) => {
+      const git = (...args: string[]) =>
+        execFileSync('git', ['-C', root, ...args], { stdio: 'ignore' });
+      git('init', '--quiet');
+      git('config', 'user.email', 'test@example.com');
+      git('config', 'user.name', 'Test');
+      const file = path.join(root, ref);
+      await fs.writeFile(file, initial);
+      git('add', ref);
+      git('commit', '--quiet', '-m', 'fixture');
+      if (dirty) await fs.writeFile(file, initial.replace('1', '2'));
+      await createNativePortableChange({ paths, name: 'comment-edit', language: 'en' });
+      await fs.writeFile(
+        path.join(nativePortableChangeDir(paths, 'comment-edit'), 'brief.md'),
+        '# Acceptance examples\n- Output remains correct.\n',
+      );
+      const state = await confirmNativePortableShape({ paths, name: 'comment-edit' });
+      const runner = createNativeRunnerChannel();
+      await submitNativePortableBuilderCandidate({
+        paths,
+        name: state.name,
+        input: {
+          identity: runner.captureExecutionIdentity({
+            identityProvider: 'test-host',
+            executionRef: 'comment-builder',
+          }),
+          candidateId: 'comments',
+          summary: 'Implemented the output.',
+          addressedAcceptanceIds: ['A1'],
+          acceptanceReview: fixtureAcceptanceReview(['A1']),
+        },
+      });
+      const plans = [
+        {
+          id: 'output',
+          name: 'Output',
+          executable: process.execPath,
+          argv: [
+            '-e',
+            `console.log(require('node:fs').readFileSync(${JSON.stringify(ref)}, 'utf8'))`,
+          ],
+          cwdRef: '.',
+          timeoutMs: 10000,
+          repeatable: true,
+        },
+      ];
+      await executeNativePortableCheckPlan({ paths, name: state.name, plans });
+      const before = (await readNativeLocalExecution(nativeLocalExecutionFile(paths, state.name)))!;
+      const beforeEdit = await fs.readFile(file, 'utf8');
+      const afterEdit =
+        ref === 'refactor.ts'
+          ? beforeEdit.replace(/return (\d+);/u, 'const result = $1; return result;')
+          : ref === 'labels.json'
+            ? beforeEdit.replace('Ready', 'Ready to continue')
+            : ref.endsWith('.json')
+              ? JSON.stringify(JSON.parse(beforeEdit), null, 2)
+              : prefix + beforeEdit;
+      if (ref.endsWith('.py') || ref === 'refactor.ts' || ref === 'labels.json') {
+        const { inspectNativeHookGuard } =
+          await import('../../../domains/comet-native/native-hook-guard.js');
+        const { nativeEditReviewScope } =
+          await import('../../../domains/comet-native/native-edit-review.js');
+        const { prepareEditReview, recordEditReview } =
+          await import('../../../domains/workflow-contract/edit-review.js');
+        const scope = nativeEditReviewScope(
+          paths,
+          await readNativePortableChange(paths, state.name),
+        );
+        const request = {
+          intent: 'write' as const,
+          toolName: 'Write',
+          targets: [ref],
+          writes: [{ path: ref, content: afterEdit }],
+        };
+        const blocked = await inspectNativeHookGuard(root, request, state.name);
+        expect(blocked).toMatchObject({ allowed: false, phase: 'verify' });
+        expect(blocked.reason).toContain('edit-review show native');
+        const proposal = await prepareEditReview(scope, request);
+        await recordEditReview(
+          scope,
+          {
+            proposalHash: proposal.proposalHash,
+            decision: 'non-behavioral',
+            summary: 'Reviewed the diff and consumers; acceptance behavior is unchanged.',
+          },
+          { kind: 'user-confirmed', executionRef: 'user' },
+        );
+        expect(await inspectNativeHookGuard(root, request, state.name)).toMatchObject({
+          allowed: true,
+          phase: 'verify',
+        });
+      }
+      await fs.writeFile(file, afterEdit);
+      const checked = await executeNativePortableCheckPlan({ paths, name: state.name, plans });
+      expect(checked.disposition).toBe('executed');
+      expect((await readNativePortableChange(paths, state.name)).phase).toBe('verify');
+      const after = (await readNativeLocalExecution(nativeLocalExecutionFile(paths, state.name)))!;
+      expect(after.candidateId).toBe(before.candidateId);
+      expect(after.inputFingerprint).not.toBe(before.inputFingerprint);
+      expect(after.checks[0].operationId).not.toBe(before.checks[0].operationId);
+      expect(
+        await fs.readFile(
+          path.join(nativePreferredChangeRuntimeDir(paths, state.name), after.checks[0].log),
+          'utf8',
+        ),
+      ).toContain(afterEdit.trim());
     },
   );
 
@@ -593,6 +721,68 @@ children:
     ).resolves.toMatchObject({ phase: 'build', status: 'active' });
   });
 
+  it.each([
+    'https://example.com/spec',
+    'http://example.com/spec',
+    'www.example.com',
+    '<https://example.com/spec>',
+    'reader@example.com',
+  ])('keeps Shape fingerprints stable across parser metadata for %s', async (link) => {
+    await createNativePortableChange({ paths, name: 'autolink', language: 'en' });
+    const changeDir = nativePortableChangeDir(paths, 'autolink');
+    await fs.writeFile(
+      path.join(changeDir, 'brief.md'),
+      `# Scope\nSee ${link}.\n# Acceptance examples\n- Follow the reference.\n`,
+    );
+    await fs.mkdir(path.join(changeDir, 'specs/links'), { recursive: true });
+    await fs.writeFile(
+      path.join(changeDir, 'specs/links/spec.md'),
+      `# Links\nReference: ${link}.\n`,
+    );
+    const state = {
+      ...(await readNativePortableChange(paths, 'autolink')),
+      document_constraints_version: 3 as const,
+    };
+    const options = {
+      paths,
+      state,
+      specChanges: [{ capability: 'links', source: 'specs/links/spec.md' }],
+    };
+    const original = await readNativePortableAcceptance(options);
+    const lex = Lexer.lex.bind(Lexer);
+    let links = 0;
+    const addMetadata = (value: unknown): void => {
+      if (Array.isArray(value)) value.forEach(addMetadata);
+      else if (value && typeof value === 'object') {
+        const token = value as Record<string, unknown>;
+        if (token.type === 'link') {
+          token.autolink = true;
+          token.parserMetadata = 'new-version';
+          links++;
+        }
+        Object.values(token).forEach(addMetadata);
+      }
+    };
+    const spy = vi.spyOn(Lexer, 'lex').mockImplementation((...args) => {
+      const tokens = lex(...args);
+      addMetadata(tokens);
+      return tokens;
+    });
+    try {
+      expect(await readNativePortableAcceptance(options)).toEqual(original);
+      expect(links).toBeGreaterThan(0);
+      await fs.writeFile(
+        path.join(changeDir, 'specs/links/spec.md'),
+        '# Links\nReference: https://example.org/changed.\n',
+      );
+      expect((await readNativePortableAcceptance(options)).formalHash).not.toBe(
+        original.formalHash,
+      );
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
   it('creates only portable user artifacts and one local execution overlay', async () => {
     await createNativePortableChange({ paths, name: 'small-change', language: 'en' });
 
@@ -765,9 +955,10 @@ children:
       id: 'timeout-check',
       name: 'Timeout check',
       executable: process.execPath,
-      argv: ['-e', 'setTimeout(() => {}, 250)'],
+      argv: ['-e', 'setInterval(() => {}, 1000)'],
       cwdRef: '.',
-      timeoutMs: 20,
+      // 给监管进程登记留出时间，再验证实际命令的超时与重试。
+      timeoutMs: 5_000,
       repeatable: true,
     } as const;
 
@@ -812,7 +1003,7 @@ children:
     ]);
   });
 
-  it('recovers an orphaned running check after its Runtime owner process exits', async () => {
+  it('recovers an orphaned running check only when process exit can be proven', async () => {
     await createNativePortableChange({ paths, name: 'orphaned-owner', language: 'en' });
     const changeDir = nativePortableChangeDir(paths, 'orphaned-owner');
     await fs.writeFile(
@@ -836,8 +1027,11 @@ children:
         review: passedReview('orphaned-reviewer'),
       },
     });
-    const marker = path.join(root, 'check-starts.txt');
-    const release = path.join(root, 'release-check');
+    // 进程同步文件不属于候选实现，避免恢复测试自行改变检查输入。
+    const controls = path.join(paths.workspaceRuntimeRoot, 'test-orphaned-check-control');
+    await fs.mkdir(controls, { recursive: true });
+    const marker = path.join(controls, 'check-starts.txt');
+    const release = path.join(controls, 'release-check');
     const plan = {
       id: 'orphaned-check',
       name: 'Orphaned check',
@@ -868,7 +1062,11 @@ children:
         .access(path.join(paths.locksDir, 'root-move.lock'))
         .then(() => false)
         .catch(() => true);
-      return reserved && mutationLockReleased;
+      const commandStarted = await fs
+        .access(marker)
+        .then(() => true)
+        .catch(() => false);
+      return reserved && mutationLockReleased && commandStarted;
     }, 'Runtime owner did not reserve and start its check');
     await waitForCondition(
       () =>
@@ -887,13 +1085,32 @@ children:
 
     owner.kill('SIGKILL');
     await waitForProcessExit(owner);
-    expect(processIsAlive(owner.pid!)).toBe(false);
-    if (activePid !== undefined && processIsAlive(activePid)) process.kill(activePid, 'SIGKILL');
+    const activeProcess = running?.checks[0]?.activeProcess;
+    // Let the registered supervisor receive owner disconnect and stop its complete tree.
+    // Killing only the supervisor can leave the command alive and cannot prove an orphan.
     await waitForCondition(
-      () => activePid !== undefined && !processIsAlive(activePid),
-      'Check process remained alive after its Runtime owner was terminated',
+      async () =>
+        activeProcess?.status === 'running' &&
+        (await inspectProcessTreeLiveness(activeProcess.pid, activeProcess.identity)) === 'dead',
+      'Check process tree did not stop after its Runtime owner was terminated',
     );
     expect((await fs.readFile(marker, 'utf8')).trim().split(/\r?\n/)).toHaveLength(1);
+
+    const ownerLiveness = await inspectProcessLiveness(
+      owner.pid!,
+      running?.execution?.ownerIdentity,
+    );
+    const checkLiveness =
+      activeProcess?.status === 'running'
+        ? await inspectProcessTreeLiveness(activeProcess.pid, activeProcess.identity)
+        : 'unknown';
+    // Windows 的 leader 退出没有提供整树停止证据，旧运行登记须继续阻止重试。
+    if (process.platform === 'win32' || ownerLiveness !== 'dead' || checkLiveness !== 'dead') {
+      await expect(
+        executeNativePortableCheckPlan({ paths, name: state.name, plans: [plan] }),
+      ).rejects.toThrow('could not be proven to have exited');
+      return;
+    }
 
     await expect(
       executeNativePortableCheckPlan({ paths, name: state.name, plans: [plan] }),
@@ -935,7 +1152,7 @@ children:
       executable: process.execPath,
       argv: ['-e', 'setInterval(() => {}, 1000)'],
       cwdRef: '.',
-      timeoutMs: 20,
+      timeoutMs: 5_000,
       repeatable: false,
     } as const;
     await expect(
@@ -1971,6 +2188,12 @@ Ship the behavior.
       reusedCheckIds: ['same-check'],
       executedCheckIds: [],
     });
+    expect(first.state.verifier_action).toMatchObject({
+      id: state.verifier_action!.id,
+      status: 'running',
+      claim: { token: 'verifier-repeat-request' },
+    });
+    expect(first.state.state_version).toBe(state.state_version + 1);
     await expect(
       submitNativePortableVerifierResult({
         paths,
@@ -1987,7 +2210,7 @@ Ship the behavior.
     expect((await readNativePortableChange(paths, state.name)).loop.execution_failure_count).toBe(
       0,
     );
-    expect(await readNativePortableChange(paths, state.name)).toEqual(state);
+    expect(await readNativePortableChange(paths, state.name)).toEqual(first.state);
   });
 
   it('derives final check status from Runtime execution instead of caller summaries', async () => {

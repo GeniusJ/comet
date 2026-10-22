@@ -1,4 +1,5 @@
 import path from 'path';
+import { Command } from 'commander';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 const statusCommand = vi.fn(async () => undefined);
@@ -43,13 +44,13 @@ const creatorListCommand = vi.fn(async () => undefined);
 const creatorStatusCommand = vi.fn(async () => undefined);
 const creatorNextCommand = vi.fn(async () => undefined);
 const creatorGuideCommand = vi.fn(async () => undefined);
+const creatorStartCommand = vi.fn(async () => undefined);
+const creatorDispatchCommand = vi.fn(async () => undefined);
 const creatorCandidatesCommand = vi.fn(async () => undefined);
-const creatorProposeCommand = vi.fn(async () => undefined);
-const creatorInitCommand = vi.fn(async () => undefined);
-const creatorResolveCommand = vi.fn(async () => undefined);
-const creatorAuthoringPlanCommand = vi.fn(async () => undefined);
-const creatorAuthoringRecordCommand = vi.fn(async () => undefined);
-const creatorGenerateCommand = vi.fn(async () => undefined);
+const applicationInstallCommand = vi.fn(async () => undefined);
+const applicationExportCommand = vi.fn(async () => undefined);
+const applicationUninstallCommand = vi.fn(async () => undefined);
+const applicationDistributeCommand = vi.fn(async () => undefined);
 const publishReviewCommand = vi.fn(async () => undefined);
 const publishApproveCommand = vi.fn(async () => undefined);
 const publishRunCommand = vi.fn(async () => undefined);
@@ -109,17 +110,13 @@ vi.mock('../../app/commands/skill.js', () => ({
   skillCheckCommand,
 }));
 vi.mock('../../app/commands/creator.js', () => ({
+  creatorStartCommand,
+  creatorDispatchCommand,
   creatorListCommand,
   creatorStatusCommand,
   creatorNextCommand,
   creatorGuideCommand,
   creatorCandidatesCommand,
-  creatorProposeCommand,
-  creatorInitCommand,
-  creatorResolveCommand,
-  creatorAuthoringPlanCommand,
-  creatorAuthoringRecordCommand,
-  creatorGenerateCommand,
 }));
 vi.mock('../../app/commands/publish.js', () => ({
   publishReviewCommand,
@@ -140,6 +137,13 @@ vi.mock('../../app/commands/bundle.js', () => ({
 }));
 
 const originalArgv = process.argv;
+
+vi.mock('../../app/commands/application.js', () => ({
+  applicationInstallCommand,
+  applicationExportCommand,
+  applicationUninstallCommand,
+  applicationDistributeCommand,
+}));
 const cliPath = path.join(path.resolve('.'), 'bin', 'comet.js');
 
 async function runAction(args: string[], command: { mock: { calls: unknown[][] } }): Promise<void> {
@@ -155,7 +159,285 @@ describe('CLI lazy command actions', () => {
     process.argv = originalArgv;
     process.exitCode = undefined;
     vi.clearAllMocks();
+    vi.restoreAllMocks();
     vi.resetModules();
+  });
+
+  it('dispatches application distribution and selective uninstall for multiple Comet platforms', async () => {
+    await runAction(
+      [
+        'application',
+        'distribute',
+        'application.json',
+        '--platform',
+        'cursor',
+        '--platform',
+        'zcode',
+        '--scope',
+        'user',
+        '--user-root',
+        'isolated-home',
+        '--preview',
+        '--json',
+      ],
+      applicationDistributeCommand,
+    );
+    expect(applicationDistributeCommand).toHaveBeenCalledWith(
+      'application.json',
+      expect.objectContaining({
+        platform: ['cursor', 'zcode'],
+        scope: 'user',
+        userRoot: 'isolated-home',
+        preview: true,
+        json: true,
+      }),
+    );
+    await runAction(
+      [
+        'application',
+        'uninstall',
+        'editorial',
+        '--platform',
+        'cursor',
+        '--platform',
+        'zcode',
+        '--confirmation-hash',
+        'current-preview',
+        '--json',
+      ],
+      applicationUninstallCommand,
+    );
+    expect(applicationUninstallCommand).toHaveBeenCalledWith(
+      'editorial',
+      expect.objectContaining({
+        platform: ['cursor', 'zcode'],
+        confirmationHash: 'current-preview',
+        json: true,
+      }),
+    );
+  });
+
+  it('dispatches application previews, explicit confirmations, and export with their scopes', async () => {
+    await runAction(
+      [
+        'application',
+        'install',
+        'application.json',
+        '--scope',
+        'user',
+        '--user-root',
+        'user-apps',
+        '--host',
+        'codex',
+        '--upgrade',
+        '--json',
+      ],
+      applicationInstallCommand,
+    );
+    expect(applicationInstallCommand).toHaveBeenCalledWith(
+      'application.json',
+      expect.objectContaining({
+        scope: 'user',
+        userRoot: 'user-apps',
+        host: 'codex',
+        upgrade: true,
+        json: true,
+      }),
+    );
+    expect(applicationInstallCommand.mock.calls[0][1]).not.toHaveProperty('confirmationHash');
+    await runAction(
+      ['application', 'export', 'application.json', 'exported', '--project', 'project', '--json'],
+      applicationExportCommand,
+    );
+    expect(applicationExportCommand).toHaveBeenCalledWith(
+      'application.json',
+      'exported',
+      expect.objectContaining({ project: 'project', json: true }),
+    );
+    await runAction(
+      [
+        'application',
+        'uninstall',
+        'weekly-report',
+        '--scope',
+        'user',
+        '--user-root',
+        'user-apps',
+        '--confirmation-hash',
+        'current-preview',
+        '--json',
+      ],
+      applicationUninstallCommand,
+    );
+    expect(applicationUninstallCommand).toHaveBeenCalledWith(
+      'weekly-report',
+      expect.objectContaining({
+        scope: 'user',
+        userRoot: 'user-apps',
+        confirmationHash: 'current-preview',
+        json: true,
+      }),
+    );
+  });
+
+  it('dispatches SDK Creator start and current action requests with their required inputs', async () => {
+    await runAction(
+      [
+        'creator',
+        'start',
+        'weekly-report',
+        '--goal',
+        '生成每周报告',
+        '--install-target',
+        '.claude/skills/weekly-report',
+        '--host',
+        'claude-code',
+        '--json',
+      ],
+      creatorStartCommand,
+    );
+    expect(creatorStartCommand).toHaveBeenCalledWith(
+      'weekly-report',
+      expect.objectContaining({
+        goal: '生成每周报告',
+        installTarget: '.claude/skills/weekly-report',
+        host: 'claude-code',
+        json: true,
+      }),
+    );
+    await runAction(
+      ['creator', 'dispatch', 'weekly-report', '--request', 'current-action.json', '--json'],
+      creatorDispatchCommand,
+    );
+    expect(creatorDispatchCommand).toHaveBeenCalledWith(
+      'weekly-report',
+      expect.objectContaining({ request: 'current-action.json', json: true }),
+    );
+  });
+
+  it('retains root commands without constructing unrelated group subcommands', async () => {
+    const register = vi.spyOn(Command.prototype, 'command');
+    await runAction(['status', 'project'], statusCommand);
+    const commands = register.mock.calls.map(([name]) => name);
+    expect(commands).toEqual(
+      expect.arrayContaining([
+        'workflow',
+        'memory',
+        'knowledge',
+        'skill',
+        'creator',
+        'publish',
+        'bundle',
+      ]),
+    );
+    expect(commands).not.toContain('retrieve [path]');
+    expect(commands).not.toContain('review [path]');
+    expect(commands).not.toContain('draft');
+    expect(commands).not.toContain('generate <name>');
+  });
+
+  it.each([
+    ['memory', '--help'],
+    ['help', 'memory'],
+    ['help', '--', 'memory'],
+  ])('registers group help for %j', async (...args) => {
+    const output: string[] = [];
+    vi.spyOn(process.stdout, 'write').mockImplementation((chunk) => {
+      output.push(String(chunk));
+      return true;
+    });
+    vi.spyOn(process, 'exit').mockImplementation((exitCode) => {
+      throw Object.assign(new Error('CLI exit'), { exitCode });
+    });
+    process.argv = [process.execPath, cliPath, ...args];
+    vi.resetModules();
+    await import('../../app/cli/index.js');
+    expect(output.join('')).toContain('Usage: comet memory [options] [command]');
+    expect(output.join('')).toContain('retrieve [options] [path]');
+    expect(output.join('')).toContain('rollback [options] [path]');
+    expect(personalMemoryManageCommand).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { args: ['memroy', '--json'], message: "unknown command 'memroy'", suggestion: 'memory' },
+    {
+      args: ['memory', 'retriev', '--json'],
+      message: "unknown command 'retriev'",
+      suggestion: 'retrieve',
+    },
+    { args: ['memory', 'retrieve', '--bogus', '--json'], message: "unknown option '--bogus'" },
+    {
+      args: ['memory', 'remember', '--json'],
+      message: "required option '--text <text>' not specified",
+    },
+  ])('retains Commander errors for $args', async ({ args, message, suggestion }) => {
+    const output: string[] = [];
+    const errors: string[] = [];
+    vi.spyOn(console, 'log').mockImplementation((value) => output.push(String(value)));
+    vi.spyOn(console, 'error').mockImplementation((value) => errors.push(String(value)));
+    vi.spyOn(process.stderr, 'write').mockImplementation((chunk) => {
+      errors.push(String(chunk));
+      return true;
+    });
+    process.argv = [process.execPath, cliPath, ...args];
+    vi.resetModules();
+    await import('../../app/cli/index.js');
+    expect(process.exitCode).toBe(1);
+    expect(JSON.parse(output.join(''))).toMatchObject({
+      status: 'failed',
+      error: expect.stringContaining(message),
+    });
+    if (suggestion) expect(errors.join('')).toContain(suggestion);
+    expect(personalMemoryRetrieveCommand).not.toHaveBeenCalled();
+    expect(personalMemoryRememberCommand).not.toHaveBeenCalled();
+  });
+
+  it('parses snapshot delivery and repeatable memory phase selectors', async () => {
+    await runAction(
+      [
+        'task',
+        'project',
+        '--task',
+        'Verify',
+        '--context-mode',
+        'snapshot',
+        '--phase',
+        'verify',
+        '--session',
+        'verifier',
+      ],
+      cometTaskCommand,
+    );
+    expect(cometTaskCommand).toHaveBeenLastCalledWith(
+      'project',
+      expect.objectContaining({ contextMode: 'snapshot', phase: 'verify', session: 'verifier' }),
+    );
+    await runAction(
+      [
+        'memory',
+        'remember',
+        'project',
+        '--text',
+        'Use my Skill',
+        '--phase',
+        'build',
+        '--phase',
+        'verify',
+      ],
+      personalMemoryRememberCommand,
+    );
+    expect(personalMemoryRememberCommand).toHaveBeenLastCalledWith(
+      'project',
+      expect.objectContaining({ phases: ['build', 'verify'] }),
+    );
+    await runAction(
+      ['memory', 'correct', 'project', '--id', 'id', '--phase', 'verify'],
+      personalMemoryCorrectCommand,
+    );
+    expect(personalMemoryCorrectCommand).toHaveBeenLastCalledWith(
+      'project',
+      expect.objectContaining({ phases: ['verify'] }),
+    );
   });
 
   it('loads and dispatches every deferred command group when invoked', async () => {
@@ -240,6 +522,15 @@ describe('CLI lazy command actions', () => {
     await runAction(['dashboard', 'project', '--port', '0'], dashboardCommand);
     await runAction(['doctor', 'project'], doctorCommand);
     await runAction(['update', 'project'], updateCommand);
+    updateCommand.mockClear();
+    await runAction(
+      ['update', 'project', '--all-projects', '--yes', '--target-version', '0.5.1'],
+      updateCommand,
+    );
+    expect(updateCommand).toHaveBeenCalledWith(
+      'project',
+      expect.objectContaining({ allProjects: true, yes: true, targetVersion: '0.5.1' }),
+    );
     await runAction(['uninstall', 'project', '--force'], uninstallCommand);
     await runAction(['eval'], evalCommand);
     await runAction(['state', 'show'], runClassicFacade);
@@ -255,21 +546,6 @@ describe('CLI lazy command actions', () => {
     await runAction(['creator', 'next', 'example'], creatorNextCommand);
     await runAction(['creator', 'guide'], creatorGuideCommand);
     await runAction(['creator', 'candidates'], creatorCandidatesCommand);
-    await runAction(
-      ['creator', 'propose', 'example', '--file', 'plan.json'],
-      creatorProposeCommand,
-    );
-    await runAction(['creator', 'init', 'example', '--file', 'plan.json'], creatorInitCommand);
-    await runAction(
-      ['creator', 'resolve', 'example', '--candidate', 'source'],
-      creatorResolveCommand,
-    );
-    await runAction(['creator', 'authoring-plan', 'example'], creatorAuthoringPlanCommand);
-    await runAction(
-      ['creator', 'authoring-record', 'example', '--lane', 'lane', '--file', 'result.json'],
-      creatorAuthoringRecordCommand,
-    );
-    await runAction(['creator', 'generate', 'example'], creatorGenerateCommand);
     await runAction(['publish', 'review', 'example', '--platform', 'codex'], publishReviewCommand);
     await runAction(
       ['publish', 'approve', 'example', '--reviewer', 'reviewer'],
@@ -295,5 +571,54 @@ describe('CLI lazy command actions', () => {
     );
     await runAction(['bundle', 'publish', 'example', '--platform', 'codex'], bundlePublishCommand);
     await runAction(['bundle', 'distribute', 'example'], bundleDistributeCommand);
+  });
+
+  it.each([
+    {
+      args: ['creator', 'start', '--json'],
+      command: 'comet creator start [options] <name>',
+      requiredArguments: ['<name>'],
+      missingOptions: ['--goal <text>', '--install-target <directory>'],
+    },
+    {
+      args: ['creator', 'start', 'weekly', '--goal', 'weekly report', '--json'],
+      command: 'comet creator start [options] <name>',
+      requiredArguments: ['<name>'],
+      missingOptions: ['--install-target <directory>'],
+    },
+    {
+      args: ['application', 'export', '--json'],
+      command: 'comet application export [options] <file> <destination>',
+      requiredArguments: ['<file>', '<destination>'],
+      missingOptions: [],
+    },
+    {
+      args: ['bundle', 'compile', '--json'],
+      command: 'comet bundle compile [options] <name>',
+      requiredArguments: ['<name>'],
+      missingOptions: ['--platform <id>'],
+    },
+  ])('returns all required inputs on the first failure for $args', async (expected) => {
+    const output: string[] = [];
+    vi.spyOn(console, 'log').mockImplementation((value) => output.push(String(value)));
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+    process.argv = [process.execPath, cliPath, ...expected.args];
+    vi.resetModules();
+    await import('../../app/cli/index.js');
+    expect(process.exitCode).toBe(1);
+    expect(output).toHaveLength(1);
+    expect(JSON.parse(output[0])).toMatchObject({
+      status: 'failed',
+      usage: {
+        command: expected.command,
+        requiredArguments: expected.requiredArguments,
+        missingOptions: expected.missingOptions,
+        helpCommand: `${expected.args.slice(0, 2).join(' ')} --help`.replace(/^/, 'comet '),
+      },
+    });
+    expect(creatorStartCommand).not.toHaveBeenCalled();
+    expect(applicationExportCommand).not.toHaveBeenCalled();
+    expect(bundleCompileCommand).not.toHaveBeenCalled();
   });
 });

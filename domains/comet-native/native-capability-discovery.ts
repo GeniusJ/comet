@@ -1,3 +1,4 @@
+import { resolveWorkspaceRuntimeRoot } from '../workflow-contract/workspace-runtime.js';
 import { createHash } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
@@ -25,12 +26,7 @@ const NATIVE_KNOWLEDGE_MAX_DOCUMENTS = 512;
 const NATIVE_KNOWLEDGE_MAX_DOCUMENT_BYTES = 256 * 1024;
 const NATIVE_KNOWLEDGE_MAX_TOTAL_BYTES = 8 * 1024 * 1024;
 const NATIVE_KNOWLEDGE_MAX_DISCOVERY_MS = 2_000;
-const NATIVE_KNOWLEDGE_CACHE_FILE = path.join(
-  '.comet',
-  'runtime',
-  'native',
-  'capability-discovery-cache.json',
-);
+const NATIVE_KNOWLEDGE_CACHE_FILE = path.join('native', 'capability-discovery-cache.json');
 const NATIVE_KNOWLEDGE_CACHE_SCHEMA = 'comet.native.capability-cache.v1';
 const NATIVE_KNOWLEDGE_CACHE_MAX_BYTES = 512 * 1024;
 const NATIVE_KNOWLEDGE_CACHE_MAX_ENTRIES = 32;
@@ -378,7 +374,13 @@ function parseCache(value: unknown): NativeCapabilityCacheFile | null {
 
 async function readCache(projectRoot: string): Promise<NativeCapabilityCacheFile | null> {
   try {
-    const source = await fs.readFile(path.join(projectRoot, NATIVE_KNOWLEDGE_CACHE_FILE), 'utf8');
+    const { bytes } = await readProtectedProjectFile(
+      await resolveWorkspaceRuntimeRoot(projectRoot),
+      NATIVE_KNOWLEDGE_CACHE_FILE,
+      NATIVE_KNOWLEDGE_CACHE_MAX_BYTES,
+      { label: 'Native capability discovery cache' },
+    );
+    const source = bytes.toString('utf8');
     if (Buffer.byteLength(source, 'utf8') > NATIVE_KNOWLEDGE_CACHE_MAX_BYTES) return null;
     return parseCache(JSON.parse(source));
   } catch {
@@ -440,8 +442,8 @@ export async function writeNativeCapabilityDiscoveryCache(options: {
   if (Buffer.byteLength(serialized, 'utf8') > NATIVE_KNOWLEDGE_CACHE_MAX_BYTES) return;
   const { atomicWriteJson } = await import('./native-atomic-file.js');
   await atomicWriteJson(
-    path.join(projectRoot, NATIVE_KNOWLEDGE_CACHE_FILE),
+    path.join(await resolveWorkspaceRuntimeRoot(projectRoot), NATIVE_KNOWLEDGE_CACHE_FILE),
     { schema: NATIVE_KNOWLEDGE_CACHE_SCHEMA, entries },
-    { containedRoot: path.join(projectRoot, '.comet', 'runtime', 'native') },
+    { containedRoot: path.join(await resolveWorkspaceRuntimeRoot(projectRoot), 'native') },
   );
 }

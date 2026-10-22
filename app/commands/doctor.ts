@@ -1,3 +1,5 @@
+import { readSdkChangeOwner } from '../../domains/workflow-contract/change-runtime-owner.js';
+import { inspectNativeSdkStatus } from '../../domains/comet-native/native-sdk-status.js';
 import path from 'path';
 import os from 'os';
 import { promises as fs } from 'fs';
@@ -48,6 +50,10 @@ import {
 } from '../../platform/install/project-registry.js';
 import { resolveCanonicalSkillRootOwners } from '../../platform/install/skill-root-owner.js';
 import type { InstallScope } from '../../platform/install/types.js';
+import {
+  CLASSIC_STATE_FILE,
+  resolveClassicStateFile,
+} from '../../domains/comet-classic/classic-state-file.js';
 import { inspectClassicChangeReadOnly } from '../../domains/comet-classic/classic-diagnostics.js';
 import {
   inspectClassicLayout,
@@ -71,6 +77,8 @@ import {
   repairWorkflowProjectConfigTransaction,
 } from '../../domains/workflow-contract/project-config-transaction.js';
 import type { WorkflowProjectConfig } from '../../domains/workflow-contract/types.js';
+import { inspectClassicSdkChangeStatus } from '../../domains/comet-entry/project-status.js';
+import { inspectSelectedWorkflowApplicationStatus } from '../../domains/workflow-application/index.js';
 import { resolveHookWorkflowOwner } from '../../domains/comet-entry/hook-router.js';
 import type { InitWorkflowSelection } from '../../domains/comet-entry/types.js';
 import { inspectGitWorktree } from '../../platform/paths/git-worktree.js';
@@ -89,6 +97,35 @@ interface DoctorContext {
 }
 
 type ManagedInstallAvailability = 'ready' | 'partial' | 'missing';
+
+interface DoctorAssetInspection {
+  manifest: Awaited<ReturnType<typeof readManifest>>;
+  skillPresent(file: string): Promise<boolean>;
+  bundledHookRuntime(): Promise<Buffer>;
+}
+
+async function createDoctorAssetInspection(): Promise<DoctorAssetInspection> {
+  const manifest = await readManifest();
+  const presence = new Map<string, Promise<boolean>>();
+  let bundledRuntime: Promise<Buffer> | undefined;
+  return {
+    manifest,
+    skillPresent(file) {
+      const key = path.resolve(file);
+      let result = presence.get(key);
+      if (!result) {
+        result = fileExists(key);
+        presence.set(key, result);
+      }
+      return result;
+    },
+    bundledHookRuntime() {
+      return (bundledRuntime ??= fs.readFile(
+        path.join(getAssetsDir(), 'skills', ...HOOK_ROUTER_RUNTIME.split('/')),
+      ));
+    },
+  };
+}
 
 interface DoctorRuntimeDiagnostic {
   isSecondaryWorktree: boolean;
@@ -707,6 +744,7 @@ async function checkPlatformComponents(
   platform: (typeof PLATFORMS)[number],
   scope: InstallScope,
   workflowSelection: InitWorkflowSelection,
+  assets: DoctorAssetInspection,
 ): Promise<CheckResult[]> {
   const results: CheckResult[] = [];
   const ruleDestinations = await getPlatformRuleDestinations(
@@ -772,7 +810,7 @@ async function checkPlatformComponents(
     }
   }
 
-  results.push(...(await checkHookComponents(baseDir, platform, scope, workflowSelection)));
+  results.push(...(await checkHookComponents(baseDir, platform, scope, workflowSelection, assets)));
 
   return results;
 }
@@ -782,6 +820,7 @@ async function checkHookComponents(
   platform: Platform,
   scope: InstallScope,
   workflowSelection: InitWorkflowSelection,
+  assets: DoctorAssetInspection,
 ): Promise<CheckResult[]> {
   if (!platform.supportsHooks || !platform.hookFormat) return [];
 
@@ -789,7 +828,7 @@ async function checkHookComponents(
   const runtime = hookRouterRuntimePaths(baseDir, platform, scope);
   try {
     const [expected, installed] = await Promise.all([
-      fs.readFile(runtime.source),
+      assets.bundledHookRuntime(),
       fs.readFile(runtime.destination),
     ]);
     results.push({
@@ -900,9 +939,10 @@ async function checkSkillCompleteness(
   scope: DoctorScope,
   context: DoctorContext,
   workflowSelection: InitWorkflowSelection,
+  assets: DoctorAssetInspection,
 ): Promise<CheckResult[]> {
   const results: CheckResult[] = [];
-  const manifest = await readManifest();
+  const { manifest } = assets;
 
   let anyCometInstall = false;
   const scopeState: Record<InstallScope, { hasInstall: boolean; hasComplete: boolean }> = {
@@ -928,7 +968,7 @@ async function checkSkillCompleteness(
         const candidateMissing: string[] = [];
         for (const relPath of managedSkills) {
           const fullPath = path.join(base.baseDir, skillsDir, 'skills', relPath);
-          if (await fileExists(fullPath)) candidatePresent.push(relPath);
+          if (await assets.skillPresent(fullPath)) candidatePresent.push(relPath);
           else candidateMissing.push(relPath);
         }
         if (candidatePresent.length === 0) continue;
@@ -973,6 +1013,7 @@ async function checkSkillCompleteness(
             platform,
             base.scope,
             base.scope === 'global' ? 'classic' : workflowSelection,
+            assets,
           )),
         );
       }
@@ -988,6 +1029,7 @@ async function checkSkillCompleteness(
           platform,
           base.scope,
           base.scope === 'global' ? 'classic' : workflowSelection,
+          assets,
         )),
       );
     }
@@ -1075,7 +1117,7 @@ async function checkCometYamlValidity(projectPath: string): Promise<CheckResult[
   for (const entry of entries) {
     if (entry === 'archive') continue;
     const changeDir = path.join(changesDir, entry);
-    const yamlPath = path.join(changeDir, '.comet.yaml');
+    let yamlPath = path.join(changeDir, CLASSIC_STATE_FILE);
     const runtimePath = path.join(changeDir, '.comet');
     try {
       const changeInspection = await inspectProtectedProjectPath(
@@ -1087,6 +1129,19 @@ async function checkCometYamlValidity(projectPath: string): Promise<CheckResult[
         },
       );
       if (!changeInspection.exists) continue;
+      yamlPath = await resolveClassicStateFile(changeDir);
+      const sdk = await inspectClassicSdkChangeStatus(projectPath, entry);
+      if (sdk) {
+        results.push({
+          check: `${path.basename(yamlPath)}: ${entry}`,
+          status: sdk.diagnostics?.healthy === false ? 'fail' : 'pass',
+          message:
+            sdk.diagnostics?.healthy === false
+              ? sdk.diagnostics.issues.map((issue) => `${issue.code}: ${issue.message}`).join('; ')
+              : `valid (step: ${sdk.currentStep ?? 'completed'}, mode: sdk)`,
+        });
+        continue;
+      }
       const yamlInspection = await inspectProtectedProjectPath(
         projectPath,
         path.relative(projectPath, yamlPath).replaceAll('\\', '/'),
@@ -1106,7 +1161,7 @@ async function checkCometYamlValidity(projectPath: string): Promise<CheckResult[
       );
     } catch (error) {
       results.push({
-        check: `.comet.yaml: ${entry}`,
+        check: `${path.basename(yamlPath)}: ${entry}`,
         status: 'fail',
         message: error instanceof Error ? error.message : String(error),
       });
@@ -1119,7 +1174,7 @@ async function checkCometYamlValidity(projectPath: string): Promise<CheckResult[
         diagnostic.currentStep ??
         (diagnostic.runtimeMode === 'legacy-state' ? `legacy:${diagnostic.phase}` : 'completed');
       results.push({
-        check: `.comet.yaml: ${entry}`,
+        check: `${path.basename(yamlPath)}: ${entry}`,
         status: 'pass',
         message: `valid (step: ${step}, mode: ${diagnostic.runtimeMode})`,
       });
@@ -1137,14 +1192,14 @@ async function checkCometYamlValidity(projectPath: string): Promise<CheckResult[
     }
 
     results.push({
-      check: `.comet.yaml: ${entry}`,
+      check: `${path.basename(yamlPath)}: ${entry}`,
       status: 'fail',
       message: diagnostic.error ?? 'invalid Classic state',
     });
     results.push({
       check: `next: ${entry}`,
       status: 'warn',
-      message: 'inspect .comet.yaml and rerun comet doctor',
+      message: `inspect ${path.basename(yamlPath)} and rerun comet doctor`,
     });
   }
 
@@ -1183,7 +1238,7 @@ function codegraphCheckResults(diagnostic: CodegraphIntegrationDiagnostic): Chec
       : diagnostic.agents
           .map(
             (agent) =>
-              `${agent.name}: ${agent.registered ? (agent.valid ? 'registered' : 'invalid entry') : 'not registered'}`,
+              `${agent.name}: ${agent.registrationStatus === 'unknown' ? `unable to inspect (${agent.detail})` : agent.registrationStatus === 'disabled' ? 'disabled' : agent.registered ? (agent.valid ? 'registered' : 'invalid entry') : 'not registered'}`,
           )
           .join('; ');
   const mcpResult: CheckResult = {
@@ -1194,9 +1249,12 @@ function codegraphCheckResults(diagnostic: CodegraphIntegrationDiagnostic): Chec
   const effectiveResults = diagnostic.agents.map((agent) => ({
     check: `CodeGraph effective for ${agent.name}`,
     status: agent.effective ? ('pass' as const) : ('warn' as const),
-    message: agent.effective
-      ? 'CLI, current project index, and MCP registration are ready'
-      : 'not ready — requires an installed CLI, current project index, and valid MCP registration',
+    message:
+      agent.registrationStatus === 'unknown'
+        ? agent.detail
+        : agent.effective
+          ? 'CLI, current project index, and MCP registration are ready'
+          : 'not ready — requires an installed CLI, current project index, and valid MCP registration',
   }));
   return [cliResult, indexResult, mcpResult, ...effectiveResults];
 }
@@ -1205,8 +1263,9 @@ async function inspectManagedInstallAvailability(
   baseDir: string,
   scope: InstallScope,
   workflowSelection: InitWorkflowSelection,
+  assets: DoctorAssetInspection,
 ): Promise<ManagedInstallAvailability> {
-  const manifest = await readManifest();
+  const { manifest } = assets;
   const managedSkills = getManagedSkillPathsForSelection(
     manifest,
     scope === 'global' ? 'classic' : workflowSelection,
@@ -1218,7 +1277,7 @@ async function inspectManagedInstallAvailability(
     for (const skillsDir of skillsDirs) {
       const presence = await Promise.all(
         managedSkills.map((relative) =>
-          fileExists(path.join(baseDir, skillsDir, 'skills', ...relative.split('/'))),
+          assets.skillPresent(path.join(baseDir, skillsDir, 'skills', ...relative.split('/'))),
         ),
       );
       const present = presence.filter(Boolean).length;
@@ -1233,12 +1292,14 @@ async function inspectDoctorRuntime(
   projectPath: string,
   context: DoctorContext,
   workflowSelection: InitWorkflowSelection,
+  assets: DoctorAssetInspection,
 ): Promise<DoctorRuntimeDiagnostic> {
   const worktree = inspectGitWorktree(projectPath);
   const currentProjectInstall = await inspectManagedInstallAvailability(
     projectPath,
     'project',
     workflowSelection,
+    assets,
   );
   const primaryProjectInstall =
     worktree.isSecondaryWorktree && worktree.primaryWorktreeRoot
@@ -1246,10 +1307,12 @@ async function inspectDoctorRuntime(
           worktree.primaryWorktreeRoot,
           'project',
           workflowSelection,
+          assets,
         )
       : currentProjectInstall;
   const globalFallbackReady =
-    (await inspectManagedInstallAvailability(context.homeDir, 'global', 'classic')) === 'ready';
+    (await inspectManagedInstallAvailability(context.homeDir, 'global', 'classic', assets)) ===
+    'ready';
   const effectiveScope =
     currentProjectInstall !== 'missing' ? 'project' : globalFallbackReady ? 'global' : 'none';
   const remediation =
@@ -1340,7 +1403,9 @@ async function collectResultsWithContext(
         ? 'native'
         : 'classic';
   const classicEnabled = workflowSelection !== 'native';
-  const runtime = await inspectDoctorRuntime(projectPath, context, workflowSelection);
+  // Collect after repair so no installation snapshot crosses a mutation boundary.
+  const assets = await createDoctorAssetInspection();
+  const runtime = await inspectDoctorRuntime(projectPath, context, workflowSelection, assets);
   const worktreeCheck = worktreeRuntimeCheck(runtime);
   if (worktreeCheck) results.push(worktreeCheck);
   if (configError) {
@@ -1374,7 +1439,13 @@ async function collectResultsWithContext(
       results.push(await checkWorkingDirs(projectPath));
     }
   }
-  const skillResults = await checkSkillCompleteness(projectPath, scope, context, workflowSelection);
+  const skillResults = await checkSkillCompleteness(
+    projectPath,
+    scope,
+    context,
+    workflowSelection,
+    assets,
+  );
   if (
     scope === 'project' &&
     runtime.isSecondaryWorktree &&
@@ -1415,6 +1486,25 @@ async function collectResultsWithContext(
 }
 
 async function checkCurrentSelection(projectPath: string): Promise<CheckResult> {
+  try {
+    const selected = await inspectSelectedWorkflowApplicationStatus(projectPath);
+    if (selected) {
+      return {
+        check: 'current selection',
+        status: selected.healthy ? 'pass' : 'fail',
+        message:
+          'error' in selected
+            ? `application:${selected.applicationId}/${selected.name}: ${selected.error.code}: ${selected.error.message}`
+            : `application:${selected.applicationId}/${selected.name} (${selected.run.status}, revision ${selected.run.revision})${selected.healthy ? '' : '; inspect the original Run and reconcile unresolved Actions'}`,
+      };
+    }
+  } catch (error) {
+    return {
+      check: 'current selection',
+      status: 'fail',
+      message: error instanceof Error ? error.message : String(error),
+    };
+  }
   const resolution = await resolveHookWorkflowOwner(projectPath);
   if (resolution.status === 'none') {
     return resolution.staleSelection
@@ -1424,6 +1514,37 @@ async function checkCurrentSelection(projectPath: string): Promise<CheckResult> 
           message: `${resolution.staleSelection.reason}; no active Comet change`,
         }
       : { check: 'current selection', status: 'pass', message: 'no active Comet change' };
+  }
+  if (
+    (resolution.status === 'owned' || resolution.status === 'inferred') &&
+    resolution.owner.workflow === 'native'
+  ) {
+    try {
+      const owner = await readSdkChangeOwner(projectPath, 'native', resolution.owner.name, {
+        readOnly: true,
+      });
+      if (owner) {
+        const status = await inspectNativeSdkStatus({
+          projectRoot: projectPath,
+          name: resolution.owner.name,
+          readOnly: true,
+        });
+        if (!status.diagnostics.healthy)
+          return {
+            check: 'current selection',
+            status: 'fail',
+            message: status.diagnostics.issues
+              .map((issue) => `${issue.code}: ${issue.message}; ${issue.nextCommand}`)
+              .join('; '),
+          };
+      }
+    } catch (error) {
+      return {
+        check: 'current selection',
+        status: 'fail',
+        message: error instanceof Error ? error.message : String(error),
+      };
+    }
   }
   if (resolution.status === 'owned') {
     return {

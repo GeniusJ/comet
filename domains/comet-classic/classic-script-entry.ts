@@ -9,6 +9,9 @@ import { pathToFileURL } from 'url';
 import { classicCommandHelp } from './classic-cli-help.js';
 import { projectCliAgentObservation } from '../workflow-contract/output-envelope.js';
 import { classicIssue } from './classic-issues.js';
+import { withCometRuntimeProgress } from '../../platform/process/runtime-metrics.js';
+import { observeRuntimeOperation } from '../../platform/process/runtime-performance.js';
+import { ClassicProjectConfigError, discoverClassicProject } from './classic-layout.js';
 
 function jsonResult(
   command: ClassicCommandName,
@@ -51,16 +54,32 @@ async function executeClassicScript(
   let result: ClassicCommandResult;
   try {
     const help = classicCommandHelp(command, args);
+    const invoke = () =>
+      handler(args, {
+        json,
+        invocationCwd: runOptions.invocationCwd ?? process.cwd(),
+        ...(runOptions.projectRoot ? { projectRoot: runOptions.projectRoot } : {}),
+      });
     result = help
       ? { exitCode: 0, stdout: help }
-      : await handler(args, {
-          json,
-          invocationCwd: runOptions.invocationCwd ?? process.cwd(),
-          ...(runOptions.projectRoot ? { projectRoot: runOptions.projectRoot } : {}),
-        });
+      : command === 'hook-guard'
+        ? await invoke()
+        : await withCometRuntimeProgress(() =>
+            observeRuntimeOperation(
+              {
+                projectRoot: () =>
+                  runOptions.projectRoot ??
+                  discoverClassicProject(runOptions.invocationCwd ?? process.cwd()),
+                workflow: 'classic',
+                command,
+                errorExitCode: (error) => (error instanceof ClassicProjectConfigError ? 1 : 70),
+              },
+              invoke,
+            ),
+          );
   } catch (error) {
     result = {
-      exitCode: 70,
+      exitCode: error instanceof ClassicProjectConfigError ? 1 : 70,
       stderr: error instanceof Error ? error.message : String(error),
       data: { issues: [classicIssue(error)] },
     };

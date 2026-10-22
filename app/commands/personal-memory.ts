@@ -9,10 +9,13 @@ import { readWorkflowProjectConfig } from '../../domains/workflow-contract/proje
 import { resolveStableProjectId } from '../../platform/paths/project-identity.js';
 
 export interface PersonalMemoryCommandOptions {
+  readonly timeoutMs?: number | string;
+  readonly learningTimeoutMs?: number | string;
   readonly json?: boolean;
   readonly task?: string;
   readonly path?: string;
   readonly phase?: string;
+  readonly phases?: readonly string[];
   readonly query?: string;
   readonly operation?: string;
   readonly tags?: readonly string[];
@@ -82,6 +85,7 @@ export async function personalMemoryRememberCommand(
     ...(options.scope === 'global' ? {} : { projectKey: bridge.currentProjectId }),
     category: options.category ?? defaultMemoryCategory(language),
     text: requireText(options.text, '--text'),
+    ...(options.phases === undefined ? {} : { phases: options.phases }),
     language,
   });
   printAction(
@@ -119,13 +123,14 @@ export async function personalMemoryCorrectCommand(
   const bridge = await createBridge(targetPath, options);
   const language = await resolveDisplayLanguage(targetPath, options);
   const correction = {
+    ...(options.phases === undefined ? {} : { phases: options.phases }),
     ...(options.text === undefined ? {} : { text: requireText(options.text, '--text') }),
     ...(options.category === undefined
       ? {}
       : { category: requireText(options.category, '--category') }),
   };
   if (Object.keys(correction).length === 0) {
-    throw new Error('At least one of --text or --category is required');
+    throw new Error('At least one of --text, --category or --phase is required');
   }
   const record = await bridge.correct(requireId(options.id), correction);
   printAction(
@@ -265,8 +270,17 @@ export async function personalMemorySyncCommand(
   targetPath = '.',
   options: PersonalMemoryCommandOptions = {},
 ): Promise<unknown> {
+  const timeout = (value: number | string | undefined, name: string) => {
+    if (value === undefined) return undefined;
+    const parsed = Number(value);
+    if (!Number.isSafeInteger(parsed) || parsed < 1 || parsed > 2147483647)
+      throw new Error(`${name} 必须是 1 到 2147483647 之间的整数毫秒。`);
+    return parsed;
+  };
+  const timeoutMs = timeout(options.timeoutMs, '--timeout-ms');
+  const learningTimeoutMs = timeout(options.learningTimeoutMs, '--learning-timeout-ms');
   const bridge = await createBridge(targetPath, options);
-  const result = await bridge.syncMemory();
+  const result = await bridge.syncMemory({ timeoutMs, learningTimeoutMs });
   if (
     result !== null &&
     typeof result === 'object' &&
@@ -364,7 +378,19 @@ function printRetrieval(
 }
 
 function printSyncResult(value: unknown, language: MemoryLanguage): void {
-  const result = value as { readonly status?: string; readonly message?: string };
+  const result = value as {
+    readonly status?: string;
+    readonly message?: string;
+    readonly learning?: {
+      readonly status: string;
+      readonly pending: number;
+      readonly processing?: number;
+      readonly retryScheduled?: number;
+      readonly failed: number;
+      readonly waiting: number;
+      readonly outboxPending?: number;
+    };
+  };
   const message =
     result.status === 'synced'
       ? localizedMessage(language, '个人记忆已同步。', 'Personal memory synced.')
@@ -386,6 +412,14 @@ function printSyncResult(value: unknown, language: MemoryLanguage): void {
               'Local memory is available; no remote is configured.',
             );
   console.log(message);
+  if (result.learning?.status === 'partial')
+    console.log(
+      localizedMessage(
+        language,
+        `补学习尚未完成：待投递 ${result.learning.outboxPending ?? 0}，待处理 ${result.learning.pending}，正在处理 ${result.learning.processing ?? 0}，待重试 ${result.learning.retryScheduled ?? 0}，待评审 ${result.learning.waiting}，失败 ${result.learning.failed}。进度已保存，可稍后再次同步。`,
+        `Learning is incomplete: ${result.learning.outboxPending ?? 0} context records queued, ${result.learning.pending} pending, ${result.learning.processing ?? 0} processing, ${result.learning.retryScheduled ?? 0} awaiting retry, ${result.learning.waiting} awaiting review, ${result.learning.failed} failed. Progress is saved; sync again later.`,
+      ),
+    );
 }
 
 function printAction(message: string, value: unknown, options: PersonalMemoryCommandOptions): void {

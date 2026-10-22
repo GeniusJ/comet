@@ -3,6 +3,10 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 
 import { inspectGitWorktree } from '../../platform/paths/git-worktree.js';
+import {
+  isWorkspaceRuntimeMigrationFence,
+  migrateWorkspaceRuntimeDirectory,
+} from '../workflow-contract/workspace-runtime.js';
 
 import { atomicWriteJson } from './native-atomic-file.js';
 import { readNativeBoundedTextFile } from './native-bounded-file.js';
@@ -33,10 +37,12 @@ import {
 } from './native-portable-runtime.js';
 import { readNativePortableState, writeNativePortableState } from './native-portable-state.js';
 import {
+  parseNativeLocalExecution,
   rebuildNativeLocalExecution,
   writeNativeLocalExecution,
 } from './native-local-execution.js';
 import { nativeLegacyChangeRuntimeDir, nativePreferredChangeRuntimeDir } from './native-paths.js';
+import { readNativeProtectedTextFile } from './native-protected-file.js';
 import type { NativePortableState, NativePortableWorkspace } from './native-portable-types.js';
 import type { NativeProjectPaths, NativeReadableChangeState } from './native-types.js';
 import { readNativeWorkspaceIdentity } from './native-workspace.js';
@@ -65,12 +71,29 @@ export async function hasIncompleteNativePortableMigration(
   name: string,
 ): Promise<boolean> {
   const changeDir = nativeChangeDir(paths, name);
+  const legacyRuntime = nativeLegacyChangeRuntimeDir(paths, name);
+  const fenced = await isWorkspaceRuntimeMigrationFence(
+    legacyRuntime,
+    nativePreferredChangeRuntimeDir(paths, name),
+    { projectRoot: paths.projectRoot, ignoreForeignWorkspaceFence: true },
+  );
   const artifacts = [
     nativePortableTransactionFile(paths, { kind: 'migration', change: name }),
-    nativeLegacyChangeRuntimeDir(paths, name),
+    ...(fenced ? [] : [legacyRuntime]),
     ...LEGACY_PROJECTION_FILES.map((file) => path.join(changeDir, file)),
   ];
   return (await Promise.all(artifacts.map(exists))).some(Boolean);
+}
+
+async function migrateLegacyRuntimeDirectory(
+  paths: NativeProjectPaths,
+  name: string,
+): Promise<void> {
+  await migrateWorkspaceRuntimeDirectory(
+    nativeLegacyChangeRuntimeDir(paths, name),
+    nativePreferredChangeRuntimeDir(paths, name),
+    { projectRoot: paths.projectRoot, ignoreForeignWorkspaceFence: true },
+  );
 }
 
 async function readTransaction(
@@ -105,32 +128,41 @@ async function cleanupLegacyMigrationArtifacts(
     options.removeVerificationReport === false
       ? LEGACY_PROJECTION_FILES
       : [...LEGACY_PROJECTION_FILES, LEGACY_VERIFICATION_REPORT];
-  await Promise.all([
-    fs.rm(nativePreferredChangeRuntimeDir(paths, name), {
-      recursive: true,
-      force: true,
-    }),
-    fs.rm(nativeLegacyChangeRuntimeDir(paths, name), {
-      recursive: true,
-      force: true,
-    }),
-    ...projectionFiles.map((file) =>
+  await Promise.all(
+    projectionFiles.map((file) =>
       fs.rm(path.join(nativeChangeDir(paths, name), file), { force: true }),
     ),
-  ]);
+  );
 }
 
 async function rebuildLocalExecution(
   paths: NativeProjectPaths,
   portable: NativePortableState,
 ): Promise<void> {
+  const file = nativeLocalExecutionFile(paths, portable.name);
+  try {
+    const snapshot = await readNativeProtectedTextFile({
+      root: paths.workspaceRuntimeRoot,
+      file,
+      maxBytes: null,
+      label: 'Native migration local execution',
+    });
+    const local = parseNativeLocalExecution(JSON.parse(snapshot.text));
+    if (local.change !== portable.name) {
+      throw new Error('Native migration local execution belongs to a different change');
+    }
+    // 有效的本机执行仍拥有 active checks；迁移旧文档投影不能重置它。
+    return;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
   await writeNativeLocalExecution(
-    nativeLocalExecutionFile(paths, portable.name),
+    file,
     rebuildNativeLocalExecution({
       portableState: portable,
       projectRoot: paths.projectRoot,
     }),
-    { containedRoot: paths.runtimeDir },
+    { containedRoot: paths.runtimeDir, exclusive: true },
   );
 }
 
@@ -226,6 +258,7 @@ export async function migrateNativeLegacyChangeToPortable(options: {
   name: string;
   now?: Date;
 }): Promise<NativePortableState> {
+  await migrateLegacyRuntimeDirectory(options.paths, options.name);
   return withNativeMutationLock(
     options.paths,
     `migrate ${options.name} to portable Native`,
@@ -235,13 +268,11 @@ export async function migrateNativeLegacyChangeToPortable(options: {
         ? await readNativePortableState(nativePortableStateFile(options.paths, options.name))
         : null;
       if (!transaction && portable) {
-        // The portable YAML is the durable migration boundary. If its journal was
-        // lost after that write, finish the deterministic cleanup and recreate the
-        // disposable local overlay instead of mistaking the migration for complete.
+        // YAML 已提交后只清理旧文档投影；保留迁移 fence、历史及有效本机执行。
+        await rebuildLocalExecution(options.paths, portable);
         await cleanupLegacyMigrationArtifacts(options.paths, options.name, {
           removeVerificationReport: false,
         });
-        await rebuildLocalExecution(options.paths, portable);
         return portable;
       }
 
@@ -285,6 +316,10 @@ export async function migrateNativeLegacyChangeToPortable(options: {
             );
           }
         } else if (step.action === 'cleanup-legacy-runtime') {
+          portable ??= await readNativePortableState(
+            nativePortableStateFile(options.paths, options.name),
+          );
+          await rebuildLocalExecution(options.paths, portable);
           await cleanupLegacyMigrationArtifacts(options.paths, options.name);
         } else if (step.action === 'commit-transaction') {
           portable ??= await readNativePortableState(

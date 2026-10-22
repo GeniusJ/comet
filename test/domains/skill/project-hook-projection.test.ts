@@ -1,6 +1,8 @@
+import { readNodeHookArguments } from '../../../platform/process/hook-command.js';
 import { promises as fs } from 'fs';
 import os from 'os';
 import path from 'path';
+import { spawnSync } from 'child_process';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { projectCometHooksFromInstalledScope } from '../../../domains/skill/project-hook-projection.js';
@@ -45,9 +47,14 @@ describe('project Hook projection', () => {
     ).resolves.toEqual({ installedPlatforms: ['codex'], failures: [] });
 
     const projectHooks = await fs.readFile(path.join(projectRoot, '.codex', 'hooks.json'), 'utf8');
-    expect(projectHooks.replaceAll('\\', '/')).toContain(
-      `${projectRoot.replaceAll('\\', '/')}/.agents/skills/comet/scripts/comet-hook-router.mjs`,
-    );
+    const command = JSON.parse(projectHooks).hooks.PreToolUse[0].hooks[0].command;
+    expect(readNodeHookArguments(command)).toEqual([
+      path.join(projectRoot, '.agents/skills/comet/scripts/comet-hook-router.mjs'),
+      '--platform',
+      'codex',
+      '--project-root',
+      projectRoot,
+    ]);
     await expect(
       fs.access(
         path.join(projectRoot, '.agents', 'skills', 'comet', 'scripts', 'comet-hook-router.mjs'),
@@ -56,6 +63,18 @@ describe('project Hook projection', () => {
     await expect(
       fs.access(path.join(projectRoot, '.comet', 'current-change.json')),
     ).rejects.toMatchObject({ code: 'ENOENT' });
+    const result = spawnSync(command, {
+      shell: true,
+      cwd: projectRoot,
+      encoding: 'utf8',
+      input: JSON.stringify({
+        cwd: projectRoot,
+        tool_name: 'Write',
+        tool_input: { file_path: 'example.txt' },
+      }),
+      timeout: 20_000,
+    });
+    expect(result.status, result.stderr).toBe(0);
   });
 
   it('reports a user-owned Kiro canonical Hook collision', async () => {

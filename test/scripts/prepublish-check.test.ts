@@ -74,6 +74,88 @@ async function makePublishFixture(): Promise<string> {
 }
 
 describe('prepublish security check', () => {
+  it('accepts the shipped SDK delivery preflight without treating a placeholder as a credential', async () => {
+    const root = await makePackageFixture();
+    await writeFile(
+      root,
+      'index.js',
+      await fs.readFile('domains/comet-classic/classic-sdk-application.ts', 'utf-8'),
+    );
+
+    const result = spawnSync(process.execPath, [prepublishCheck], {
+      cwd: root,
+      encoding: 'utf-8',
+    });
+
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+  });
+
+  it('rejects a real hard-coded claim credential in a published module', async () => {
+    const root = await makePackageFixture();
+    await writeFile(root, 'index.js', 'export const claimToken = "fixture-credential-123456";\n');
+
+    const result = spawnSync(process.execPath, [prepublishCheck], {
+      cwd: root,
+      encoding: 'utf-8',
+    });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('[SECURITY] Possible Secret/token found in index.js');
+  });
+
+  it.each([
+    'domains/comet-classic/classic-application.ts',
+    'domains/comet-native/native-sdk-continuation.ts',
+    'domains/workflow-generation/artifact-verification-entry.ts',
+  ])('accepts credential-free SDK modules in %s', async (source) => {
+    const root = await makePackageFixture();
+    await writeFile(root, 'index.js', await fs.readFile(source, 'utf-8'));
+    const result = spawnSync(process.execPath, [prepublishCheck], { cwd: root, encoding: 'utf-8' });
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+  });
+
+  it.each([
+    "claimToken: 'source-reference'",
+    'claimToken = "<claim-token>"',
+    'claimToken:\n"source-reference"',
+  ])('accepts the exact public claim placeholder: %s', async (source) => {
+    const root = await makePackageFixture();
+    await writeFile(root, 'index.js', source);
+    const result = spawnSync(process.execPath, [prepublishCheck], { cwd: root, encoding: 'utf-8' });
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+  });
+
+  it.each([
+    "claimToken: 'source-reference-123456'",
+    "claimToken: '<claim-token>-123456'",
+    "accessToken: 'source-reference'",
+    "password: '<claim-token>'",
+    "reclaimToken: 'source-reference'",
+    "$claimToken: 'source-reference'",
+    "éclaimToken: 'source-reference'",
+    "𝒙claimToken: 'source-reference'",
+    String.raw`\u{61}claimToken: 'source-reference'`,
+    "claimToken: 'source-reference' + '-private-1234567890'",
+    "claimToken: 'source-reference'.concat('-private-1234567890')",
+    "claimToken: 'source-reference' /* comment */ + '-private-1234567890'",
+    "claimToken: '<claim-token>'\n + '-private-1234567890'",
+    "claimToken: 'source-reference', claimToken: 'synthetic-credential-123456'",
+    "claimToken: 'synthetic-credential-123456', claimToken: '<claim-token>'",
+    "claimToken: '<claim-token>', api_key: 'abcdefghijklmnopqrstuvwxyz'",
+    "claimToken: '<claim-token>', secret: 'synthetic-credential-123456'",
+    'claimToken: "<claim-token>", key: "ghp_' + 'a'.repeat(36) + '"',
+    'claimToken: "<claim-token>", key: "sk-' + 'a'.repeat(24) + '"',
+    'claimToken: "<claim-token>", key: "xoxb-123456-abcdef"',
+    'claimToken: "<claim-token>", key: "AKIA' + 'A'.repeat(16) + '"',
+    'claimToken: "<claim-token>", key: "-----BEGIN PRIVATE KEY-----"',
+  ])('still rejects credential patterns beside or resembling placeholders: %s', async (source) => {
+    const root = await makePackageFixture();
+    await writeFile(root, 'index.js', source);
+    const result = spawnSync(process.execPath, [prepublishCheck], { cwd: root, encoding: 'utf-8' });
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(1);
+    expect(result.stderr).toContain('[SECURITY] Possible');
+  });
+
   it('packs the eval harness without derived artifacts', async () => {
     const root = await makePublishFixture();
     const npmCache = await fs.mkdtemp(path.join(os.tmpdir(), 'comet-npm-cache-'));

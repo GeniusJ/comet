@@ -11,8 +11,9 @@ import {
 } from '../../../domains/comet-native/native-change.js';
 import {
   inspectNativeHookGuard,
-  resolveActiveNativeHookChange,
+  listActiveNativeHookChanges,
   parseNativeHookRequest,
+  resolveActiveNativeHookChange,
   type NativeHookRequest,
 } from '../../../domains/comet-native/native-hook-guard.js';
 import { runNativeCli } from '../../../domains/comet-native/native-cli.js';
@@ -33,6 +34,10 @@ import {
 } from '../../../domains/comet-native/native-portable-runtime.js';
 import { confirmNativePortableShape } from '../../helpers/native-portable-confirmed-transition.js';
 import { createNativeRunnerChannel } from '../../../domains/comet-native/native-runner-protocol.js';
+import {
+  createNativeSdkRuntime,
+  inspectNativeSdkRun,
+} from '../../../domains/comet-native/native-runtime-ownership.js';
 import { runWithHookReadCache } from '../../../platform/process/hook-read-cache.js';
 import * as portableRuntime from '../../../domains/comet-native/native-portable-runtime.js';
 
@@ -131,6 +136,7 @@ describe('Native phase Hook guard', () => {
   it('discards the selected Hook snapshot before returning a candidate to Build', async () => {
     await writeProjectConfig(projectRoot, defaultProjectConfig());
     const { paths, state } = await portableBuild('hook-invalidates', 'docs');
+    await fs.writeFile(path.join(projectRoot, 'AGENTS.md'), 'Run checks.\n');
     await submitNativePortableBuilderCandidate({
       paths,
       name: state.name,
@@ -160,7 +166,16 @@ describe('Native phase Hook guard', () => {
         phase: 'verify',
       });
       expect(
-        await inspectNativeHookGuard(projectRoot, writeRequest('src/index.ts'), state.name),
+        await inspectNativeHookGuard(
+          projectRoot,
+          {
+            intent: 'write',
+            targets: ['AGENTS.md'],
+            toolName: 'Write',
+            writes: [{ path: 'AGENTS.md', content: 'Skip checks.\n' }],
+          },
+          state.name,
+        ),
       ).toMatchObject({ allowed: true, phase: 'build' });
       expect(await resolveActiveNativeHookChange(projectRoot, state.name)).toMatchObject({
         phase: 'build',
@@ -241,6 +256,183 @@ describe('Native phase Hook guard', () => {
     });
   });
 
+  it('guards an SDK-owned Shape from its Run while retaining the portable state file', async () => {
+    const created = await runNativeCli([
+      'new',
+      'sdk-guard',
+      '--runtime',
+      'sdk',
+      '--project-root',
+      projectRoot,
+      '--json',
+    ]);
+    expect(created.exitCode, created.stderr).toBe(0);
+
+    await expect(listActiveNativeHookChanges(projectRoot)).resolves.toContainEqual({
+      workflow: 'native',
+      name: 'sdk-guard',
+      phase: 'shape',
+    });
+    await expect(resolveActiveNativeHookChange(projectRoot, 'sdk-guard')).resolves.toMatchObject({
+      workflow: 'native',
+      name: 'sdk-guard',
+      phase: 'shape',
+    });
+    await expect(
+      inspectNativeHookGuard(projectRoot, writeRequest('src/index.ts'), 'sdk-guard'),
+    ).resolves.toMatchObject({ allowed: false, change: 'sdk-guard', phase: 'shape' });
+    await expect(
+      inspectNativeHookGuard(
+        projectRoot,
+        writeRequest('docs/comet/changes/sdk-guard/brief.md'),
+        'sdk-guard',
+      ),
+    ).resolves.toMatchObject({ allowed: true, change: 'sdk-guard', phase: 'shape' });
+
+    const paths = await nativeProjectPaths(projectRoot, 'docs');
+    const changeDir = path.join(paths.changesDir, 'sdk-guard');
+    await fs.writeFile(
+      path.join(changeDir, 'brief.md'),
+      '# Outcome\nShip the workflow.\n# Scope\nKeep compatibility.\n# Non-goals\nNone.\n# Acceptance examples\n- The workflow resumes.\n# Constraints and invariants\nPreserve state.\n# Decisions\nNone.\n# Open questions\nNone.\n# Verification expectations\nRun focused checks.\n',
+    );
+    await fs.mkdir(path.join(changeDir, 'specs', 'workflow'), { recursive: true });
+    await fs.writeFile(
+      path.join(changeDir, 'specs', 'workflow', 'spec.md'),
+      '# Workflow\nThe workflow resumes without losing confirmed work.\n',
+    );
+    const prepared = await runNativeCli([
+      'next',
+      'sdk-guard',
+      '--project-root',
+      projectRoot,
+      '--json',
+    ]);
+    expect(prepared.exitCode, prepared.stderr).toBe(0);
+    const stateVersion = (JSON.parse(prepared.stdout!) as { data: { stateVersion: number } }).data
+      .stateVersion;
+    const confirmed = await runNativeCli([
+      'next',
+      'sdk-guard',
+      '--confirmed',
+      '--summary',
+      'User approved Shape.',
+      '--expected-state-version',
+      String(stateVersion),
+      '--expected-action',
+      'confirm-shape',
+      '--project-root',
+      projectRoot,
+      '--json',
+    ]);
+    expect(confirmed.exitCode, confirmed.stderr).toBe(0);
+    await expect(
+      inspectNativeHookGuard(projectRoot, writeRequest('src/index.ts'), 'sdk-guard'),
+    ).resolves.toMatchObject({ allowed: true, change: 'sdk-guard', phase: 'build' });
+    await expect(
+      inspectNativeHookGuard(
+        projectRoot,
+        writeRequest('docs/comet/changes/sdk-guard/brief.md'),
+        'sdk-guard',
+      ),
+    ).resolves.toMatchObject({ allowed: true, change: 'sdk-guard', phase: 'build' });
+    const { run } = await inspectNativeSdkRun(projectRoot, 'sdk-guard');
+    const builder = run.actions.at(-1)!;
+    const runtime = createNativeSdkRuntime(projectRoot);
+    const context = { requestId: 'sdk-hook-builder', projectRoot };
+    const claimed = await runtime.claim({
+      runId: run.runId,
+      actionId: builder.id,
+      attempt: builder.attempt,
+      inputHash: builder.inputHash,
+      executorId: 'native-host',
+      sessionId: 'sdk-hook-builder-session',
+      claimToken: 'sdk-hook-builder-claim',
+      context,
+    });
+    await runtime.recordOutcome({
+      runId: run.runId,
+      outcome: {
+        actionId: builder.id,
+        attempt: builder.attempt,
+        inputHash: builder.inputHash,
+        claimToken: claimed.actions.find((action) => action.id === builder.id)!.claim!.token,
+        outcomeId: 'sdk-hook-builder-result',
+        status: 'succeeded',
+        output: {
+          summary: 'Implemented the workflow.',
+          addressedAcceptanceIds: ['A1'],
+          acceptanceReview: fixtureAcceptanceReview(['A1']),
+          checks: [],
+          knownLimits: [],
+          submittedAt: new Date().toISOString(),
+          verificationChecks: [
+            {
+              id: 'focused',
+              name: 'Focused check',
+              executable: process.execPath,
+              argv: ['-e', 'process.exit(0)'],
+              cwdRef: '.',
+              timeoutMs: 5_000,
+              repeatable: true,
+            },
+          ],
+        },
+      },
+      context,
+    });
+    const checked = await runNativeCli([
+      'next',
+      'sdk-guard',
+      '--project-root',
+      projectRoot,
+      '--json',
+    ]);
+    expect(checked.exitCode, checked.stderr).toBe(0);
+    await expect(
+      inspectNativeHookGuard(projectRoot, writeRequest('src/index.ts'), 'sdk-guard'),
+    ).resolves.toMatchObject({ allowed: false, change: 'sdk-guard', phase: 'verify' });
+    await expect(inspectNativeSdkRun(projectRoot, 'sdk-guard')).resolves.toMatchObject({
+      state: { phase: 'verify' },
+    });
+    const sourceFile = path.join(projectRoot, 'source.ts');
+    const source = 'export const value = 1;\n';
+    await fs.writeFile(sourceFile, source);
+    const beforeComment = await inspectNativeSdkRun(projectRoot, 'sdk-guard');
+    const commentRequest = parseNativeHookRequest(
+      JSON.stringify({
+        tool_name: 'Edit',
+        tool_input: {
+          file_path: sourceFile,
+          old_string: source,
+          new_string: '// Explain the value.\n' + source,
+        },
+      }),
+    );
+    await expect(
+      inspectNativeHookGuard(projectRoot, commentRequest, 'sdk-guard'),
+    ).resolves.toMatchObject({ allowed: true, phase: 'verify' });
+    expect((await inspectNativeSdkRun(projectRoot, 'sdk-guard')).run).toEqual(beforeComment.run);
+    await expect(
+      inspectNativeHookGuard(
+        projectRoot,
+        parseNativeHookRequest(
+          JSON.stringify({
+            tool_name: 'Edit',
+            tool_input: {
+              file_path: sourceFile,
+              old_string: source,
+              new_string: '// @ts-nocheck\n' + source,
+            },
+          }),
+        ),
+        'sdk-guard',
+      ),
+    ).resolves.toMatchObject({ allowed: false, phase: 'verify' });
+    await expect(
+      fs.readFile(path.join(paths.changesDir, 'sdk-guard', 'comet-state.yaml'), 'utf8'),
+    ).resolves.toContain('phase: verify');
+  });
+
   it('allows a configured project-local path during Native Shape', async () => {
     await writeProjectConfig(projectRoot, defaultProjectConfig('.'));
     await addHookAllowPath('docs/team-notes');
@@ -253,6 +445,24 @@ describe('Native phase Hook guard', () => {
       phase: 'shape',
       reason: expect.stringContaining('configured Hook allow path'),
     });
+  });
+
+  it('guards user-level Runtime files outside the project tree', async () => {
+    await writeProjectConfig(projectRoot, defaultProjectConfig('.'));
+    await activeChange('shape', 'home-runtime-guard');
+    const paths = await nativeProjectPaths(projectRoot, '.');
+    for (const target of [
+      path.join(paths.changesRuntimeDir, 'home-runtime-guard/state.json'),
+      path.join(paths.workspaceRuntimeRoot, 'state-projections/native/home-runtime-guard.json'),
+    ]) {
+      await expect(
+        inspectNativeHookGuard(projectRoot, writeRequest(target)),
+      ).resolves.toMatchObject({
+        allowed: false,
+        phase: 'shape',
+        reason: expect.stringContaining('Runtime-owned'),
+      });
+    }
   });
 
   it('does not let the allowlist bypass Native Runtime-owned files', async () => {
@@ -360,7 +570,7 @@ describe('Native phase Hook guard', () => {
     });
   });
 
-  it('invalidates a portable Verify candidate before allowing an implementation write', async () => {
+  it('keeps a portable Verify candidate pending when an implementation write has no content', async () => {
     await writeProjectConfig(projectRoot, defaultProjectConfig('.'));
     const { paths, state } = await portableBuild('portable-verify-write');
     const runner = createNativeRunnerChannel();
@@ -399,20 +609,19 @@ describe('Native phase Hook guard', () => {
     await expect(
       inspectNativeHookGuard(projectRoot, writeRequest('src/index.ts')),
     ).resolves.toMatchObject({
-      allowed: true,
-      phase: 'build',
-      reason: expect.stringContaining('candidate was invalidated'),
+      allowed: false,
+      phase: 'verify',
+      reason: expect.stringContaining('edit-review show native'),
     });
     await expect(readNativePortableChange(paths, state.name)).resolves.toMatchObject({
-      phase: 'build',
+      phase: 'verify',
       builder_handoff: {
         review: { reviewer_execution_ref: 'runtime-owned-state-reviewer' },
       },
-      verification: null,
     });
   });
 
-  it('allows concurrent implementation writes after invalidating one Verify candidate once', async () => {
+  it('keeps concurrent unclassified writes pending without revising the Verify candidate', async () => {
     await writeProjectConfig(projectRoot, defaultProjectConfig('.'));
     const { paths, state } = await portableBuild('portable-concurrent-write');
     const runner = createNativeRunnerChannel();
@@ -438,19 +647,19 @@ describe('Native phase Hook guard', () => {
     ]);
 
     expect(results).toEqual([
-      expect.objectContaining({ allowed: true, phase: 'build' }),
-      expect.objectContaining({ allowed: true, phase: 'build' }),
+      expect.objectContaining({ allowed: false, phase: 'verify' }),
+      expect.objectContaining({ allowed: false, phase: 'verify' }),
     ]);
     await expect(readNativePortableChange(paths, state.name)).resolves.toMatchObject({
-      phase: 'build',
-      loop: { iteration: 2 },
+      phase: 'verify',
+      loop: { iteration: 1 },
       builder_handoff: {
         review: { reviewer_execution_ref: 'concurrent-guard-reviewer' },
       },
     });
   });
 
-  it('preserves a Verify candidate for resource messages and still invalidates mixed file writes', async () => {
+  it('preserves a Verify candidate for resource messages and holds unclassified mixed writes', async () => {
     await writeProjectConfig(projectRoot, defaultProjectConfig('.'));
     const { paths, state } = await portableBuild('portable-resource-targets');
     const runner = createNativeRunnerChannel();
@@ -477,7 +686,7 @@ describe('Native phase Hook guard', () => {
     expect(await readNativePortableChange(paths, state.name)).toEqual(before);
     await expect(
       inspectNativeHookGuard(projectRoot, writeRequest('agent:/Main', 'src/new-file.ts')),
-    ).resolves.toMatchObject({ allowed: true, phase: 'build' });
+    ).resolves.toMatchObject({ allowed: false, phase: 'verify' });
   });
 
   it('keeps a portable Verify candidate valid for neutral document writes', async () => {
@@ -513,7 +722,7 @@ describe('Native phase Hook guard', () => {
     });
   });
 
-  it('still invalidates a portable Verify candidate when a material write mixes with documents', async () => {
+  it('holds an unclassified material write mixed with documents in Verify', async () => {
     await writeProjectConfig(projectRoot, defaultProjectConfig('.'));
     const { paths, state } = await portableBuild('portable-mixed-write');
     const runner = createNativeRunnerChannel();
@@ -536,12 +745,12 @@ describe('Native phase Hook guard', () => {
     await expect(
       inspectNativeHookGuard(projectRoot, writeRequest('README.md', 'src/index.ts')),
     ).resolves.toMatchObject({
-      allowed: true,
-      phase: 'build',
-      reason: expect.stringContaining('candidate was invalidated'),
+      allowed: false,
+      phase: 'verify',
+      reason: expect.stringContaining('edit-review show native'),
     });
     await expect(readNativePortableChange(paths, state.name)).resolves.toMatchObject({
-      phase: 'build',
+      phase: 'verify',
     });
   });
 

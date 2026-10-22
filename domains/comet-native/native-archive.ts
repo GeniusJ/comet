@@ -539,7 +539,7 @@ export async function archiveNativeChange(options: {
         }
         if (runtimeStorage.layout === 'legacy') {
           throw new Error(
-            `Native Archive requires project-local Runtime; run comet native doctor ${options.name} --repair`,
+            `Native Archive requires user-level Runtime; run comet native doctor ${options.name} --repair`,
           );
         }
         await writeNativeEvidenceProjection(options.paths, state.name, { now: options.now });

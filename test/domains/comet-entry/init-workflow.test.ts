@@ -39,6 +39,11 @@ describe('Comet init workflow policy', () => {
     '.comet/config.yaml',
     'openspec/changes/active-change/.comet.yaml',
     'openspec/changes/archive/old-change/.comet.yaml',
+    'openspec/changes/active-change/comet-state.yaml',
+    'openspec/changes/archive/old-change/comet-state.yaml',
+    'docs/openspec/changes/active-change/.comet.yaml',
+    'docs/openspec/changes/active-change/comet-state.yaml',
+    'docs/openspec/changes/archive/old-change/comet-state.yaml',
   ])('preserves the Classic fallback when legacy evidence exists at %s', async (legacyPath) => {
     const file = path.join(projectRoot, ...legacyPath.split('/'));
     await fs.mkdir(path.dirname(file), { recursive: true });
@@ -49,6 +54,52 @@ describe('Comet init workflow policy', () => {
       source: 'legacy-project',
       writeProjectConfig: false,
       legacyEvidence: [legacyPath],
+    });
+  });
+
+  it.each([
+    ['openspec/changes', false],
+    ['docs/openspec/changes', false],
+    ['openspec/changes', true],
+    ['docs/openspec/changes', true],
+  ] as const)(
+    'rejects dual Classic states under %s with existing config=%s',
+    async (changesPath, configured) => {
+      if (configured) await writeProjectConfig(projectRoot, defaultProjectConfig('docs'));
+      const changeDir = path.join(projectRoot, ...changesPath.split('/'), 'conflict');
+      await fs.mkdir(changeDir, { recursive: true });
+      await fs.writeFile(path.join(changeDir, 'comet-state.yaml'), 'phase: build\n');
+      await fs.writeFile(path.join(changeDir, '.comet.yaml'), 'phase: verify\n');
+      const before = await fs.readdir(changeDir);
+      await expect(resolveInitWorkflow(projectRoot)).rejects.toThrow(
+        /comet-state\.yaml.*\.comet\.yaml/u,
+      );
+      expect(await fs.readdir(changeDir)).toEqual(before);
+      expect(await fs.readFile(path.join(changeDir, 'comet-state.yaml'), 'utf8')).toBe(
+        'phase: build\n',
+      );
+      expect(await fs.readFile(path.join(changeDir, '.comet.yaml'), 'utf8')).toBe(
+        'phase: verify\n',
+      );
+    },
+  );
+
+  it('detects a dangling legacy state symlink as a conflict before initialization', async () => {
+    const changeDir = path.join(projectRoot, 'docs/openspec/changes/conflict');
+    await fs.mkdir(changeDir, { recursive: true });
+    await fs.writeFile(path.join(changeDir, 'comet-state.yaml'), 'phase: build\n');
+    try {
+      await fs.symlink('missing.yaml', path.join(changeDir, '.comet.yaml'), 'file');
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'EPERM') return;
+      throw error;
+    }
+    await expect(resolveInitWorkflow(projectRoot, { workflow: 'classic' })).rejects.toThrow(
+      /comet-state\.yaml.*\.comet\.yaml/u,
+    );
+    expect(await fs.readlink(path.join(changeDir, '.comet.yaml'))).toBe('missing.yaml');
+    await expect(fs.access(path.join(projectRoot, '.comet/config.yaml'))).rejects.toMatchObject({
+      code: 'ENOENT',
     });
   });
 

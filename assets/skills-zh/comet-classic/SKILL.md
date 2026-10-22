@@ -9,28 +9,37 @@ Classic 分为 Open → Design → Build → Verify → Archive 五个阶段。O
 
 ## 1. 确定目标与工作区
 
-开始或恢复前，按 `comet-classic/reference/classic-layout.md` 确定各产物目录对应的逻辑路径，并读取 `comet-classic/reference/scripts.md` 的“CLI 引导”章节。调用公开的 Comet CLI，通过 OpenSpec 适配器执行相关命令。所有参考按当前动作读取相关章节；已在上下文中且仍有效的规则不重复读取，也不因引用一个文件而通读其余章节。
+开始新任务或更换宿主时，必须读取并执行[宿主能力核对](../comet/reference/host-check.md)，在批准 Open 前确认当前流程所需的能力。执行配置改变后，只补核对新策略需要的能力。
+
+开始或恢复前，按 `comet-classic/reference/classic-layout.md` 解析产物路径，并执行 `comet-classic/reference/scripts.md` 的“CLI 引导”。使用公开 Comet CLI 和 OpenSpec 适配器。所有参考按当前动作读取相关章节，复用上下文中仍有效的规则。
 
 - 未明确调用 Classic、需要判定是否恢复已有工作时：读取 `comet-classic/reference/context-recovery.md` 的 Ambient Resume，按 `comet resume-probe . --stdin --json` 结果处理；只有 `auto_resume` 自动进入，`ask_user` 按 `reason` 使用 Ambient Resume 表格中的问题与选项提问，`out_of_scope`/`none` 不进入。
 - 启动新需求或目标 change 尚不明确时：读取 `comet-classic/reference/intent-frame.md` 的最小示例与目标选择规则，获取未归档的 change 列表后填写 CometIntentFrame，运行 `comet classic intent route --stdin`。Agent 只负责按证据填写意图字段，路由由 Runtime 计算；以返回结果为准，不另写一套自然语言评分规则。
-- 已明确目标 change 且该 change 已初始化（`.comet.yaml` 已存在）时：按下方绑定工作区；有多个未归档的 change 且尚未选定时，不提前绑定。新 change（尚未初始化）直接交 `/comet-open` 或对应预设 Skill，它们会先准备工作区再初始化，`workspace resolve` 对未初始化的 change 会报 not found。
+- 已明确目标 change 且已由 Runtime 初始化时：按下方绑定工作区；SDK 新 change 使用 `comet-state.yaml`，历史 `.comet.yaml` 原地读写，compat 初始化仍使用旧名，以 `state next` 返回的 Runtime 归属判断恢复路径，不能只看状态文件是否存在。有多个未归档的 change 且尚未选定时，不提前绑定。真正的新 change 直接交 `/comet-open` 或对应预设 Skill，它们会先准备工作区再初始化；`workspace resolve` 对未初始化的 change 会报 not found。
 
 ```bash
 comet classic workspace resolve <change-name> --json
 # 进入返回的 projectRoot 后选择 change
-comet state select <change-name>
-comet state next <name> --json
+comet state select <change-name> --json
 ```
 
-根据返回的 phase、configuration 和下一步路由继续。新 full change 交 `/comet-open`，由它准备工作区，并创建 OpenSpec 产物和 `.comet.yaml` 状态文件；已确认的 hotfix/tweak 分别交 `/comet-hotfix`、`/comet-tweak`，按各自预设完成初始化。不直接调用 `/opsx:new`。已有 change 缺少状态文件时，按 context-recovery.md 的“入口错误与恢复”核对 workflow 后恢复；文件格式异常时报告错误，不根据现有产物猜测阶段。
+同一 change 同时存在 `comet-state.yaml` 和 `.comet.yaml` 时（包括其中一个是失效符号链接）必须停止，保留两个文件并核对来源；不得静默择一、覆盖或自动改名。
+
+选择结果已包含当前 Runtime 归属、phase、revision 与 nextAction 时直接继续；只有缺少信息、外部状态变化或旧结果已过期时，才运行 `comet state next <change-name> --json` 补读。
+
+跨设备同步应携带实际状态文件、change 文档、引用工件、代码和项目配置；检查点不包含独立子 worktree 和未提交代码。复制到新设备的 SDK change 若在实际状态文件中有 `run_checkpoint`，具名 `state select` 或 `state next` 会恢复原阶段、Action 和确认；继续外部工作前先确认原设备的执行进程已停止。结果未明的 Action 先核对，不重发。只有旧状态文件缺少检查点、常规入口明确报告 Run 记录丢失时，才核对正式文档，说明显式恢复会回到 Open、旧确认和检查需要重做，取得用户同意后运行 `comet state restore <change-name> --confirmed`。
+
+响应已有 `agent.continuation.mode` 时，先按 `comet-classic/reference/auto-transition.md` 的统一规则处理，以 `mode` 决定执行、等待、提问、核对或结束；下文的 `nextAction.kind` 路由仅用于没有 `mode` 的旧响应。
+
+以 `data.runtimeFormat` 区分 `sdk` 与 `compat`，并按返回的 phase、configuration 和 `data.nextAction.kind` 继续。SDK 的 `action` 才能加载返回的 Skill；`decision`、`evidence`、`reconcile` 先进入对应阶段的恢复步骤，核对同一 Run 的待决定项、待提交证据或已领取 Action，不能把它们当作未执行的 Skill 重跑。旧 change 保持原有阶段路由。新 full change 交 `/comet-open`，由它准备工作区、创建 OpenSpec 产物并初始化 SDK Run；已确认的 hotfix/tweak 分别交 `/comet-hotfix`、`/comet-tweak`，按各自预设完成初始化。不直接调用 `/opsx:new`。已有 change 的 Runtime 归属与文件冲突或格式异常时，按 context-recovery.md 的“入口错误与恢复”停止并核对，不根据现有产物猜测阶段或新建第二份状态。
 
 新 full change 必须先确定工作区，再在 Open 阶段创建产物。full workflow 的 `isolation` 可为 `current`、`branch` 或 `worktree`；用户明确要求并行工作时准备 Worktree，其他情况按 `comet-classic/reference/workspace.md` 选择。hotfix/tweak 按各自初始化步骤确认并绑定工作区。恢复时使用已经绑定的工作区；分支归属发生变化时，根据用户已确认的选择执行 rebind，缺少有效授权时才询问。
 
 ## 2. 载入当前阶段
 
-执行同一组任务时，复用本次命令返回的状态信息和已读取的上下文。命令更新状态且响应已提供最新状态与 `agent.continuation` 时，直接继续；只有这些字段缺失、切换工作区、恢复会话时丢失上下文或发现外部变化，才重新查询。根据当前改动的风险选择检查范围，Verify 仍需完成一次覆盖最终实现的集成审查。
+同一组任务复用命令结果和已有上下文；响应含当前状态与 `agent.continuation` 时直接继续。只有字段缺失、工作区切换、恢复时丢失上下文或外部状态变化时才重新查询。按改动风险选择检查，Verify 负责一次最终集成审查。
 
-绑定工作区并取得 phase 后，读取并执行 [任务上下文与产物语言](reference/scripts.md#任务上下文与产物语言)，运行 `comet task`。按配置确定产物语言；根据 Context Manifest（上下文清单）中的摘要，只展开当前步骤还缺少的内容。实际使用某条内容后如实记录使用结果，任务结束时保存检查点。
+绑定工作区并取得 phase 后，以及阶段切换、换 Agent 或上下文恢复时，读取并执行 [任务上下文与产物语言](reference/scripts.md#任务上下文与产物语言)，优先使用当前 continuation 或已领取 Action 的 `contextRequest` 获取快照；同一阶段连续执行不重复获取。按配置确定产物语言；根据 Context Manifest（上下文清单）中的摘要，只展开当前步骤还缺少的内容。实际使用某条内容后如实记录使用结果，任务结束时保存检查点。
 
 记忆学习只提交可复用的用户信息；任务摘要、进展、命令输出和测试结果不写入个人记忆。任务结束前按任务上下文参考完成学习检查，并记录 `submitted`、`no-observation` 或 `not-run`。
 
@@ -48,7 +57,7 @@ comet state next <name> --json
 
 只有新需求才考虑推荐轻量流程：风险符合预设要求且用户已明确选择时直接进入；由 Agent 推荐时，说明依据，并展示 hotfix/tweak 与保留 full 的选项及各自影响，等待用户确认。不得擅自把已有 full change 改成轻量流程。公共 API、数据迁移、安全、并发或跨模块设计应按实际风险处理，不能因为文件少就省略必要步骤。
 
-运行 hotfix/tweak 时必须读取所选预设的“升级判定”：出现其中列出的升级条件，或改动文件数超过提示阈值时，展示继续预设或升级 full 的选择并等待答复；用户选择升级后才运行 `comet state transition <name> preset-escalate`。`verify_mode` 只决定验证级别，不能替代 workflow 选择或预设升级确认。
+运行 hotfix/tweak 时，SDK 必须读取并执行[预设范围复核](reference/sdk-methods.md#预设范围复核)，按该节核对并复用仍有效的 `rulings.md` 授权；Compat 读取所选预设的 `reference/compat.md` 中“升级判定”。仅文件数超限时先核对范围和已有授权，需要新决定时才展示继续预设或升级 full 的选项。用户选择升级后，使用当前 Run 的 continuation 或 Compat 对应命令推进。`verify_mode` 只决定验证级别，不能替代 workflow 选择或预设升级确认。
 
 恢复会话、外部状态变化，或计划、任务、审查、交付记录与实际情况不一致时，读取 `comet-classic/reference/context-recovery.md`，根据当前阶段入口返回的 nextAction 确定还有哪些步骤未完成。沿用仍有效的配置和成果；任务未勾选不等于尚未实现。具体恢复步骤以该参考文件为准。
 

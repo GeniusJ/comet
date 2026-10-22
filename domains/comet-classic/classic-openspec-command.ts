@@ -1,8 +1,16 @@
+import { resolveClassicChangeDirectory } from './classic-paths.js';
 import path from 'node:path';
 import { spawnSync } from 'child_process';
 
-import { resolveNodeCliCommand } from '../../platform/process/node-cli-command.js';
+import {
+  assertNodeCliCommandAvailable,
+  resolveNodeCliCommand,
+} from '../../platform/process/node-cli-command.js';
 import { projectCliAgentObservation } from '../workflow-contract/output-envelope.js';
+import {
+  listSdkChangeNames,
+  readSdkChangeOwner,
+} from '../workflow-contract/change-runtime-owner.js';
 import { classicIssue } from './classic-issues.js';
 
 import type { ClassicCommandHandler, ClassicCommandResult } from './classic-cli.js';
@@ -16,6 +24,27 @@ import { writeClassicProjectText } from './classic-protected-path.js';
 
 function normalizedArguments(args: readonly string[]): string[] {
   return args[0] === '--' ? args.slice(1) : [...args];
+}
+
+async function assertPublicArchiveNotSdkOwned(args: readonly string[]): Promise<void> {
+  const forwarded = normalizedArguments(args);
+  if (forwarded[0] !== 'archive') return;
+  const root = await discoverClassicProject(process.cwd());
+  const change = forwarded[1];
+  if (change && !change.startsWith('-')) {
+    await resolveClassicChangeDirectory(change, root);
+    if (await readSdkChangeOwner(root, 'classic', change)) {
+      throw new Error(
+        `Classic SDK change '${change}' must use the Comet SDK Archive flow; OpenSpec archive would bypass its Run and leave the change incomplete.`,
+      );
+    }
+    return;
+  }
+  if ((await listSdkChangeNames(root, 'classic')).length > 0) {
+    throw new Error(
+      'Classic SDK changes require the Comet SDK Archive flow; specify a non-SDK change when using the OpenSpec adapter.',
+    );
+  }
 }
 
 function takeCustomOption(args: string[], name: string): string | undefined {
@@ -85,10 +114,26 @@ async function discoverClassicCapability(
   }
 }
 
+/** 在领取 Archive Action 前检查依赖；不执行 OpenSpec 命令。 */
+export async function assertClassicOpenSpecAvailable(startPath = process.cwd()): Promise<void> {
+  const projectRoot = await discoverClassicProject(startPath);
+  const layout = await assertClassicLayoutWritable(projectRoot);
+  await assertClassicOpenSpecRootHealthy(projectRoot, layout);
+  const command = process.env.COMET_OPENSPEC || 'openspec';
+  try {
+    assertNodeCliCommandAvailable(command, [], { cwd: layout.openSpecBase });
+  } catch (error) {
+    throw new Error(
+      `OpenSpec CLI unavailable: ${command}: ${error instanceof Error ? error.message : String(error)}`,
+      { cause: error },
+    );
+  }
+}
+
 export async function executeClassicOpenSpec(
   args: readonly string[],
   startPath = process.cwd(),
-): Promise<ClassicCommandResult> {
+): Promise<ClassicCommandResult & { executionStarted?: false }> {
   const openSpecArgs = normalizedArguments(args);
   if (openSpecArgs.length === 0) {
     return {
@@ -101,7 +146,18 @@ export async function executeClassicOpenSpec(
   const layout = await assertClassicLayoutWritable(projectRoot);
   await assertClassicOpenSpecRootHealthy(projectRoot, layout);
   const command = process.env.COMET_OPENSPEC || 'openspec';
-  const launch = resolveNodeCliCommand(command, openSpecArgs, { cwd: layout.openSpecBase });
+  let launch: ReturnType<typeof resolveNodeCliCommand>;
+  try {
+    assertNodeCliCommandAvailable(command, openSpecArgs, { cwd: layout.openSpecBase });
+    launch = resolveNodeCliCommand(command, openSpecArgs, { cwd: layout.openSpecBase });
+  } catch (error) {
+    // 启动器或其 Node 入口在领取后消失时，尚未调用 spawnSync。
+    return {
+      exitCode: (error as NodeJS.ErrnoException).code === 'ENOENT' ? 127 : 70,
+      executionStarted: false,
+      stderr: error instanceof Error ? error.message : String(error),
+    };
+  }
   const result = spawnSync(launch.command, launch.args, {
     cwd: layout.openSpecBase,
     encoding: 'utf8',
@@ -115,6 +171,10 @@ export async function executeClassicOpenSpec(
     const code = (result.error as NodeJS.ErrnoException).code;
     return {
       exitCode: code === 'ENOENT' ? 127 : 70,
+      // 只接受操作系统确认未启动的错误；退出码或错误文本不能证明没有副作用。
+      ...(result.pid === 0 && ['ENOENT', 'EACCES', 'ENOTDIR', 'ENOEXEC'].includes(code ?? '')
+        ? { executionStarted: false as const }
+        : {}),
       stdout: result.stdout || undefined,
       stderr:
         result.stderr ||
@@ -141,6 +201,7 @@ async function agentOpenSpec(args: string[]): Promise<ClassicCommandResult> {
   const capabilityDiscovery = await discoverClassicCapability(root, layout, task, capability);
   let result: ClassicCommandResult;
   try {
+    await assertPublicArchiveNotSdkOwned(forwarded);
     result = await executeClassicOpenSpec(forwarded, root);
   } catch (error) {
     result = { exitCode: 70, stderr: error instanceof Error ? error.message : String(error) };
@@ -253,7 +314,10 @@ async function agentOpenSpec(args: string[]): Promise<ClassicCommandResult> {
 
 export const classicOpenSpecCommand: ClassicCommandHandler = async (args) => {
   // Opt-in agent projection leaves the historical raw upstream stdout/JSON contract intact.
-  if (args[0] !== '--agent-json') return executeClassicOpenSpec(args);
+  if (args[0] !== '--agent-json') {
+    await assertPublicArchiveNotSdkOwned(args);
+    return executeClassicOpenSpec(args);
+  }
   try {
     return await agentOpenSpec(args);
   } catch (error) {

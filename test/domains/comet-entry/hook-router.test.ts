@@ -1,3 +1,4 @@
+import { resolveWorkspaceRuntimeRoot } from '../../../domains/workflow-contract/workspace-runtime.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { promises as fs } from 'fs';
 import os from 'os';
@@ -170,6 +171,133 @@ describe('Comet Hook Router', () => {
     expect(listClassic).not.toHaveBeenCalled();
     expect(inspectNative).not.toHaveBeenCalled();
     expect(inspectClassic).not.toHaveBeenCalled();
+  });
+
+  it.each(['none', 'native', 'classic', 'application'])(
+    'protects user-level Runtime before resolving %s ownership',
+    async (selection) => {
+      if (selection !== 'none') {
+        await configureBoth();
+        await fs.writeFile(
+          path.join(root, '.comet/current-change.json'),
+          JSON.stringify({
+            schema: 'comet.selection.v2',
+            workflow: selection,
+            change: 'runtime-guard',
+            branch: null,
+            ...(selection === 'application' ? { applicationId: 'custom-app' } : {}),
+          }),
+        );
+      }
+      const runtimeRoot = await resolveWorkspaceRuntimeRoot(root);
+      const inspectNative = vi.fn();
+      const inspectClassic = vi.fn();
+      const dependencies = {
+        listNative: vi.fn(async () => []),
+        listClassic: vi.fn(async () => []),
+        inspectNative,
+        inspectClassic,
+      };
+      for (const ref of [
+        'native/changes/runtime-guard/state.json',
+        'sdk-runs/classic/current.json',
+        'applications/custom-app/run.json',
+        'change-owners/native/runtime-guard.json',
+      ]) {
+        const decision = await inspectCometHook(
+          root,
+          {
+            intent: 'write',
+            targets: ['src/main.ts', path.join(runtimeRoot, ref)],
+            toolName: 'Write',
+          },
+          dependencies,
+        );
+        expect(decision).toMatchObject({
+          allowed: false,
+          reason: expect.stringContaining('Runtime-owned'),
+        });
+      }
+      expect(inspectNative).not.toHaveBeenCalled();
+      expect(inspectClassic).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(['runtime', 'project-subdirectory'])(
+    'protects relative Runtime targets resolved from the host %s cwd',
+    async (cwdKind) => {
+      const runtimeRoot = await resolveWorkspaceRuntimeRoot(root);
+      const cwd = cwdKind === 'runtime' ? runtimeRoot : path.join(root, 'nested');
+      await expect(
+        inspectCometHook(root, {
+          intent: 'write',
+          targets: [path.relative(cwd, path.join(runtimeRoot, 'native/checkpoint.json'))],
+          toolName: 'Write',
+          cwd,
+        }),
+      ).resolves.toMatchObject({
+        allowed: false,
+        reason: expect.stringContaining('Runtime-owned'),
+      });
+    },
+  );
+
+  it('does not expand ordinary project scope using host cwd candidates', async () => {
+    const dependencies = {
+      listNative: vi.fn(async () => []),
+      listClassic: vi.fn(async () => []),
+      inspectNative: vi.fn(),
+      inspectClassic: vi.fn(),
+    };
+    await expect(
+      inspectCometHook(
+        root,
+        {
+          intent: 'write',
+          targets: ['../src/app.ts'],
+          toolName: 'Write',
+          cwd: path.join(root, 'nested'),
+        },
+        dependencies,
+      ),
+    ).resolves.toMatchObject({
+      allowed: true,
+      reason: 'Write targets are outside the guarded project',
+    });
+    expect(dependencies.listNative).not.toHaveBeenCalled();
+    expect(dependencies.listClassic).not.toHaveBeenCalled();
+    expect(dependencies.inspectNative).not.toHaveBeenCalled();
+    expect(dependencies.inspectClassic).not.toHaveBeenCalled();
+  });
+
+  it('protects a linked alias of user-level Runtime while leaving another workspace alone', async () => {
+    const runtimeRoot = await resolveWorkspaceRuntimeRoot(root);
+    const alias = path.join(root, 'linked-runtime');
+    await fs.symlink(runtimeRoot, alias, process.platform === 'win32' ? 'junction' : 'dir');
+    const dependencies = {
+      listNative: vi.fn(async () => []),
+      listClassic: vi.fn(async () => []),
+      inspectNative: vi.fn(),
+      inspectClassic: vi.fn(),
+    };
+    await expect(
+      inspectCometHook(
+        root,
+        { intent: 'write', targets: [path.join(alias, 'native/state.json')], toolName: 'Write' },
+        dependencies,
+      ),
+    ).resolves.toMatchObject({ allowed: false, reason: expect.stringContaining('Runtime-owned') });
+    const other = path.join(
+      path.dirname(path.dirname(runtimeRoot)),
+      'different-workspace/runtime/native/state.json',
+    );
+    await expect(
+      inspectCometHook(
+        root,
+        { intent: 'write', targets: [other], toolName: 'Write' },
+        dependencies,
+      ),
+    ).resolves.toMatchObject({ allowed: true });
   });
 
   it('fails closed when the scope of an explicit write target cannot be determined', async () => {

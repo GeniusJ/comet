@@ -5,17 +5,21 @@ import { pathToFileURL } from 'node:url';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { inspectCometHook } from '../../../domains/comet-entry/hook-router.js';
+import {
+  inspectCometHook,
+  inspectCometRuntimeWriteTargets,
+} from '../../../domains/comet-entry/hook-router.js';
 import {
   main,
   isDirectEntry,
-  projectRootFrom,
   runCometHookRouter,
 } from '../../../domains/comet-entry/hook-router-entry.js';
+import { projectRootFrom } from '../../../domains/comet-entry/hook-router-guard-entry.js';
 import { resolveCometHookProjectRoot } from '../../../domains/comet-entry/hook-project-root.js';
 
 vi.mock('../../../domains/comet-entry/hook-router.js', () => ({
   inspectCometHook: vi.fn(),
+  inspectCometRuntimeWriteTargets: vi.fn(async () => null),
 }));
 
 vi.mock('../../../domains/comet-entry/hook-project-root.js', () => ({
@@ -27,6 +31,7 @@ describe('Comet Hook Router entry', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.mocked(inspectCometRuntimeWriteTargets).mockResolvedValue(null);
     process.env.FILE_PATH = 'src/entry.ts';
     stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
   });
@@ -91,6 +96,24 @@ describe('Comet Hook Router entry', () => {
     expect(stderr).toHaveBeenCalledWith(
       expect.stringContaining('Comet Hook Router failed closed during project discovery'),
     );
+  });
+
+  it('retains an explicit unconfigured workspace when a Runtime write needs protection', async () => {
+    const plain = await mkdtemp(path.join(tmpdir(), 'comet-router-runtime-only-'));
+    try {
+      vi.mocked(inspectCometRuntimeWriteTargets).mockResolvedValue({
+        allowed: false,
+        reason: 'Runtime-owned',
+      });
+      await expect(
+        projectRootFrom(
+          { platformId: 'codex', projectRoot: plain },
+          { intent: 'write', targets: ['/user/runtime/state.json'], toolName: 'Write' },
+        ),
+      ).resolves.toBe(plain);
+    } finally {
+      await rm(plain, { recursive: true, force: true });
+    }
   });
 
   it('requires a valid Comet config and keeps a legacy invocation neutral without a request cwd', async () => {

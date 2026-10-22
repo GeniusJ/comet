@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import * as net from 'node:net';
 import path from 'node:path';
 import { recordCometGitCommand } from '../../../platform/process/runtime-metrics.js';
@@ -122,7 +122,17 @@ describe('Comet daemon protocol', () => {
       ok: true,
       status: { buildId: 'test-build' },
     });
-    expect(status.status?.activeRequests).toBeGreaterThanOrEqual(1);
+    expect(status.status?.activeRequests).toBe(0);
+    expect(status.status?.requestCount).toBe(1);
+    const metrics = server.status().lastRequest;
+    await sendCometDaemonRequest({
+      endpoint,
+      buildId: 'test-build',
+      projectRoot,
+      control: 'status',
+    });
+    expect(server.status().requestCount).toBe(1);
+    expect(server.status().lastRequest).toEqual(metrics);
   });
 
   it('rejects a request from another build before invoking the handler', async () => {
@@ -149,6 +159,52 @@ describe('Comet daemon protocol', () => {
     });
     expect(response).toMatchObject({ ok: false, error: 'daemon build mismatch' });
     expect(calls).toBe(0);
+  });
+  it('lets an idle process exit while status observations continue', async () => {
+    // 只推进空闲时钟，避免 CI 调度延迟让观察请求落在服务器正常退出之后。
+    vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+    try {
+      const projectRoot = process.cwd();
+      const buildId = 'idle-observations';
+      const endpoint = resolveCometDaemonEndpoint(projectRoot, buildId);
+      const server = await createCometDaemonServer({
+        endpoint,
+        buildId,
+        projectRoot,
+        idleTimeoutMs: 250,
+        handler: async () => ({ exitCode: 0 }),
+      });
+      servers.push(server);
+      for (let index = 0; index < 3; index++) {
+        await vi.advanceTimersByTimeAsync(50);
+        const response = await sendCometDaemonRequest({
+          endpoint,
+          buildId,
+          projectRoot,
+          control: 'status',
+        });
+        expect(response).toMatchObject({
+          ok: true,
+          status: { idleForMs: (index + 1) * 50, requestCount: 0 },
+        });
+      }
+      await vi.advanceTimersByTimeAsync(100);
+      await expect(
+        sendCometDaemonRequest({
+          endpoint,
+          buildId,
+          projectRoot,
+          control: 'status',
+          timeoutMs: 500,
+        }),
+      ).rejects.toMatchObject({ code: expect.stringMatching(/^(ENOENT|ECONNREFUSED)$/u) });
+    } finally {
+      try {
+        await Promise.all(servers.splice(0).map((server) => server.close()));
+      } finally {
+        vi.useRealTimers();
+      }
+    }
   });
 
   it('stops through the control channel', async () => {

@@ -4,13 +4,20 @@ import { promises as fs } from 'fs';
 import os from 'os';
 import path from 'path';
 
+import { resolveNodeCliCommand } from '../../../platform/process/node-cli-command.js';
+import { executeClassicOpenSpec } from '../../../domains/comet-classic/classic-openspec-command.js';
 import { runClassicCli } from '../../../domains/comet-classic/classic-cli.js';
+import {
+  COMET_CHANGE_OWNER_SCHEMA,
+  registerSdkChangeOwner,
+} from '../../../domains/workflow-contract/change-runtime-owner.js';
 
 vi.mock('child_process', () => ({
   spawnSync: vi.fn(),
 }));
 vi.mock('../../../platform/process/node-cli-command.js', () => ({
-  resolveNodeCliCommand: (command: string, args: string[]) => ({ command, args }),
+  assertNodeCliCommandAvailable: vi.fn(),
+  resolveNodeCliCommand: vi.fn((command: string, args: string[]) => ({ command, args })),
 }));
 
 const mockedSpawnSync = vi.mocked(spawnSync);
@@ -62,7 +69,9 @@ describe('Classic OpenSpec adapter', () => {
       status: 1,
       signal: null,
     });
-    expect((await runClassicCli(['state', 'init', 'demo', 'full'])).exitCode).toBe(0);
+    expect(
+      (await runClassicCli(['state', 'init', 'demo', 'full', '--runtime', 'compat'])).exitCode,
+    ).toBe(0);
     const previousForcePhase = process.env.COMET_FORCE_PHASE;
     process.env.COMET_FORCE_PHASE = '1';
     try {
@@ -101,6 +110,27 @@ describe('Classic OpenSpec adapter', () => {
       stdout: '{"changes":[]}\n',
       stderr: 'warning\n',
     });
+  });
+
+  it('does not forward an SDK-owned Archive through the public OpenSpec adapter', async () => {
+    const change = path.join(projectRoot, 'docs', 'openspec', 'changes', 'demo');
+    await fs.mkdir(change, { recursive: true });
+    await fs.writeFile(path.join(change, '.comet.yaml'), 'workflow: full\nphase: archive\n');
+    await registerSdkChangeOwner(projectRoot, {
+      schema: COMET_CHANGE_OWNER_SCHEMA,
+      workflow: 'classic',
+      change: 'demo',
+      format: 'sdk',
+      application: 'classic-full',
+      runId: 'demo',
+    });
+    const result = await runClassicCli(['openspec', '--', 'archive', 'demo', '--yes']);
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toMatch(/SDK.*Archive/);
+    expect(mockedSpawnSync).not.toHaveBeenCalled();
+    await expect(
+      fs.stat(path.join(projectRoot, 'docs', 'openspec', 'changes', 'demo', '.comet.yaml')),
+    ).resolves.toBeDefined();
   });
 
   it('uses the configured docs root when a standalone OpenSpec root also exists', async () => {
@@ -335,4 +365,46 @@ describe('Classic OpenSpec adapter', () => {
       fs.access(path.join(projectRoot, 'docs', 'openspec', 'changes', 'demo', '.comet.yaml')),
     ).resolves.toBeUndefined();
   });
+
+  it.each([
+    { code: 'ENOENT', pid: 0, notStarted: true },
+    { code: 'EACCES', pid: 0, notStarted: true },
+    { code: 'ENOEXEC', pid: 0, notStarted: true },
+    { code: 'ETIMEDOUT', pid: 42, notStarted: false },
+    { code: 'ENOBUFS', pid: 42, notStarted: false },
+    { code: 'ENOENT', pid: 42, notStarted: false },
+    { code: 'EIO', pid: 0, notStarted: false },
+  ])(
+    'classifies spawn $code with pid $pid without guessing from output',
+    async ({ code, pid, notStarted }) => {
+      mockedSpawnSync.mockReturnValue({
+        pid,
+        output: [null, '', 'OpenSpec CLI not found: misleading stderr'],
+        stdout: '',
+        stderr: 'OpenSpec CLI not found: misleading stderr',
+        status: null,
+        signal: null,
+        error: Object.assign(new Error(`spawn openspec ${code}`), { code }),
+      });
+      const result = await executeClassicOpenSpec(['archive', 'demo', '--yes'], projectRoot);
+      expect(result.executionStarted).toBe(notStarted ? false : undefined);
+      expect(result.exitCode).not.toBe(0);
+    },
+  );
+
+  it.each([
+    { message: 'ENOENT: missing openspec.cmd', code: 'ENOENT', exitCode: 127 },
+    { message: 'Node CLI entry is missing: openspec.js', code: undefined, exitCode: 70 },
+    { message: 'Unsupported Node CLI shim: openspec.cmd', code: undefined, exitCode: 70 },
+  ])(
+    'reports resolver failure before any process starts: $message',
+    async ({ message, code, exitCode }) => {
+      vi.mocked(resolveNodeCliCommand).mockImplementationOnce(() => {
+        throw Object.assign(new Error(message), { code });
+      });
+      const result = await executeClassicOpenSpec(['archive', 'demo', '--yes'], projectRoot);
+      expect(result).toEqual({ exitCode, executionStarted: false, stderr: message });
+      expect(mockedSpawnSync).not.toHaveBeenCalled();
+    },
+  );
 });

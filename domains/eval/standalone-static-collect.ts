@@ -17,6 +17,9 @@ export interface StaticCollectOptions {
   judgeModel?: string;
   judgeBaseUrl?: string;
   profile?: string;
+  judgeEnabled?: boolean;
+  environment?: NodeJS.ProcessEnv;
+  onManifest?: (file: string) => void;
 }
 
 const AGENT_IDS = ['claude-code', 'codex', 'qoder', 'codebuddy'] as const;
@@ -76,16 +79,19 @@ export interface InstalledCustomAgent {
   id: string;
   modelEnv?: string;
   baseUrlEnv?: string;
+  credentials?: string[];
 }
 
 /** Read only the explicitly installed adapter metadata needed by static collection. */
 export async function loadInstalledCustomAgent(
   agentId: string,
+  environment: NodeJS.ProcessEnv = process.env,
+  options: { includeCredentials?: boolean } = {},
 ): Promise<InstalledCustomAgent | null> {
   if ((AGENT_IDS as readonly string[]).includes(agentId)) return null;
   if (!CUSTOM_AGENT_ID_RE.test(agentId)) return null;
 
-  const configuredRoot = process.env.COMET_EVAL_ADAPTERS_DIR;
+  const configuredRoot = environment.COMET_EVAL_ADAPTERS_DIR;
   const registry = path.resolve(
     configuredRoot || path.join(os.homedir(), '.comet', 'eval', 'adapters'),
   );
@@ -228,7 +234,12 @@ export async function loadInstalledCustomAgent(
       );
     return value;
   };
-  return { id: agentId, modelEnv: env('modelEnv'), baseUrlEnv: env('baseUrlEnv') };
+  return {
+    id: agentId,
+    modelEnv: env('modelEnv'),
+    baseUrlEnv: env('baseUrlEnv'),
+    ...(options.includeCredentials ? { credentials: credentials as string[] } : {}),
+  };
 }
 function validateModel(value: unknown, field: string, required = false) {
   if (value === undefined) {
@@ -261,18 +272,22 @@ function validateBaseUrl(data: Record<string, unknown>, field: string) {
     throw new Error(`${field}.baseUrl: must be a valid absolute http(s) URL`);
   }
 }
-function environmentValue(keys: string[]): string | undefined {
-  return keys.map((key) => process.env[key]?.trim()).find((value) => value);
+function environmentValue(
+  keys: string[],
+  environment: NodeJS.ProcessEnv = process.env,
+): string | undefined {
+  return keys.map((key) => environment[key]?.trim()).find((value) => value);
 }
-function judgeFlagEnabled(): boolean {
+function judgeFlagEnabled(environment: NodeJS.ProcessEnv = process.env): boolean {
   return ['1', 'true', 'yes', 'on'].includes(
-    (process.env.BENCH_LLM_JUDGE ?? '').trim().toLowerCase(),
+    (environment.BENCH_LLM_JUDGE ?? '').trim().toLowerCase(),
   );
 }
 async function validateExecutionConfig(
   options: StaticCollectOptions,
   manifest?: Record<string, unknown>,
 ): Promise<{ agent: string; adapter: InstalledCustomAgent | null }> {
+  const environment = options.environment ?? process.env;
   if (options.agent !== undefined) validateAgentId(options.agent, 'CLI evaluation agent');
   validateModel(options.model, 'CLI evaluation model');
   if (options.baseUrl !== undefined)
@@ -295,11 +310,11 @@ async function validateExecutionConfig(
   const configuredAgent =
     options.agent ??
     (typeof execution.agent === 'string' ? execution.agent : undefined) ??
-    (typeof process.env.BENCH_EVAL_AGENT === 'string' && process.env.BENCH_EVAL_AGENT.trim()
-      ? process.env.BENCH_EVAL_AGENT.trim()
+    (typeof environment.BENCH_EVAL_AGENT === 'string' && environment.BENCH_EVAL_AGENT.trim()
+      ? environment.BENCH_EVAL_AGENT.trim()
       : undefined) ??
     'claude-code';
-  const adapter = await loadInstalledCustomAgent(configuredAgent);
+  const adapter = await loadInstalledCustomAgent(configuredAgent, environment);
   const configuredBaseUrl =
     options.baseUrl ??
     (typeof execution.baseUrl === 'string'
@@ -310,6 +325,7 @@ async function validateExecutionConfig(
             adapter?.baseUrlEnv
               ? [adapter.baseUrlEnv]
               : (BUILTIN_BASE_URL_ENVS[configuredAgent] ?? []),
+            environment,
           ));
   if (configuredBaseUrl !== undefined) validateBaseUrl({ baseUrl: configuredBaseUrl }, 'execution');
   if (adapter?.id && configuredBaseUrl && !adapter.baseUrlEnv) {
@@ -317,25 +333,30 @@ async function validateExecutionConfig(
       `custom Agent ${adapter.id} must declare baseUrlEnv before execution.baseUrl can be used`,
     );
   }
-  const judge = manifest?.judge as Record<string, unknown> | undefined;
+  const judgeDisabled =
+    options.judgeEnabled === false ||
+    (environment.COMET_EVAL_MANAGED === '1' && environment.COMET_EVAL_MANAGED_JUDGE === '0');
+  const judge = judgeDisabled
+    ? undefined
+    : (manifest?.judge as Record<string, unknown> | undefined);
   const configuredJudge =
     options.judgeAgent ??
     (typeof judge?.agent === 'string' ? judge.agent : undefined) ??
     (judge ||
     options.judgeModel !== undefined ||
     options.judgeBaseUrl !== undefined ||
-    judgeFlagEnabled()
+    (!judgeDisabled && judgeFlagEnabled(environment))
       ? configuredAgent
       : undefined);
-  if (configuredJudge) await loadInstalledCustomAgent(configuredJudge);
+  if (configuredJudge) await loadInstalledCustomAgent(configuredJudge, environment);
   const configuredJudgeModel =
     options.judgeModel ??
     (typeof judge?.model === 'string' ? judge.model : undefined) ??
-    environmentValue(['BENCH_JUDGE_MODEL']);
+    environmentValue(['BENCH_JUDGE_MODEL'], environment);
   const judgeEnabled = Boolean(configuredJudge);
   if (judgeEnabled && !configuredJudgeModel) {
     throw new Error(
-      judgeFlagEnabled()
+      judgeFlagEnabled(environment)
         ? 'BENCH_JUDGE_MODEL is required when BENCH_LLM_JUDGE=1'
         : 'judge.model: is required when LLM-as-Judge is enabled',
     );
@@ -346,7 +367,7 @@ async function validateExecutionConfig(
       ? judge.baseUrl
       : typeof judge?.base_url === 'string'
         ? judge.base_url
-        : environmentValue(['BENCH_JUDGE_BASE_URL']));
+        : environmentValue(['BENCH_JUDGE_BASE_URL'], environment));
   if (configuredJudgeBaseUrl !== undefined)
     validateBaseUrl({ baseUrl: configuredJudgeBaseUrl }, 'judge');
   return { agent: configuredAgent, adapter };
@@ -812,7 +833,7 @@ export async function collectStandaloneTasks(
     const execution = (manifest?.execution as Record<string, unknown> | undefined) ?? {};
     const configuredModel = execution.model;
     const customModel = executionConfig.adapter?.modelEnv
-      ? process.env[executionConfig.adapter.modelEnv]?.trim() || undefined
+      ? (options.environment ?? process.env)[executionConfig.adapter.modelEnv]?.trim() || undefined
       : undefined;
     const model =
       options.model ??
@@ -820,10 +841,11 @@ export async function collectStandaloneTasks(
         ? configuredModel
         : undefined) ??
       customModel ??
-      environmentValue(BUILTIN_MODEL_ENVS[agent] ?? []) ??
+      environmentValue(BUILTIN_MODEL_ENVS[agent] ?? [], options.environment) ??
       'runtime-default';
     const customBaseUrl = executionConfig.adapter?.baseUrlEnv
-      ? process.env[executionConfig.adapter.baseUrlEnv]?.trim() || undefined
+      ? (options.environment ?? process.env)[executionConfig.adapter.baseUrlEnv]?.trim() ||
+        undefined
       : undefined;
     const baseUrl =
       options.baseUrl ??
@@ -832,7 +854,7 @@ export async function collectStandaloneTasks(
         : typeof execution.base_url === 'string'
           ? execution.base_url
           : (customBaseUrl ??
-            environmentValue(BUILTIN_BASE_URL_ENVS[agent] ?? []) ??
+            environmentValue(BUILTIN_BASE_URL_ENVS[agent] ?? [], options.environment) ??
             'runtime-default'));
     const generation = createHash('sha256')
       .update(
@@ -877,6 +899,7 @@ export async function collectStandaloneTasks(
     )
       throw new Error('cache mismatch');
     const cached = await validate(raw);
+    options.onManifest?.(manifestPath);
     const tasks = (cached.evaluation as Record<string, unknown>)?.tasks;
     if (!Array.isArray(tasks) || tasks.length < 2 || tasks.length > 4)
       throw new Error('cache tasks');

@@ -1,11 +1,16 @@
+import * as nativeCollector from '../../../domains/dashboard/native-collector.js';
+import { writeClassicProjectText } from '../../../domains/comet-classic/classic-protected-path.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { promises as fs } from 'fs';
 import os from 'os';
 import path from 'path';
+import { snapshotCometRuntimeMetrics } from '../../../platform/process/runtime-metrics.js';
+import { requireFileSymlink } from '../../helpers/file-symlink.js';
 import {
   collectDashboardChangeDetail,
   collectDashboardChangePage,
+  collectDashboardChangeSummary,
   collectDashboardOverview,
   collectDashboardSnapshot,
 } from '../../../domains/dashboard/collector.js';
@@ -13,6 +18,7 @@ import {
 interface ChangeFixture {
   name: string;
   yaml?: Record<string, string>;
+  stateFileName?: 'comet-state.yaml' | '.comet.yaml';
   tasks?: string;
   proposal?: boolean;
   design?: boolean;
@@ -33,7 +39,10 @@ async function writeChange(root: string, fixture: ChangeFixture): Promise<void> 
 
   if (fixture.yaml) {
     const lines = Object.entries(fixture.yaml).map(([k, v]) => `${k}: ${v}`);
-    await fs.writeFile(path.join(baseDir, '.comet.yaml'), `${lines.join('\n')}\n`);
+    await fs.writeFile(
+      path.join(baseDir, fixture.stateFileName ?? '.comet.yaml'),
+      `${lines.join('\n')}\n`,
+    );
   }
   if (fixture.tasks !== undefined) {
     await fs.writeFile(path.join(baseDir, 'tasks.md'), fixture.tasks);
@@ -65,14 +74,464 @@ function git(root: string, args: string[]): string {
 
 describe('collectDashboardSnapshot', () => {
   let root: string;
+  let cacheRoot: string;
 
   beforeEach(async () => {
     root = await fs.mkdtemp(path.join(os.tmpdir(), 'comet-collector-'));
+    cacheRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'comet-collector-home-'));
+    for (const key of ['HOME', 'USERPROFILE', 'LOCALAPPDATA', 'XDG_CACHE_HOME'])
+      vi.stubEnv(key, cacheRoot);
   });
 
   afterEach(async () => {
+    vi.unstubAllEnvs();
     await fs.rm(root, { recursive: true, force: true });
+    await fs.rm(cacheRoot, { recursive: true, force: true });
   });
+
+  it('reads complete Classic summary once beyond page limits and checks external edits', async () => {
+    await Promise.all(
+      Array.from({ length: 70 }, (_, index) =>
+        writeChange(root, {
+          name: `change-${String(index).padStart(3, '0')}`,
+          tasks: '- [ ] Work\n',
+          yaml: { phase: 'build', workflow: 'full' },
+        }),
+      ),
+    );
+    await writeChange(root, { name: '2026-01-01-old', status: 'archived' });
+    const summary = await collectDashboardChangeSummary(root);
+    expect(summary.total).toBe(70);
+    expect(summary.items).toHaveLength(70);
+    expect(summary.nextCursor).toBeNull();
+    const expanded = await collectDashboardChangeSummary(root, { limit: 60 });
+    expect(expanded.items).toHaveLength(60);
+    const tail = await collectDashboardChangePage(root, {
+      status: 'active',
+      cursor: expanded.nextCursor!,
+      limit: 50,
+    });
+    expect([...expanded.items, ...tail.items].map((item) => item.id)).toEqual(
+      summary.items.map((item) => item.id),
+    );
+    const filtered = await collectDashboardChangeSummary(root, {
+      status: 'all',
+      query: 'change-06',
+    });
+    expect(filtered.total).toBe(10);
+    const page = await collectDashboardChangePage(root, { status: 'active', limit: 50 });
+    const second = await collectDashboardChangePage(root, {
+      status: 'active',
+      limit: 50,
+      cursor: page.nextCursor!,
+    });
+    expect(summary.items.map((item) => item.id)).toEqual(
+      [...page.items, ...second.items].map((item) => item.id),
+    );
+    await fs.writeFile(path.join(root, 'openspec/changes/change-000/tasks.md'), '- [x] Work\n');
+    await fs.rm(path.join(root, 'openspec/changes/change-001'), { recursive: true });
+    const refreshed = await collectDashboardChangeSummary(root);
+    expect(refreshed.total).toBe(69);
+    expect(refreshed.items.find((item) => item.name === 'change-000')?.tasks.completed).toBe(1);
+    expect(refreshed.items.some((item) => item.name === 'change-001')).toBe(false);
+  });
+
+  it('bounds selected Classic detail path inspection independently of overview', async () => {
+    await writeChange(root, {
+      name: 'selected',
+      yaml: { phase: 'build', workflow: 'full' },
+      tasks: '- [ ] Work\n',
+      proposal: true,
+      design: true,
+      plan: true,
+    });
+    const lstat = vi.spyOn(fs, 'lstat');
+    const realpath = vi.spyOn(fs, 'realpath');
+    try {
+      const detail = await collectDashboardChangeDetail(root, 'openspec/changes/selected');
+      expect(detail?.name).toBe('selected');
+      console.info(
+        'Classic selected detail path calls',
+        lstat.mock.calls.length,
+        realpath.mock.calls.length,
+      );
+      expect(lstat.mock.calls.length + realpath.mock.calls.length).toBeLessThan(250);
+    } finally {
+      lstat.mockRestore();
+      realpath.mockRestore();
+    }
+  });
+
+  it('reuses worktree discovery for consecutive detail reads and observes branch changes', async () => {
+    git(root, ['init', '-q']);
+    git(root, ['remote', 'add', 'origin', 'https://example.invalid/detail-performance.git']);
+    await writeChange(root, { name: 'selected', yaml: { phase: 'build' } });
+    await collectDashboardChangeDetail(root, 'openspec/changes/selected');
+    const before = snapshotCometRuntimeMetrics().gitCommands;
+    expect((await collectDashboardChangeDetail(root, 'openspec/changes/selected'))?.name).toBe(
+      'selected',
+    );
+    expect(snapshotCometRuntimeMetrics().gitCommands - before).toBeLessThanOrEqual(1);
+    git(root, ['symbolic-ref', 'HEAD', 'refs/heads/renamed']);
+    expect(
+      (await collectDashboardChangeDetail(root, 'openspec/changes/selected'))?.workspace.branch,
+    ).toBe('renamed');
+  });
+
+  it('bounds overview path inspection across linked worktrees and archived changes', async () => {
+    git(root, ['init', '-q']);
+    git(root, [
+      '-c',
+      'user.name=Test',
+      '-c',
+      'user.email=test@example.invalid',
+      'commit',
+      '--allow-empty',
+      '-qm',
+      'seed',
+    ]);
+    const workspaces = [root];
+    for (let index = 1; index < 6; index += 1) {
+      const worktree = path.join(root, '.worktrees', `workspace-${index}`);
+      git(root, ['worktree', 'add', '-qb', `dashboard-${index}`, worktree]);
+      workspaces.push(worktree);
+    }
+    for (const [workspaceIndex, workspace] of workspaces.entries()) {
+      for (let index = 0; index < 24; index += 1) {
+        await writeChange(workspace, {
+          name:
+            index < 4
+              ? `active-${workspaceIndex}-${index}`
+              : `2026-10-15-archived-${workspaceIndex}-${index}`,
+          status: index < 4 ? 'active' : 'archived',
+          yaml: { phase: index < 4 ? 'build' : 'archive', workflow: 'full' },
+          tasks: '- [ ] Task\n',
+          proposal: true,
+          design: true,
+          plan: true,
+        });
+      }
+    }
+    const lstat = vi.spyOn(fs, 'lstat');
+    const realpath = vi.spyOn(fs, 'realpath');
+    try {
+      const overview = await collectDashboardOverview(root);
+      expect(overview.summary).toMatchObject({ activeChanges: 24, archivedChanges: 120 });
+      const calls = { lstat: lstat.mock.calls.length, realpath: realpath.mock.calls.length };
+      console.info('Dashboard overview filesystem calls', calls);
+      // 活跃与归档摘要均须校验可变依赖。
+      expect(calls.lstat + calls.realpath).toBeLessThan(10000);
+      lstat.mockClear();
+      realpath.mockClear();
+      await collectDashboardOverview(root);
+      const warm = { lstat: lstat.mock.calls.length, realpath: realpath.mock.calls.length };
+      console.info('Unchanged Dashboard overview filesystem calls', warm);
+      expect(warm.lstat + warm.realpath).toBeLessThan(1500);
+      // 归档也检查元数据，避免遗漏文件原地修改。
+      expect(lstat.mock.calls.some(([file]) => String(file).includes('archived-'))).toBe(true);
+    } finally {
+      lstat.mockRestore();
+      realpath.mockRestore();
+    }
+  });
+
+  it('counts shared large task candidates once and still invalidates changed task files', async () => {
+    for (let index = 0; index < 5; index += 1) {
+      await writeChange(root, {
+        name: `large-${index}`,
+        yaml: { workflow: 'comet', phase: 'build' },
+        tasks: '- [ ] ' + 'x'.repeat(1_900_000) + '\n',
+      });
+    }
+    const open = vi.spyOn(fs, 'open');
+    const taskReads = () =>
+      open.mock.calls.filter(([file]) => String(file).endsWith('tasks.md')).length;
+    try {
+      const cold = await collectDashboardChangePage(root, { status: 'active', limit: 50 });
+      expect(cold.total).toBe(5);
+      expect(taskReads()).toBe(5);
+      open.mockClear();
+      const warm = await collectDashboardChangePage(root, { status: 'active', limit: 50 });
+      expect(warm).toEqual(cold);
+      expect(taskReads()).toBe(0);
+      await fs.writeFile(path.join(root, 'openspec/changes/large-0/tasks.md'), '- [x] complete\n');
+      open.mockClear();
+      const updated = await collectDashboardChangePage(root, { status: 'active', limit: 50 });
+      expect(taskReads()).toBe(1);
+      expect(updated.items.find((item) => item.name === 'large-0')?.tasks.completed).toBe(1);
+    } finally {
+      open.mockRestore();
+    }
+  });
+
+  it('retains the unique-content cache size limit without truncating large tasks', async () => {
+    for (let index = 0; index < 9; index += 1) {
+      await writeChange(root, {
+        name: `over-budget-${index}`,
+        yaml: { workflow: 'comet', phase: 'build' },
+        tasks: '- [ ] ' + 'x'.repeat(1_900_000) + '\n',
+      });
+    }
+    const open = vi.spyOn(fs, 'open');
+    try {
+      for (let round = 0; round < 2; round += 1) {
+        open.mockClear();
+        const page = await collectDashboardChangePage(root, { status: 'active', limit: 50 });
+        expect(page.total).toBe(9);
+        expect(page.items.every((item) => item.tasks.total === 1)).toBe(true);
+        expect(open.mock.calls.filter(([file]) => String(file).endsWith('tasks.md'))).toHaveLength(
+          9,
+        );
+      }
+    } finally {
+      open.mockRestore();
+    }
+  });
+
+  it('refreshes cached Classic summaries after active files and external report changes', async () => {
+    await writeChange(root, {
+      name: 'cached',
+      yaml: { phase: 'build', verification_report: 'reports/result.md' },
+      tasks: '- [ ] Work\n',
+    });
+    expect((await collectDashboardOverview(root)).summary.tasksIncomplete).toBe(1);
+    const dir = path.join(root, 'openspec/changes/cached');
+    await fs.writeFile(path.join(dir, 'tasks.md'), '- [x] Work\n');
+    expect((await collectDashboardOverview(root)).summary.tasksIncomplete).toBe(0);
+    await fs.mkdir(path.join(root, 'reports'));
+    await fs.writeFile(path.join(root, 'reports/result.md'), '# Failed check\n');
+    expect((await collectDashboardOverview(root)).summary.verifyFailed).toBe(1);
+    await fs.rm(path.join(root, 'reports/result.md'));
+    expect((await collectDashboardOverview(root)).summary.verifyFailed).toBe(0);
+    await fs.writeFile(path.join(dir, '.comet.yaml'), 'phase: verify\n');
+    expect((await collectDashboardOverview(root)).initialChanges.items[0].phase).toBe('verify');
+  });
+
+  it('rereads only changed active or archived summaries and discovers additions and removals', async () => {
+    await writeChange(root, { name: 'one', yaml: { phase: 'build' }, tasks: '- [ ] Work\n' });
+    await writeChange(root, { name: 'two', yaml: { phase: 'build' }, tasks: '- [ ] Work\n' });
+    await writeChange(root, {
+      name: '2026-10-15-old',
+      status: 'archived',
+      yaml: { phase: 'archive' },
+      tasks: '- [ ] Work\n',
+    });
+    await collectDashboardOverview(root);
+    const open = vi.spyOn(fs, 'open');
+    const openedPaths = () => open.mock.calls.map(([file]) => String(file).replaceAll('\\', '/'));
+    try {
+      await fs.writeFile(path.join(root, 'openspec/changes/one/tasks.md'), '- [x] Work\n');
+      expect((await collectDashboardOverview(root)).summary.tasksIncomplete).toBe(1);
+      const reads = openedPaths();
+      expect(reads.some((file) => file.includes('/one/'))).toBe(true);
+      expect(reads.some((file) => file.includes('/two/') || file.includes('/archive/'))).toBe(
+        false,
+      );
+      open.mockClear();
+      await fs.writeFile(
+        path.join(root, 'openspec/changes/archive/2026-10-15-old/tasks.md'),
+        '- [x] Work\n',
+      );
+      const page = await collectDashboardChangePage(root, { status: 'archived' });
+      expect(page.items[0].tasks.completed).toBe(1);
+      expect(openedPaths().some((file) => file.includes('/one/') || file.includes('/two/'))).toBe(
+        false,
+      );
+      await writeChange(root, {
+        name: '2026-10-16-new',
+        status: 'archived',
+        yaml: { phase: 'archive' },
+      });
+      expect((await collectDashboardOverview(root)).summary.archivedChanges).toBe(2);
+      await fs.rm(path.join(root, 'openspec/changes/archive/2026-10-15-old'), { recursive: true });
+      expect((await collectDashboardOverview(root)).summary.archivedChanges).toBe(1);
+    } finally {
+      open.mockRestore();
+    }
+  });
+
+  it('rejects a change directory replaced by a junction after a cached overview', async () => {
+    await writeChange(root, { name: 'cached', yaml: { phase: 'build' } });
+    expect((await collectDashboardOverview(root)).summary.activeChanges).toBe(1);
+    const outside = await fs.mkdtemp(path.join(os.tmpdir(), 'comet-dashboard-cache-outside-'));
+    try {
+      await fs.writeFile(path.join(outside, '.comet.yaml'), 'phase: verify\nworkflow: secret\n');
+      const dir = path.join(root, 'openspec/changes/cached');
+      await fs.rename(dir, path.join(root, 'retained-change'));
+      await fs.symlink(outside, dir, process.platform === 'win32' ? 'junction' : 'dir');
+      const overview = await collectDashboardOverview(root);
+      expect(overview.summary.activeChanges).toBe(0);
+      expect(JSON.stringify(overview)).not.toContain('secret');
+    } finally {
+      await fs.rm(outside, { recursive: true, force: true });
+    }
+  });
+
+  it('invalidates archived summaries when a cached report becomes a symlink', async (context) => {
+    await requireFileSymlink(context);
+    await writeChange(root, {
+      name: '2026-10-15-guarded',
+      status: 'archived',
+      yaml: { phase: 'archive', verification_report: 'reports/result.md' },
+    });
+    const report = path.join(root, 'reports/result.md');
+    await fs.mkdir(path.dirname(report), { recursive: true });
+    await fs.writeFile(report, '# Verification failed\n');
+    const page = () => collectDashboardChangePage(root, { status: 'archived' });
+    expect((await page()).items[0].verify.result).toBe('fail');
+    await fs.rm(report);
+    await fs.symlink(
+      path.join(root, 'openspec/changes/archive/2026-10-15-guarded/.comet.yaml'),
+      report,
+    );
+    expect((await page()).items[0].verify.result).toBe('unknown');
+    await fs.rm(report);
+    await fs.writeFile(report, '# Repaired\n');
+    expect((await page()).items[0].verify.result).toBe('fail');
+  });
+
+  it('shows Classic checkpoint and progress from user Runtime without recreating project records', async () => {
+    await writeChange(root, {
+      name: 'local-runtime-preview',
+      yaml: { phase: 'build', workflow: 'classic' },
+    });
+    const change = path.join(root, 'openspec/changes/local-runtime-preview');
+    const checkpoint = path.join(change, '.comet/checkpoint.json');
+    const progress = path.join(change, '.comet/subagent-progress.md');
+    await writeClassicProjectText(root, checkpoint, '{"summary":"retained checkpoint"}\n', {
+      label: 'test checkpoint',
+    });
+    await writeClassicProjectText(root, progress, '# Child progress\nStill working.\n', {
+      label: 'test progress',
+    });
+    await expect(fs.access(checkpoint)).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(fs.access(progress)).rejects.toMatchObject({ code: 'ENOENT' });
+    const detail = await collectDashboardChangeDetail(
+      root,
+      'openspec/changes/local-runtime-preview',
+    );
+    const previews = detail.artifactPreviews!;
+    expect(previews.find((item) => item.key === 'checkpoint')).toMatchObject({
+      exists: true,
+      content: '{"summary":"retained checkpoint"}\n',
+    });
+    expect(previews.find((item) => item.key === 'subagentProgress')).toMatchObject({
+      exists: true,
+      content: '# Child progress\nStill working.\n',
+    });
+  });
+
+  it.each([
+    ['comet-state.yaml', 'openspec/changes'],
+    ['.comet.yaml', 'openspec/changes'],
+    ['comet-state.yaml', 'docs/openspec/changes'],
+    ['.comet.yaml', 'docs/openspec/changes'],
+  ] as const)(
+    'reads %s in %s across Classic dashboard views',
+    async (stateFileName, changesPath) => {
+      await writeChange(root, {
+        name: 'active-state',
+        stateFileName,
+        changesPath,
+        yaml: { phase: 'build', workflow: 'full' },
+      });
+      await writeChange(root, {
+        name: '2026-10-11-archived-state',
+        stateFileName,
+        changesPath,
+        status: 'archived',
+        yaml: { phase: 'archive', workflow: 'full', archived: 'true' },
+      });
+      const snapshot = await collectDashboardSnapshot(root);
+      expect(snapshot.classicError).toBeUndefined();
+      expect(snapshot.changes.active[0]).toMatchObject({
+        name: 'active-state',
+        phase: 'build',
+        artifacts: { cometYaml: true },
+      });
+      expect(snapshot.changes.archived[0].artifacts.cometYaml).toBe(true);
+      const overview = await collectDashboardOverview(root);
+      expect(overview.classicError).toBeUndefined();
+      expect(overview.summary).toMatchObject({ activeChanges: 1, archivedChanges: 1 });
+      const page = await collectDashboardChangePage(root, { status: 'all' });
+      expect(page.total).toBe(2);
+      const detail = await collectDashboardChangeDetail(root, `${changesPath}/active-state`);
+      expect(detail?.artifacts.grouped).toContainEqual(
+        expect.objectContaining({
+          key: 'cometYaml',
+          label: stateFileName,
+          path: path.join(root, ...changesPath.split('/'), 'active-state', stateFileName),
+          exists: true,
+        }),
+      );
+    },
+  );
+
+  it.each(['file', 'dangling-symlink'] as const)(
+    'surfaces conflicting Classic state names including a %s without writes',
+    async (legacyKind) => {
+      await writeChange(root, {
+        name: 'healthy',
+        yaml: { phase: 'build' },
+        stateFileName: 'comet-state.yaml',
+      });
+      await writeChange(root, {
+        name: 'conflict',
+        yaml: { phase: 'build' },
+        stateFileName: 'comet-state.yaml',
+      });
+      const changeDir = path.join(root, 'openspec/changes/conflict');
+      const legacyPath = path.join(changeDir, '.comet.yaml');
+      if (legacyKind === 'file') {
+        await fs.writeFile(legacyPath, 'phase: verify\n');
+      } else {
+        try {
+          await fs.symlink('missing-state.yaml', legacyPath, 'file');
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === 'EPERM') return;
+          throw error;
+        }
+      }
+      const before = await fs.readFile(path.join(changeDir, 'comet-state.yaml'));
+      // 隔离 Native 的独立索引缓存，只观察 Classic 收集与状态文件的读写。
+      const nativeReads = [
+        vi.spyOn(nativeCollector, 'collectNativeDashboardProjection').mockResolvedValue(null),
+        vi.spyOn(nativeCollector, 'collectNativeDashboardOverview').mockResolvedValue(null),
+      ];
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const writes = [
+        vi.spyOn(fs, 'mkdir'),
+        vi.spyOn(fs, 'writeFile'),
+        vi.spyOn(fs, 'rename'),
+        vi.spyOn(fs, 'unlink'),
+      ];
+      try {
+        const snapshot = await collectDashboardSnapshot(root);
+        expect(snapshot.changes.active.map((change) => change.name)).toEqual(['healthy']);
+        expect(snapshot.classicError?.message).toMatch(/comet-state\.yaml.*\.comet\.yaml/u);
+        const overview = await collectDashboardOverview(root);
+        expect(overview.initialChanges.items.map((change) => change.name)).toEqual(['healthy']);
+        expect(overview.classicError?.message).toMatch(/comet-state\.yaml.*\.comet\.yaml/u);
+        await expect(collectDashboardChangePage(root, { status: 'active' })).rejects.toThrow(
+          /comet-state\.yaml.*\.comet\.yaml/u,
+        );
+        await expect(
+          collectDashboardChangeDetail(root, 'openspec/changes/conflict'),
+        ).rejects.toThrow(/comet-state\.yaml.*\.comet\.yaml/u);
+        for (const write of writes) expect(write).not.toHaveBeenCalled();
+        expect(await fs.readFile(path.join(changeDir, 'comet-state.yaml'))).toEqual(before);
+        if (legacyKind === 'file') {
+          expect(await fs.readFile(legacyPath, 'utf8')).toBe('phase: verify\n');
+        } else {
+          expect(await fs.readlink(legacyPath)).toBe('missing-state.yaml');
+        }
+      } finally {
+        warn.mockRestore();
+        for (const write of writes) write.mockRestore();
+        for (const read of nativeReads) read.mockRestore();
+      }
+    },
+  );
 
   it('treats missing Classic roots as an empty state without configuration', async () => {
     const snap = await collectDashboardSnapshot(root);
@@ -656,6 +1115,7 @@ describe('collectDashboardSnapshot', () => {
     await writeChange(root, {
       name: 'docs-cleanup',
       yaml: { phase: 'design', workflow: 'full' },
+      tasks: '- [x] outline\n',
       proposal: true,
     });
     await writeChange(root, {

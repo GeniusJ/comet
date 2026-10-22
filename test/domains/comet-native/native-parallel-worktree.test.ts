@@ -1,3 +1,4 @@
+import { resolveWorkspaceRuntimeRootSync } from '../../../domains/workflow-contract/workspace-runtime.js';
 import { fixtureAcceptanceReview } from '../../helpers/native-builder-acceptance-review.js';
 import { promises as fs } from 'node:fs';
 import { execFileSync, spawn } from 'node:child_process';
@@ -251,7 +252,7 @@ describe('Native parallel linked-worktree Runtime', () => {
       CHANGE_NAMES.map((name) =>
         runNativeCommand(
           'new',
-          [name, '--isolation', 'worktree', '--target-branch', targetBranch],
+          [name, '--isolation', 'worktree', '--target-branch', targetBranch, '--runtime', 'compat'],
           repository,
         ),
       ),
@@ -326,8 +327,57 @@ describe('Native parallel linked-worktree Runtime', () => {
       COMMAND_TIMEOUT_MS,
       { ...process.env, FILE_PATH: BUSINESS_SOURCE },
     );
-    assertCompleted(guard, 'guard manual source edit');
+    expect(guard.exitCode, guard.stderr).toBe(2);
+    expect(guard.data).toMatchObject({ allowed: false, phase: 'verify' });
+    const { runNativeEditReviewCommand } =
+      await import('../../../domains/comet-native/native-edit-review-command.js');
+    const reviewFile = path.join(
+      resolveWorkspaceRuntimeRootSync(editedWorktree.root),
+      'test-edit-review.json',
+    );
+    await fs.writeFile(
+      reviewFile,
+      JSON.stringify({
+        tool_name: 'Write',
+        tool_input: { file_path: BUSINESS_SOURCE, content: userSource },
+      }),
+    );
+    const proposal = await runNativeEditReviewCommand({
+      projectRoot: editedWorktree.root,
+      name: editedWorktree.name,
+      operation: 'prepare',
+      file: reviewFile,
+    });
     await fs.writeFile(path.join(editedWorktree.root, BUSINESS_SOURCE), userSource);
+    await fs.writeFile(
+      reviewFile,
+      JSON.stringify({
+        proposalHash: proposal.proposal!.proposalHash,
+        decision: 'implementation-changed',
+        summary: 'The exported business value changes; rebuild the candidate.',
+      }),
+    );
+    await runNativeEditReviewCommand({
+      projectRoot: editedWorktree.root,
+      name: editedWorktree.name,
+      operation: 'record',
+      file: reviewFile,
+      confirmed: true,
+    });
+
+    assertCompleted(
+      await runNativeCommand(
+        'next',
+        [
+          editedWorktree.name,
+          '--revise-implementation',
+          '--summary',
+          'Confirmed business value revision',
+        ],
+        editedWorktree.root,
+      ),
+      'revise the edited implementation',
+    );
 
     const [editedStatus, untouchedStatus] = await Promise.all([
       runNativeCommand('status', [editedWorktree.name], editedWorktree.root),
@@ -354,12 +404,14 @@ describe('Native parallel linked-worktree Runtime', () => {
     ).resolves.toBe(userSource);
 
     for (const { root } of worktrees) {
-      const locks = path.join(root, '.comet', 'runtime', 'native', 'locks');
+      const locks = path.join(resolveWorkspaceRuntimeRootSync(root), 'native', 'locks');
       const lockEntries = await readDirectoryOrEmpty(locks);
       expect(lockEntries.filter((entry) => entry !== '.coordinator')).toEqual([]);
       expect(await readDirectoryOrEmpty(path.join(locks, '.coordinator'))).toEqual([]);
       expect(
-        await readDirectoryOrEmpty(path.join(root, '.comet', 'runtime', 'native', 'transactions')),
+        await readDirectoryOrEmpty(
+          path.join(resolveWorkspaceRuntimeRootSync(root), 'native', 'transactions'),
+        ),
       ).toEqual([]);
       expect(
         execFileSync('git', ['branch', '--show-current'], { cwd: root, encoding: 'utf8' }).trim(),

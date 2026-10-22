@@ -1,3 +1,4 @@
+import { t } from './dashboard-i18n.js';
 export function dashboardChangeKey(change) {
   return change.locator ?? change.id;
 }
@@ -45,8 +46,10 @@ export async function dashboardResponseError(response) {
     const payload = await response.json();
     if (typeof payload?.error === 'string' && payload.error.trim()) {
       const pluginId = typeof payload.pluginId === 'string' ? payload.pluginId.trim() : '';
-      const message = pluginId ? `插件 ${pluginId}：${payload.error}` : payload.error;
+      const message = pluginId ? t('插件 {0}：{1}', [pluginId, payload.error]) : payload.error;
       const error = new Error(message);
+      error.status = response.status;
+      if (typeof payload.code === 'string') error.code = payload.code;
       if (pluginId) error.pluginId = pluginId;
       return error;
     }

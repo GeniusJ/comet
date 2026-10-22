@@ -40,8 +40,6 @@ describe('Comet Native isolation boundaries', () => {
         '.comet/current-change.json',
         '.comet/runtime',
         '.comet/runtime/',
-        '.comet/runtime/native',
-        '.comet/runtime/native/runner-input-artifacts.json',
       ]),
     );
   });
@@ -54,7 +52,7 @@ describe('Comet Native isolation boundaries', () => {
     const source = await combined(skillFiles);
 
     expect(source).not.toMatch(
-      /requiredSkillCalls|openspec|superpowers|grill-me|brainstorming|test-driven-development|subagent-driven-development/iu,
+      /requiredSkillCalls|openspec|(?<!\\\.)superpowers|grill-me|brainstorming|test-driven-development|subagent-driven-development/iu,
     );
     expect(source).not.toMatch(/comet\s+(?:state|guard|handoff)\b/iu);
   });

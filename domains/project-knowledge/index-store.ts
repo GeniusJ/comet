@@ -1,10 +1,12 @@
-import { promises as fs } from 'node:fs';
+import { promises as fs, type Stats } from 'node:fs';
 import { createHash } from 'node:crypto';
 import path from 'node:path';
 
 import { resolveProjectKnowledgeStorageLocation } from '../../platform/paths/project-knowledge-storage.js';
 import { readProtectedProjectFile } from '../workflow-contract/protected-project-path.js';
 import { openProjectKnowledgeDatabase, type ProjectKnowledgeDatabase } from './sqlite.js';
+import { independentQueryTermCount, projectKnowledgeHistoryRequested } from './query.js';
+import { knowledgeDocumentKindRank } from './corpus.js';
 import type {
   ProjectKnowledgeDocument,
   ProjectKnowledgeDiagnosticReporter,
@@ -12,11 +14,43 @@ import type {
   ProjectKnowledgeResult,
 } from './types.js';
 
-const INDEX_SCHEMA = 'comet.project-knowledge.index.v3';
+const INDEX_SCHEMA = 'comet.project-knowledge.index.v4';
 const MAX_SOURCE_BYTES = 256 * 1024;
 const MAX_SECTION_CHARS = 16_000;
 const MAX_LEXICAL_TERMS = 256;
 const MAX_SYNC_MS = 2_000;
+const SOURCE_READ_CONCURRENCY = 8;
+
+interface IndexSourceRead {
+  readonly stat?: Stats;
+  readonly read?: Awaited<ReturnType<typeof readProtectedProjectFile>>;
+  readonly error?: unknown;
+}
+
+async function readIndexSource(
+  projectRoot: string,
+  document: ProjectKnowledgeDocument,
+): Promise<IndexSourceRead> {
+  let stat: Stats;
+  try {
+    stat = await fs.lstat(document.absolutePath);
+  } catch (error) {
+    return { error };
+  }
+  let read: IndexSourceRead['read'];
+  try {
+    read = await readProtectedProjectFile(projectRoot, document.source, MAX_SOURCE_BYTES, {
+      label: document.source,
+    });
+    const afterRead = await fs.lstat(document.absolutePath);
+    if (afterRead.size !== read.stat.size || afterRead.mtimeMs !== read.stat.mtimeMs) {
+      throw new Error('source changed while it was being indexed');
+    }
+    return { stat, read };
+  } catch (error) {
+    return { stat, read, error };
+  }
+}
 
 export interface ProjectKnowledgeIndexOptions {
   readonly projectRoot: string;
@@ -57,6 +91,10 @@ export interface ProjectKnowledgeIndexSyncResult {
 
 export interface ProjectKnowledgeIndexSyncOptions {
   readonly complete?: boolean;
+  /** Skip archive reads while reconciling deletions against the complete corpus. */
+  readonly includeArchives?: boolean;
+  /** Absolute deadline shared by query passes; cannot extend the per-sync budget. */
+  readonly deadline?: number;
 }
 
 interface ParsedSection {
@@ -85,6 +123,7 @@ interface SearchRow {
   readonly heading_path: string;
   readonly body: string;
   readonly rank: number;
+  readonly document_match?: number;
 }
 
 function contentDigest(bytes: Buffer): string {
@@ -124,6 +163,14 @@ function setMeta(database: ProjectKnowledgeDatabase, key: string, value: string)
 function repairFtsProjection(database: ProjectKnowledgeDatabase): void {
   database.exec('BEGIN IMMEDIATE;');
   try {
+    database
+      .prepare('DELETE FROM pk_fts_documents WHERE rowid NOT IN (SELECT id FROM pk_documents)')
+      .run();
+    database
+      .prepare(
+        'INSERT INTO pk_fts_documents(rowid, workspace_id, source, title, body, lexical_terms) SELECT document.id, document.workspace_id, document.source, document.title, document.body, document.lexical_terms FROM pk_documents AS document WHERE NOT EXISTS (SELECT 1 FROM pk_fts_documents AS fts WHERE fts.rowid = document.id)',
+      )
+      .run();
     database
       .prepare('DELETE FROM pk_fts_terms WHERE rowid NOT IN (SELECT id FROM pk_sections)')
       .run();
@@ -289,6 +336,8 @@ export class ProjectKnowledgeIndexStore {
           [
             'DROP TABLE IF EXISTS pk_fts_terms;',
             'DROP TABLE IF EXISTS pk_fts_trigram;',
+            'DROP TABLE IF EXISTS pk_fts_documents;',
+            'DROP TABLE IF EXISTS pk_documents;',
             'DROP TABLE IF EXISTS pk_sections;',
             'DROP TABLE IF EXISTS pk_sources;',
           ].join('\n'),
@@ -300,6 +349,8 @@ export class ProjectKnowledgeIndexStore {
           'CREATE TABLE IF NOT EXISTS pk_sources (workspace_id TEXT NOT NULL, source TEXT NOT NULL, kind TEXT NOT NULL, archived_at TEXT, size INTEGER NOT NULL, modified_at REAL NOT NULL, digest TEXT NOT NULL, indexed_at TEXT NOT NULL, PRIMARY KEY(workspace_id, source));',
           'CREATE TABLE IF NOT EXISTS pk_sections (id INTEGER PRIMARY KEY, workspace_id TEXT NOT NULL, source TEXT NOT NULL, anchor TEXT NOT NULL, title TEXT NOT NULL, heading_path TEXT NOT NULL, body TEXT NOT NULL, lexical_terms TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(workspace_id, source, anchor));',
           'CREATE INDEX IF NOT EXISTS pk_sections_workspace_source ON pk_sections(workspace_id, source);',
+          'CREATE TABLE IF NOT EXISTS pk_documents (id INTEGER PRIMARY KEY, workspace_id TEXT NOT NULL, source TEXT NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL, lexical_terms TEXT NOT NULL, UNIQUE(workspace_id, source));',
+          "CREATE VIRTUAL TABLE IF NOT EXISTS pk_fts_documents USING fts5(workspace_id UNINDEXED, source UNINDEXED, title, body, lexical_terms, tokenize='unicode61');",
           "CREATE VIRTUAL TABLE IF NOT EXISTS pk_fts_terms USING fts5(workspace_id UNINDEXED, source UNINDEXED, title, heading_path, body, lexical_terms, tokenize='unicode61');",
           "CREATE VIRTUAL TABLE IF NOT EXISTS pk_fts_trigram USING fts5(workspace_id UNINDEXED, source UNINDEXED, title, heading_path, body, tokenize='trigram');",
         ].join('\n'),
@@ -312,7 +363,9 @@ export class ProjectKnowledgeIndexStore {
       setMeta(database, 'repositoryId', this.repositoryId);
       setMeta(database, 'tokenizer', 'unicode61+trigram');
       repairFtsProjection(database);
-      database.prepare("SELECT rowid FROM pk_fts_terms WHERE pk_fts_terms MATCH 'probe'").all();
+      for (const table of ['pk_fts_documents', 'pk_fts_terms', 'pk_fts_trigram']) {
+        database.prepare(`SELECT rowid FROM ${table} WHERE ${table} MATCH 'probe'`).all();
+      }
       this.database = database;
     } catch (error) {
       if (isSqliteLockError(error)) {
@@ -331,11 +384,15 @@ export class ProjectKnowledgeIndexStore {
             [
               'DROP TABLE IF EXISTS pk_fts_terms;',
               'DROP TABLE IF EXISTS pk_fts_trigram;',
+              'DROP TABLE IF EXISTS pk_fts_documents;',
+              'DROP TABLE IF EXISTS pk_documents;',
               'DROP TABLE IF EXISTS pk_sections;',
               'DROP TABLE IF EXISTS pk_sources;',
               'CREATE TABLE pk_sources (workspace_id TEXT NOT NULL, source TEXT NOT NULL, kind TEXT NOT NULL, archived_at TEXT, size INTEGER NOT NULL, modified_at REAL NOT NULL, digest TEXT NOT NULL, indexed_at TEXT NOT NULL, PRIMARY KEY(workspace_id, source));',
               'CREATE TABLE pk_sections (id INTEGER PRIMARY KEY, workspace_id TEXT NOT NULL, source TEXT NOT NULL, anchor TEXT NOT NULL, title TEXT NOT NULL, heading_path TEXT NOT NULL, body TEXT NOT NULL, lexical_terms TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(workspace_id, source, anchor));',
               'CREATE INDEX pk_sections_workspace_source ON pk_sections(workspace_id, source);',
+              'CREATE TABLE pk_documents (id INTEGER PRIMARY KEY, workspace_id TEXT NOT NULL, source TEXT NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL, lexical_terms TEXT NOT NULL, UNIQUE(workspace_id, source));',
+              "CREATE VIRTUAL TABLE pk_fts_documents USING fts5(workspace_id UNINDEXED, source UNINDEXED, title, body, lexical_terms, tokenize='unicode61');",
               "CREATE VIRTUAL TABLE pk_fts_terms USING fts5(workspace_id UNINDEXED, source UNINDEXED, title, heading_path, body, lexical_terms, tokenize='unicode61');",
               "CREATE VIRTUAL TABLE pk_fts_trigram USING fts5(workspace_id UNINDEXED, source UNINDEXED, title, heading_path, body, tokenize='trigram');",
             ].join('\n'),
@@ -377,16 +434,35 @@ export class ProjectKnowledgeIndexStore {
   ): Promise<ProjectKnowledgeIndexSyncResult> {
     return this.syncCorpusInternal(corpus, {
       complete: options.complete !== false,
-      deadline: Date.now() + MAX_SYNC_MS,
+      includeArchives: options.includeArchives !== false,
+      deadline: Math.min(Date.now() + MAX_SYNC_MS, options.deadline ?? Infinity),
     });
   }
 
   private async syncCorpusInternal(
     corpus: readonly ProjectKnowledgeDocument[],
-    options: { readonly complete: boolean; readonly deadline?: number; readonly force?: boolean },
+    options: {
+      readonly complete: boolean;
+      readonly includeArchives?: boolean;
+      readonly deadline?: number;
+      readonly force?: boolean;
+    },
   ): Promise<ProjectKnowledgeIndexSyncResult> {
     await this.open();
     const database = this.requireDatabase();
+    const corpusSources = new Set(corpus.map((document) => document.source));
+    corpus = [...corpus]
+      .filter(
+        (document) => options.includeArchives !== false || !document.kind.endsWith('-archive'),
+      )
+      .sort(
+        (left, right) =>
+          knowledgeDocumentKindRank(left.kind) - knowledgeDocumentKindRank(right.kind),
+      );
+    const resumeKey = `refresh-source:${this.workspaceId}`;
+    const resumeSource = options.force ? undefined : metaMap(database).get(resumeKey);
+    const resumeIndex = corpus.findIndex((document) => document.source === resumeSource);
+    if (resumeIndex > 0) corpus = [...corpus.slice(resumeIndex), ...corpus.slice(0, resumeIndex)];
     const known = new Map(
       (
         database
@@ -401,10 +477,11 @@ export class ProjectKnowledgeIndexStore {
         }>
       ).map((entry) => [entry.source, entry]),
     );
-    const corpusSources = new Set(corpus.map((document) => document.source));
     const changedSources: ProjectKnowledgeDocument[] = [];
     const refreshedSources: ProjectKnowledgeDocument[] = [];
     this.lastSyncReadBytes = 0;
+    let sourceReads: readonly IndexSourceRead[] = [];
+    let nextSource = '';
     for (let index = 0; index < corpus.length; index += 1) {
       const document = corpus[index];
       if (options.deadline !== undefined && Date.now() > options.deadline) {
@@ -413,12 +490,24 @@ export class ProjectKnowledgeIndexStore {
           message: '未进入检索：索引刷新超过时间预算，尚未处理的语料当前不会参与召回。',
         });
         changedSources.push(...corpus.slice(index));
+        nextSource = document.source;
         break;
       }
-      let stat;
-      try {
-        stat = await fs.lstat(document.absolutePath);
-      } catch {
+      if (index % SOURCE_READ_CONCURRENCY === 0) {
+        // Limit in-flight protected reads; keep SQLite updates in corpus order.
+        sourceReads = await Promise.all(
+          corpus
+            .slice(index, index + SOURCE_READ_CONCURRENCY)
+            .map((source) => readIndexSource(this.projectRoot, source)),
+        );
+        this.lastSyncReadBytes += sourceReads.reduce(
+          (total, source) => total + (source.read?.bytes.length ?? 0),
+          0,
+        );
+      }
+      const sourceRead = sourceReads[index % SOURCE_READ_CONCURRENCY];
+      const stat = sourceRead.stat;
+      if (!stat) {
         changedSources.push(document);
         if (known.has(document.source)) {
           this.reportDiagnostic?.({
@@ -430,24 +519,16 @@ export class ProjectKnowledgeIndexStore {
       }
       const previous = known.get(document.source);
       try {
-        const read = await readProtectedProjectFile(
-          this.projectRoot,
-          document.source,
-          MAX_SOURCE_BYTES,
-          { label: document.source },
-        );
-        this.lastSyncReadBytes += read.bytes.length;
+        if (sourceRead.error || !sourceRead.read) throw sourceRead.error;
+        const read = sourceRead.read;
         if (options.deadline !== undefined && Date.now() > options.deadline) {
           this.reportDiagnostic?.({
             code: 'index-budget',
             message: '未进入检索：索引刷新超过时间预算，尚未处理的语料当前不会参与召回。',
           });
           changedSources.push(...corpus.slice(index));
+          nextSource = document.source;
           break;
-        }
-        const afterRead = await fs.lstat(document.absolutePath);
-        if (afterRead.size !== read.stat.size || afterRead.mtimeMs !== read.stat.mtimeMs) {
-          throw new Error('source changed while it was being indexed');
         }
         const digest = contentDigest(read.bytes);
         if (
@@ -469,6 +550,7 @@ export class ProjectKnowledgeIndexStore {
             message: '未进入检索：索引刷新超过时间预算，尚未处理的语料当前不会参与召回。',
           });
           changedSources.push(...corpus.slice(index));
+          nextSource = document.source;
           break;
         }
         try {
@@ -503,6 +585,7 @@ export class ProjectKnowledgeIndexStore {
         if (!corpusSources.has(source)) this.removeSource(database, this.workspaceId, source);
       }
     }
+    setMeta(database, resumeKey, nextSource);
     return { changedSources, refreshedSources, status: this.status() };
   }
 
@@ -510,6 +593,48 @@ export class ProjectKnowledgeIndexStore {
     const started = performance.now();
     const database = this.requireDatabase();
     const channels: Array<{ name: string; rows: SearchRow[] }> = [];
+    const historyRequested = projectKnowledgeHistoryRequested(query);
+    const documentTerms = ftsExpression([
+      ...query.strongTerms,
+      ...query.phraseTerms,
+      ...query.weakTerms,
+    ]);
+    if (documentTerms) {
+      channels.push({
+        name: 'fts-documents',
+        rows: database
+          .prepare(
+            `
+        SELECT -d.id AS id, d.source, p.kind, p.archived_at, d.title, d.title AS heading_path,
+          d.body, bm25(pk_fts_documents, 0.0, 0.0, 4.0, 1.0, 1.0) AS rank, 1 AS document_match
+        FROM pk_fts_documents JOIN pk_documents d ON d.id = pk_fts_documents.rowid
+        JOIN pk_sources p ON p.workspace_id = d.workspace_id AND p.source = d.source
+        WHERE pk_fts_documents MATCH ? AND d.workspace_id = ?
+        ORDER BY CASE WHEN ? OR p.kind NOT IN ('native-archive', 'classic-archive') THEN 0 ELSE 1 END, rank LIMIT 80
+      `,
+          )
+          .all(documentTerms, this.workspaceId, Number(historyRequested)) as unknown as SearchRow[],
+      });
+    }
+    const coverageTerms = [...new Set([...query.strongTerms, ...query.weakTerms])].slice(0, 4);
+    if (coverageTerms.length >= 2) {
+      channels.push({
+        name: 'fts-coverage',
+        rows: this.searchChannel(
+          database,
+          this.workspaceId,
+          'terms',
+          coverageTerms.map(quoteFts).join(' AND '),
+          20,
+        ),
+      });
+    }
+    const strongTerms = ftsExpression(query.strongTerms);
+    if (strongTerms)
+      channels.push({
+        name: 'fts-strong',
+        rows: this.searchChannel(database, this.workspaceId, 'terms', strongTerms, 20),
+      });
     const terms = ftsExpression([...query.strongTerms, ...query.phraseTerms, ...query.weakTerms]);
     if (terms)
       channels.push({
@@ -545,20 +670,29 @@ export class ProjectKnowledgeIndexStore {
         const phrase = query.phraseTerms.some((term) =>
           searchable.includes(term.toLocaleLowerCase()),
         );
-        const matchedTerms = query.terms.filter((term) =>
-          searchable.includes(term.toLocaleLowerCase()),
-        ).length;
+        const matchedTerms = independentQueryTermCount(
+          query.terms.filter((term) => searchable.includes(term.toLocaleLowerCase())),
+        );
+        const topic =
+          `${row.source.split('/').slice(-2).join('/')}\n${row.title}\n${row.heading_path}`.toLocaleLowerCase();
+        const topicPhrase = query.phraseTerms.some((term) =>
+          topic.includes(term.toLocaleLowerCase()),
+        );
         const pathAssociation = Boolean(
           query.path && row.source.toLocaleLowerCase().includes(query.path.toLocaleLowerCase()),
         );
         const kindRank = row.kind.endsWith('-spec') ? 0 : row.kind.endsWith('-archive') ? 1 : 2;
         return {
           row,
+          strong,
+          topicPhrase,
+          archived: row.kind.endsWith('-archive'),
           reliable: strong || phrase || matchedTerms >= 2,
           score:
             score +
             (strong ? 0.05 : 0) +
             (phrase ? 0.025 : 0) +
+            (topicPhrase ? 0.05 : 0) +
             (pathAssociation ? 0.03 : 0) -
             kindRank * 0.05,
           names,
@@ -567,7 +701,14 @@ export class ProjectKnowledgeIndexStore {
       .filter((candidate) => candidate.reliable)
       .sort(
         (left, right) =>
-          right.score - left.score || left.row.source.localeCompare(right.row.source),
+          Number(right.strong) - Number(left.strong) ||
+          (historyRequested ? 0 : Number(left.archived) - Number(right.archived)) ||
+          Number(Boolean(right.row.document_match)) - Number(Boolean(left.row.document_match)) ||
+          (left.row.document_match && right.row.document_match
+            ? Number(right.topicPhrase) - Number(left.topicPhrase) || left.row.rank - right.row.rank
+            : 0) ||
+          right.score - left.score ||
+          left.row.source.localeCompare(right.row.source),
       )
       .slice(0, 40);
     const elapsed = Math.round((performance.now() - started) * 100) / 100;
@@ -577,6 +718,7 @@ export class ProjectKnowledgeIndexStore {
     return results.map(({ row, score }) => ({
       source: row.source,
       title: row.title,
+      headingPath: row.heading_path,
       content: row.body.slice(0, 1600),
       score,
       document: {
@@ -754,6 +896,35 @@ export class ProjectKnowledgeIndexStore {
             section.body,
           );
       }
+      const documentBody = sections.map((section) => section.body).join('\n\n');
+      const documentTerms = sections.map((section) => section.lexicalTerms).join(' ');
+      database
+        .prepare(
+          'INSERT INTO pk_documents(workspace_id, source, title, body, lexical_terms) VALUES (?, ?, ?, ?, ?) ON CONFLICT(workspace_id, source) DO UPDATE SET title = excluded.title, body = excluded.body, lexical_terms = excluded.lexical_terms',
+        )
+        .run(
+          this.workspaceId,
+          document.source,
+          sections[0]?.title ?? document.source,
+          documentBody,
+          documentTerms,
+        );
+      const documentRow = database
+        .prepare('SELECT id FROM pk_documents WHERE workspace_id = ? AND source = ?')
+        .get(this.workspaceId, document.source) as { id: number };
+      database.prepare('DELETE FROM pk_fts_documents WHERE rowid = ?').run(documentRow.id);
+      database
+        .prepare(
+          'INSERT INTO pk_fts_documents(rowid, workspace_id, source, title, body, lexical_terms) VALUES (?, ?, ?, ?, ?, ?)',
+        )
+        .run(
+          documentRow.id,
+          this.workspaceId,
+          document.source,
+          sections[0]?.title ?? document.source,
+          documentBody,
+          documentTerms,
+        );
       setMeta(database, 'updatedAt', now);
       database.exec('COMMIT;');
     } catch (error) {
@@ -774,6 +945,14 @@ export class ProjectKnowledgeIndexStore {
     }>;
     database.exec('BEGIN IMMEDIATE;');
     try {
+      database
+        .prepare(
+          'DELETE FROM pk_fts_documents WHERE rowid IN (SELECT id FROM pk_documents WHERE workspace_id = ? AND source = ?)',
+        )
+        .run(workspaceId, source);
+      database
+        .prepare('DELETE FROM pk_documents WHERE workspace_id = ? AND source = ?')
+        .run(workspaceId, source);
       for (const { id } of rows) {
         database.prepare('DELETE FROM pk_fts_terms WHERE rowid = ?').run(id);
         database.prepare('DELETE FROM pk_fts_trigram WHERE rowid = ?').run(id);
@@ -801,10 +980,18 @@ export class ProjectKnowledgeIndexStore {
   ): SearchRow[] {
     const table = channel === 'terms' ? 'pk_fts_terms' : 'pk_fts_trigram';
     const weights =
-      channel === 'terms' ? '0.0, 0.0, 1.0, 3.0, 2.0, 0.8, 1.5' : '0.0, 0.0, 1.0, 2.5, 1.8, 0.7';
+      channel === 'terms' ? '0.0, 0.0, 1.0, 3.0, 2.0, 0.8' : '0.0, 0.0, 1.0, 2.5, 1.8';
     return database
       .prepare(
-        `SELECT s.id, s.source, p.kind, p.archived_at, s.title, s.heading_path, s.body, bm25(${table}, ${weights}) AS rank FROM ${table} JOIN pk_sections s ON s.id = ${table}.rowid JOIN pk_sources p ON p.workspace_id = s.workspace_id AND p.source = s.source WHERE ${table} MATCH ? AND s.workspace_id = ? ORDER BY rank LIMIT ?`,
+        `WITH matches AS MATERIALIZED (
+          SELECT s.id, s.source, p.kind, p.archived_at, s.title, s.heading_path, s.body, bm25(${table}, ${weights}) AS rank
+          FROM ${table} JOIN pk_sections s ON s.id = ${table}.rowid
+          JOIN pk_sources p ON p.workspace_id = s.workspace_id AND p.source = s.source
+          WHERE ${table} MATCH ? AND s.workspace_id = ?
+        ), documents AS (
+          SELECT *, ROW_NUMBER() OVER (PARTITION BY source ORDER BY rank, id) AS source_rank FROM matches
+        ) SELECT * FROM documents WHERE source_rank <= 3
+          ORDER BY CASE WHEN kind IN ('native-spec', 'classic-spec') THEN 0 ELSE 1 END, rank LIMIT ?`,
       )
       .all(expression, workspaceId, limit) as unknown as SearchRow[];
   }

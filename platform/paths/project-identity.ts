@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { AsyncLocalStorage } from 'node:async_hooks';
 
+import { runExternalCommandAsync, ExternalCommandError } from '../process/external-command.js';
 import { runGitCommand } from '../process/git.js';
 import { resolvePortablePath } from './portable-path.js';
 
@@ -85,7 +86,7 @@ export function resolveProjectIdentity(
 export function stableProjectId(identity: string): string {
   const normalized = normalizeIdentity(identity);
   const leaf = normalized.split(/[/:]/u).filter(Boolean).at(-1) ?? 'project';
-  const slug = leaf.replace(/[^a-z0-9._-]+/gu, '-').replace(/^-+|-+$/gu, '') || 'project';
+  const slug = trimBoundaryDashes(leaf.replace(/[^a-z0-9._-]+/gu, '-')) || 'project';
   const digest = createHash('sha256').update(normalized, 'utf8').digest('hex').slice(0, 8);
   return `${slug.slice(0, 40)}-${digest}`;
 }
@@ -97,6 +98,39 @@ export function resolveStableProjectId(
   return stableProjectId(resolveProjectIdentity(projectRoot, options));
 }
 
+/** 保持原有项目身份规则，同时允许可选学习查询取消等待 Git。 */
+export async function resolveStableProjectIdAsync(
+  projectRoot: string,
+  options: { readonly signal: AbortSignal; readonly timeoutMs: number },
+): Promise<string> {
+  const root = resolvePortablePath(projectRoot);
+  const run = async (args: readonly string[]) =>
+    runExternalCommandAsync('git', ['-C', root, ...args], {
+      timeoutMs: options.timeoutMs,
+      signal: options.signal,
+      maxBufferBytes: 64 * 1024,
+    });
+  const checkCancellation = (error: unknown) => {
+    if (options.signal.aborted || (error instanceof ExternalCommandError && error.timedOut))
+      throw error;
+  };
+  let source = root;
+  try {
+    const remote = (await run(['remote', 'get-url', 'origin'])).trim();
+    if (!remote) throw new Error('No origin');
+    source = remote;
+  } catch (error) {
+    checkCancellation(error);
+    try {
+      const commonDir = (await run(['rev-parse', '--git-common-dir'])).trim();
+      if (commonDir) source = resolvePortablePath(root, commonDir);
+    } catch (error) {
+      checkCancellation(error);
+    }
+  }
+  return stableProjectId(source);
+}
+
 export function resolveProjectName(
   projectRoot: string,
   options: ProjectIdentityOptions = {},
@@ -105,22 +139,37 @@ export function resolveProjectName(
 }
 
 function readableProjectName(value: string): string {
-  const normalized = value
-    .trim()
-    .replace(/\\/gu, '/')
-    .replace(/\.git$/iu, '')
-    .replace(/\/+$/u, '');
+  const normalized = trimTrailingSlashes(
+    value
+      .trim()
+      .replace(/\\/gu, '/')
+      .replace(/\.git$/iu, ''),
+  );
   const leaf = normalized.split(/[/:]/u).filter(Boolean).at(-1) ?? 'project';
-  return leaf.replace(/[^a-zA-Z0-9._-]+/gu, '-').replace(/^-+|-+$/gu, '') || 'project';
+  return trimBoundaryDashes(leaf.replace(/[^a-zA-Z0-9._-]+/gu, '-')) || 'project';
 }
 
 function normalizeIdentity(value: string): string {
-  const normalized = value
-    .trim()
-    .replace(/\\/gu, '/')
-    .replace(/\.git$/iu, '')
-    .replace(/\/+$/u, '')
-    .toLocaleLowerCase();
+  const normalized = trimTrailingSlashes(
+    value
+      .trim()
+      .replace(/\\/gu, '/')
+      .replace(/\.git$/iu, ''),
+  ).toLocaleLowerCase();
   if (!normalized) return 'project';
   return normalized;
+}
+
+function trimTrailingSlashes(value: string): string {
+  let end = value.length;
+  while (end > 0 && value[end - 1] === '/') end--;
+  return value.slice(0, end);
+}
+
+function trimBoundaryDashes(value: string): string {
+  let start = 0;
+  let end = value.length;
+  while (start < end && value[start] === '-') start++;
+  while (end > start && value[end - 1] === '-') end--;
+  return value.slice(start, end);
 }

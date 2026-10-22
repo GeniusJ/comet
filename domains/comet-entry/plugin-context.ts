@@ -1,19 +1,19 @@
 import path from 'node:path';
 import { ProjectKnowledgeHostReview } from '../project-knowledge/host-review.js';
-import { createHash } from 'node:crypto';
+import { workflowResultEvent, type CometWorkflowResult } from './workflow-learning-receipt.js';
+export { areCometWorkflowResultsProcessed } from './workflow-learning-receipt.js';
+export type { CometWorkflowResult } from './workflow-learning-receipt.js';
 
 import {
   createDefaultCometPluginBridge,
   type CometPluginContextContribution,
   type CometPluginContextRequest,
-} from '../comet-plugin/index.js';
+} from '../comet-plugin/comet.js';
 import type { MemoryLearningStatus } from '../comet-memory/index.js';
 import {
-  AGENT_EXPERIENCE_SCHEMA,
   type AgentContextExpansion,
   type AgentContextOutcomeStatus,
   type AgentContextOutcomeEvidence,
-  type AgentExperienceEventType,
 } from '../agent-learning/index.js';
 import { resolveStableProjectId } from '../../platform/paths/project-identity.js';
 
@@ -103,24 +103,9 @@ export async function recordCometContextOutcome(options: {
   await bridge.recordContextOutcome(options.applicationId, options.outcome, options.evidence);
 }
 
-export async function recordCometWorkflowResult(options: {
-  readonly projectRoot: string;
-  readonly workflow: string;
-  readonly changeId: string;
-  readonly command: string;
-  readonly success: boolean;
-  readonly eventType?: AgentExperienceEventType;
-  readonly changedPaths?: readonly string[];
-  readonly artifactRefs?: readonly string[];
-  readonly verificationCommands?: readonly string[];
-  readonly verificationResults?: readonly {
-    readonly command: string;
-    readonly success: boolean;
-  }[];
-  readonly summary?: string;
-  /** Whether the host performed the task-end learning check. */
-  readonly learningCheck?: 'submitted' | 'no-observation' | 'not-run';
-}): Promise<MemoryLearningStatus | undefined> {
+export async function recordCometWorkflowResult(
+  options: CometWorkflowResult,
+): Promise<MemoryLearningStatus | undefined> {
   if (!options.changeId.trim()) return;
   try {
     const notices: string[] = [];
@@ -129,6 +114,9 @@ export async function recordCometWorkflowResult(options: {
     });
     const language = bridge.currentLanguage;
     let learningStatus: MemoryLearningStatus | undefined;
+    const event = workflowResultEvent(options, bridge.currentProjectId, language);
+    await bridge.pluginRuntime.enqueueEvents([event]);
+    if (options.captureOnly) return undefined;
     if (options.learningCheck !== undefined) {
       try {
         learningStatus = await bridge.recordMemoryLearningCheck(options.learningCheck, {
@@ -137,102 +125,19 @@ export async function recordCometWorkflowResult(options: {
           changeId: options.changeId,
         });
       } catch {
-        // A Provider may not implement the optional task-end diagnostic yet;
-        // still dispatch the workflow checkpoint and keep the task nonblocking.
+        // The checkpoint is already durable even if the optional Provider diagnostic fails.
       }
     }
-    const eventType =
-      options.eventType ??
-      (options.command === 'archive'
-        ? 'change.archived'
-        : options.verificationResults !== undefined || options.command === 'check'
-          ? 'verification.completed'
-          : 'episode.completed');
-    const evidence = [
-      ...(options.changedPaths ?? []).map((source, index) => ({
-        id: `source-${index}`,
-        kind: 'source' as const,
-        summary: `Changed source: ${source}`,
-        source,
-        digest: digest(`${source}:${options.changeId}`),
-      })),
-      ...(options.artifactRefs ?? []).map((source, index) => ({
-        id: `artifact-${index}`,
-        kind: 'source' as const,
-        summary: `Workflow artifact: ${source}`,
-        source,
-        digest: digest(`${source}:${options.changeId}:artifact`),
-      })),
-      ...(options.verificationResults ?? []).map((result, index) => ({
-        id: `verification-${index}`,
-        kind: 'verification' as const,
-        summary: `${result.command}: ${result.success ? 'passed' : 'failed'}`,
-        command: result.command,
-        success: result.success,
-        digest: digest(`${result.command}:${result.success}`),
-      })),
-      ...(options.verificationCommands ?? [])
-        .filter(
-          (command) =>
-            !(options.verificationResults ?? []).some((result) => result.command === command),
-        )
-        .map((command, index) => ({
-          id: `verification-command-${index}`,
-          kind: 'verification' as const,
-          summary: `Verification command: ${command}`,
-          command,
-          digest: digest(command),
-        })),
-    ];
-    await bridge.dispatchExperience({
-      schema: AGENT_EXPERIENCE_SCHEMA,
-      eventId: `workflow:${digest(
-        JSON.stringify({
-          workflow: options.workflow,
-          changeId: options.changeId,
-          command: options.command,
-          eventType,
-          success: options.success,
-          evidence,
-        }),
-      )}`,
-      episodeId: `workflow:${digest(`${options.workflow}:${options.changeId}`)}`,
-      occurredAt: new Date().toISOString(),
-      type: eventType,
-      actor: 'workflow',
-      scope: 'project',
-      projectId: bridge.currentProjectId,
-      source: {
-        kind: 'workflow',
-        name: options.workflow,
-        workflow: options.workflow,
-        changeId: options.changeId,
-        command: options.command,
-      },
-      context: {
-        workflow: options.workflow,
-        changeId: options.changeId,
-        operation: options.command,
-        ...(options.changedPaths === undefined ? {} : { paths: options.changedPaths }),
-      },
-      evidence,
-      outcome: {
-        status: options.success ? 'used-successfully' : 'contributed-to-failure',
-        summary:
-          options.summary ??
-          (language === 'en' ? 'Workflow checkpoint completed' : '工作流检查点已完成'),
-      },
-    });
-    for (const notice of notices) console.log(notice);
+    await bridge.dispatchExperience(event);
+    for (const notice of notices) process.stderr.write(`${notice}\n`);
     return learningStatus;
   } catch {
     // Memory learning is optional and must never block a workflow checkpoint.
+    process.stderr.write(
+      'Workflow learning checkpoint is unavailable; the workflow result is unchanged.\n',
+    );
     return undefined;
   }
-}
-
-function digest(value: string): string {
-  return createHash('sha256').update(value).digest('hex');
 }
 
 async function createBridge(

@@ -1,4 +1,8 @@
+import { compactCliStdout } from '../workflow-contract/compact-output.js';
 import { nativeArchiveCommand } from './native-archive-command.js';
+import { withCometRuntimeProgress } from '../../platform/process/runtime-metrics.js';
+import { observeRuntimeOperation } from '../../platform/process/runtime-performance.js';
+import { nativeCancelCommand } from './native-cancel-command.js';
 import { nativeCheckCommand } from './native-check-command.js';
 import { nativeDoctorCommand } from './native-doctor-command.js';
 import { nativeHookGuardCommand } from './native-hook-guard-command.js';
@@ -10,6 +14,7 @@ import { nativeSelectCommand } from './native-select-command.js';
 import { nativeShowCommand } from './native-show-command.js';
 import { nativeSpecCommand } from './native-spec-command.js';
 import { nativeStatusCommand } from './native-status-command.js';
+import { nativeTransferCommand } from './native-transfer-command.js';
 import { nativeHelp } from './native-cli-help.js';
 import {
   errorResult,
@@ -54,8 +59,10 @@ const COMMAND_HANDLERS: Record<string, NativeCommandHandler> = {
   select: nativeSelectCommand,
   next: nativeNextCommand,
   archive: nativeArchiveCommand,
+  cancel: nativeCancelCommand,
   check: nativeCheckCommand,
   doctor: nativeDoctorCommand,
+  transfer: nativeTransferCommand,
 };
 
 async function dispatch(
@@ -86,7 +93,20 @@ async function dispatch(
   if (!handler) {
     throw new NativeUsageError(`Unknown Native command: ${command}`);
   }
-  return { executionCwd: projectRoot, ...(await handler(rawArgs, projectRoot)) };
+  const invoke = () => handler(rawArgs, projectRoot);
+  const result =
+    command === 'hook-guard'
+      ? await invoke()
+      : await observeRuntimeOperation(
+          {
+            projectRoot: () => projectRoot,
+            workflow: 'native',
+            command,
+            errorExitCode: (error) => errorResult(command, error).exitCode,
+          },
+          invoke,
+        );
+  return { executionCwd: projectRoot, ...result };
 }
 
 export async function runNativeCliDetailed(
@@ -99,23 +119,32 @@ export async function runNativeCliDetailed(
   const commandTail = separator < 0 ? [] : args.slice(separator);
   const json = globalArgs.includes('--json');
   const verbose = globalArgs.includes('--verbose');
+  const compact = globalArgs.includes('--compact');
   let explicitProjectRoot: string | undefined;
   let command: string | null = globalArgs[0] ?? null;
   try {
     takeFlag(globalArgs, '--json');
+    takeFlag(globalArgs, '--compact');
+    if (compact && !json) throw new NativeUsageError('--compact requires --json');
     takeFlag(globalArgs, '--verbose');
     explicitProjectRoot = takeOption(globalArgs, '--project-root');
     const dispatchArgs = [...globalArgs, ...commandTail];
     command = dispatchArgs[0] ?? null;
     const invoke = () =>
       dispatch(dispatchArgs, explicitProjectRoot, options.invocationCwd ?? process.cwd());
-    const dispatchResult = isNativeReadOnlyCommand(command ?? '', dispatchArgs.slice(1))
-      ? await withGitWorktreeReadScope(invoke)
-      : await invoke();
+    const run = async () =>
+      isNativeReadOnlyCommand(command ?? '', dispatchArgs.slice(1))
+        ? await withGitWorktreeReadScope(invoke)
+        : await invoke();
+    const dispatchResult =
+      command === 'hook-guard' ? await run() : await withCometRuntimeProgress(run);
     const rendered = renderNativeCommandDetailed(dispatchResult, json, verbose);
     return {
       dispatch: dispatchResult,
-      output: rendered.output,
+      output:
+        compact && json
+          ? { ...rendered.output, stdout: compactCliStdout(rendered.output.stdout, true) }
+          : rendered.output,
       experience: projectNativeExperienceEvidence(
         dispatchResult.data,
         rendered.structuredDataVisible,
@@ -128,7 +157,10 @@ export async function runNativeCliDetailed(
     const rendered = renderNativeCommandDetailed(dispatchResult, json, verbose);
     return {
       dispatch: dispatchResult,
-      output: rendered.output,
+      output:
+        compact && json
+          ? { ...rendered.output, stdout: compactCliStdout(rendered.output.stdout, true) }
+          : rendered.output,
       experience: projectNativeExperienceEvidence(
         dispatchResult.data,
         rendered.structuredDataVisible,

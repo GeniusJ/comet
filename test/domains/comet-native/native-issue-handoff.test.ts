@@ -1,3 +1,4 @@
+import { resolveWorkspaceRuntimeRootSync } from '../../../domains/workflow-contract/workspace-runtime.js';
 import { execFileSync } from 'node:child_process';
 import { promises as fs } from 'node:fs';
 import os from 'node:os';
@@ -45,7 +46,7 @@ describe('Native issue handoff regressions', () => {
     };
   }
   function plan(failOnce = false) {
-    const counter = path.join(root, '.comet/runtime/check-count.txt');
+    const counter = path.join(resolveWorkspaceRuntimeRootSync(root), 'check-count.txt');
     return {
       id: 'fixture-check',
       name: 'Fixture check',
@@ -107,7 +108,7 @@ describe('Native issue handoff regressions', () => {
       ],
       { cwd: root, stdio: 'ignore' },
     );
-    expect((await cli(['new', name])).exitCode).toBe(0);
+    expect((await cli(['new', name, '--runtime', 'compat'])).exitCode).toBe(0);
     await fs.writeFile(
       path.join(root, 'docs/comet/changes', name, 'brief.md'),
       '# Outcome\nShip fixture behaviors.\n# Scope\nFirst and second behaviors.\n## Directory structure\n### Created\nNone.\n### Modified\nNone.\n### Deleted\nNone.\n### Not created\nNone.\n# Non-goals\nNo unrelated work.\n# Acceptance examples\n- First behavior works.\n- Second behavior works.\n# Constraints and invariants\nKeep scope fixed.\n# Decisions\nUse fixture implementation.\n# Open questions\nNone.\n# Verification expectations\nRun applicable checks.\n',
@@ -168,15 +169,20 @@ describe('Native issue handoff regressions', () => {
         continuation: { action: 'await-verifier' },
       },
     });
-    expect(await fs.readFile(path.join(root, '.comet/runtime/check-count.txt'), 'utf8')).toBe(
-      'run\n',
-    );
+    expect(
+      await fs.readFile(
+        path.join(resolveWorkspaceRuntimeRootSync(root), 'check-count.txt'),
+        'utf8',
+      ),
+    ).toBe('run\n');
   });
 
   it('does not classify protocol files during validate-only', async () => {
     expect((await cli(['next', name, '--validate-only'], handoff(), true)).exitCode).toBe(0);
     await expect(
-      fs.lstat(path.join(root, '.comet/runtime/native/runner-input-artifacts.json')),
+      fs.lstat(
+        path.join(resolveWorkspaceRuntimeRootSync(root), 'native/runner-input-artifacts.json'),
+      ),
     ).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
@@ -239,9 +245,12 @@ describe('Native issue handoff regressions', () => {
       exitCode: 0,
       data: { requestChecks: { reusedCheckIds: [check.id], executedCheckIds: [] } },
     });
-    expect(await fs.readFile(path.join(root, '.comet/runtime/check-count.txt'), 'utf8')).toBe(
-      'run\n',
-    );
+    expect(
+      await fs.readFile(
+        path.join(resolveWorkspaceRuntimeRootSync(root), 'check-count.txt'),
+        'utf8',
+      ),
+    ).toBe('run\n');
   });
 
   it.each([

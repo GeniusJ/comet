@@ -41,6 +41,31 @@ async function physicalPathForPossiblyMissingTarget(target: string): Promise<str
   }
 }
 
+/** Runtime 禁写兼容项目相对路径和宿主 cwd 相对路径，不改变普通 phase guard 的归属。 */
+export function cometHookRuntimeTargetCandidates(
+  projectRoot: string,
+  target: string,
+  cwd?: string,
+): string[] {
+  const candidates = [path.resolve(projectRoot, target)];
+  if (!path.isAbsolute(target) && cwd && path.isAbsolute(cwd)) {
+    candidates.push(path.resolve(cwd, target));
+  }
+  return [...new Set(candidates)];
+}
+
+/** 受管存储即使在项目外也不能写入；同时识别链接别名和尚未创建的目标。 */
+export async function isCometHookTargetWithin(root: string, target: string): Promise<boolean> {
+  const resolvedRoot = path.resolve(root);
+  const resolvedTarget = path.resolve(target);
+  if (isWithin(resolvedRoot, resolvedTarget)) return true;
+  const [physicalRoot, physicalTarget] = await Promise.all([
+    physicalPathForPossiblyMissingTarget(resolvedRoot),
+    physicalPathForPossiblyMissingTarget(resolvedTarget),
+  ]);
+  return physicalRoot !== null && physicalTarget !== null && isWithin(physicalRoot, physicalTarget);
+}
+
 export async function scopeCometHookTargets(
   projectRoot: string,
   targets: readonly string[],

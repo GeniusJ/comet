@@ -1,4 +1,11 @@
-import { existsSync, promises as fs } from 'fs';
+import {
+  resolveWorkspaceRuntimeRoot,
+  resolveWorkspaceRuntimeRootSync,
+  migrateWorkspaceRuntimeDirectory,
+  isWorkspaceRuntimeMigrationFence,
+  isWorkspaceRuntimeMigrationFenceSync,
+} from '../workflow-contract/workspace-runtime.js';
+import { lstatSync, promises as fs } from 'fs';
 import path from 'path';
 import os from 'os';
 
@@ -7,6 +14,7 @@ import { normalizeWorkflowArtifactRoot } from '../workflow-contract/project-conf
 import type { NativeChangeArtifactPaths, NativeProjectPaths } from './native-types.js';
 
 export const PROJECT_CONFIG_FILE = '.comet/config.yaml';
+const runtimeMigrationInspections = new Map<string, Promise<void>>();
 const NATIVE_CHANGE_NAME_PATTERN = /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/u;
 
 async function isFileOrDirectory(target: string): Promise<boolean> {
@@ -103,6 +111,7 @@ export async function resolveArtifactRoot(projectRoot: string, value: string): P
 export async function nativeProjectPaths(
   projectRoot: string,
   artifactRootRef: string,
+  options: { readOnly?: boolean } = {},
 ): Promise<NativeProjectPaths> {
   const normalized = normalizeArtifactRootRef(artifactRootRef);
   const artifactRoot = await resolveArtifactRoot(projectRoot, normalized);
@@ -118,18 +127,15 @@ export async function nativeProjectPaths(
     throw new Error('The configured Native comet root resolves outside its artifact root');
   }
   const resolvedProjectRoot = path.resolve(projectRoot);
-  const runtimeDir = path.join(resolvedProjectRoot, '.comet', 'runtime', 'native');
+  const workspaceRuntimeRoot = options.readOnly
+    ? resolveWorkspaceRuntimeRootSync(resolvedProjectRoot)
+    : await resolveWorkspaceRuntimeRoot(resolvedProjectRoot);
+  const runtimeDir = path.join(workspaceRuntimeRoot, 'native');
   if (await isSymbolicLink(runtimeDir)) {
     throw new Error('The Native Runtime root must not be a symbolic link');
   }
-  const [physicalProjectRoot, physicalRuntimeDir] = await Promise.all([
-    fs.realpath(resolvedProjectRoot),
-    physicalPath(runtimeDir),
-  ]);
-  if (!inside(physicalProjectRoot, physicalRuntimeDir)) {
-    throw new Error('The Native Runtime root resolves outside the project root');
-  }
-  return {
+  await resolveContainedNativePath(workspaceRuntimeRoot, runtimeDir);
+  const paths: NativeProjectPaths = {
     projectRoot: resolvedProjectRoot,
     configFile: path.join(projectRoot, ...PROJECT_CONFIG_FILE.split('/')),
     artifactRoot,
@@ -138,11 +144,56 @@ export async function nativeProjectPaths(
     specsDir: path.join(nativeRoot, 'specs'),
     changesDir: path.join(nativeRoot, 'changes'),
     archiveDir: path.join(nativeRoot, 'archive'),
+    workspaceRuntimeRoot,
     runtimeDir,
     changesRuntimeDir: path.join(runtimeDir, 'changes'),
     locksDir: path.join(runtimeDir, 'locks'),
     transactionsDir: path.join(runtimeDir, 'transactions'),
   };
+  if (options.readOnly) return paths;
+  const migrationKey = `${workspaceRuntimeRoot}\0${nativeRoot}`;
+  let migration = runtimeMigrationInspections.get(migrationKey);
+  if (!migration) {
+    migration = migrateNativeChangeRuntimeDirectories(paths);
+    runtimeMigrationInspections.set(migrationKey, migration);
+  }
+  try {
+    await migration;
+  } finally {
+    if (runtimeMigrationInspections.get(migrationKey) === migration) {
+      runtimeMigrationInspections.delete(migrationKey);
+    }
+  }
+  return paths;
+}
+
+async function migrateNativeChangeRuntimeDirectories(paths: NativeProjectPaths): Promise<void> {
+  await resolveContainedNativePath(paths.nativeRoot, paths.changesDir);
+  let entries;
+  try {
+    entries = await fs.readdir(paths.changesDir, { withFileTypes: true });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+    throw error;
+  }
+  for (const entry of entries) {
+    if (
+      !entry.isDirectory() ||
+      entry.isSymbolicLink() ||
+      !NATIVE_CHANGE_NAME_PATTERN.test(entry.name)
+    )
+      continue;
+    const source = nativeLegacyChangeRuntimeDir(paths, entry.name);
+    if (!(await isFileOrDirectory(source))) continue;
+    await migrateWorkspaceRuntimeDirectory(
+      source,
+      nativePreferredChangeRuntimeDir(paths, entry.name),
+      {
+        projectRoot: paths.projectRoot,
+        ignoreForeignWorkspaceFence: true,
+      },
+    );
+  }
 }
 
 export async function ensureNativeDirectories(paths: NativeProjectPaths): Promise<void> {
@@ -154,7 +205,7 @@ export async function ensureNativeDirectories(paths: NativeProjectPaths): Promis
   );
   await Promise.all(
     [paths.changesRuntimeDir, paths.locksDir, paths.transactionsDir].map(async (directory) => {
-      await resolveContainedNativePath(paths.projectRoot, directory);
+      await resolveContainedNativePath(paths.workspaceRuntimeRoot, directory);
       await fs.mkdir(directory, { recursive: true });
     }),
   );
@@ -185,15 +236,24 @@ export function nativeLegacyChangeRuntimeDir(paths: NativeProjectPaths, name: st
 }
 
 /**
- * Resolve the physical Runtime root for a change. New Runtime wins whenever it exists;
- * otherwise an existing legacy `<change>/runtime` remains readable until Doctor migrates it.
- * A missing Runtime resolves to the preferred new location so all new writes use `.comet`.
+ * 只返回工作区隔离的用户级 Runtime；旧 change/runtime 必须先完成迁移。
  */
 export function nativeChangeRuntimeDir(paths: NativeProjectPaths, name: string): string {
   const preferred = nativePreferredChangeRuntimeDir(paths, name);
-  if (existsSync(preferred)) return preferred;
   const legacy = nativeLegacyChangeRuntimeDir(paths, name);
-  return existsSync(legacy) ? legacy : preferred;
+  try {
+    const stat = lstatSync(legacy);
+    if (
+      stat.isDirectory() ||
+      stat.isSymbolicLink() ||
+      !isWorkspaceRuntimeMigrationFenceSync(legacy)
+    ) {
+      throw new Error(`Legacy Native Runtime requires migration before use: ${legacy}`);
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+  return preferred;
 }
 
 export function nativeChangeArtifactPaths(
@@ -219,7 +279,7 @@ export function nativeChangeArtifactPaths(
 
 export interface NativeRuntimeStorageInspection {
   status: 'available' | 'missing' | 'invalid';
-  layout: 'project-local' | 'legacy' | 'missing';
+  layout: 'user-local' | 'legacy' | 'missing';
   path: string;
   message?: string;
 }
@@ -236,6 +296,18 @@ async function inspectRuntimeDirectory(
   }
 }
 
+async function inspectLegacyRuntimeDirectory(
+  target: string,
+): Promise<'directory' | 'missing' | 'invalid'> {
+  const kind = await inspectRuntimeDirectory(target);
+  if (kind !== 'invalid') return kind;
+  try {
+    return (await isWorkspaceRuntimeMigrationFence(target)) ? 'missing' : 'invalid';
+  } catch {
+    return 'invalid';
+  }
+}
+
 /** Read-only storage health used by status/doctor before opening machine-owned files. */
 export async function inspectNativeRuntimeStorage(
   paths: NativeProjectPaths,
@@ -245,12 +317,12 @@ export async function inspectNativeRuntimeStorage(
   const legacy = nativeLegacyChangeRuntimeDir(paths, name);
   const [preferredKind, legacyKind] = await Promise.all([
     inspectRuntimeDirectory(preferred),
-    inspectRuntimeDirectory(legacy),
+    inspectLegacyRuntimeDirectory(legacy),
   ]);
   if (preferredKind === 'invalid') {
     return {
       status: 'invalid',
-      layout: 'project-local',
+      layout: 'user-local',
       path: preferred,
       message: 'Native Runtime path must be a real directory',
     };
@@ -266,13 +338,13 @@ export async function inspectNativeRuntimeStorage(
   if (preferredKind === 'directory' && legacyKind === 'directory') {
     return {
       status: 'invalid',
-      layout: 'project-local',
+      layout: 'user-local',
       path: preferred,
-      message: 'Both project-local and legacy Native Runtime directories exist',
+      message: 'Both user-local and legacy Native Runtime directories exist',
     };
   }
   if (preferredKind === 'directory') {
-    return { status: 'available', layout: 'project-local', path: preferred };
+    return { status: 'available', layout: 'user-local', path: preferred };
   }
   if (legacyKind === 'directory') {
     return { status: 'available', layout: 'legacy', path: legacy };

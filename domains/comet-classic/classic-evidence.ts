@@ -1,3 +1,4 @@
+import { classicProjectFileNonempty } from './classic-protected-path.js';
 import path from 'path';
 import { inspectClassicPlanReadiness } from './classic-plan-readiness.js';
 import { parseClassicTasks } from './classic-tasks.js';
@@ -283,7 +284,25 @@ export async function collectClassicEvidence(
       layoutError,
     ),
     archivedHandoffEvidence(projectRoot, changeDir, classic?.handoffContext ?? null, layout),
-    directFileEvidence(projectRoot, 'run.checkpoint', checkpoint),
+    (async (): Promise<ClassicEvidence> => {
+      try {
+        return {
+          code: 'run.checkpoint',
+          source: relativeSource(projectRoot, checkpoint),
+          satisfied: await classicProjectFileNonempty(
+            projectRoot,
+            checkpoint,
+            'Classic Run checkpoint',
+          ),
+        };
+      } catch (error) {
+        return {
+          code: 'run.checkpoint',
+          satisfied: false,
+          detail: error instanceof Error ? error.message : String(error),
+        };
+      }
+    })(),
   ]);
 
   const handoff = evidence.find((item) => item.code === 'design.handoff');

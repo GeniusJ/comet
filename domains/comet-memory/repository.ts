@@ -1,9 +1,15 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { execFile } from 'node:child_process';
+import { isDeepStrictEqual } from 'node:util';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { constants as fsConstants, promises as fs } from 'node:fs';
-import { promisify } from 'node:util';
 import path from 'node:path';
 import { independentGitEnvironment } from '../../platform/process/git-environment.js';
+import { runExternalCommandAsync } from '../../platform/process/external-command.js';
+import {
+  operationSignal,
+  remainingOperationMs,
+  throwIfOperationAborted,
+} from '../../platform/process/operation-budget.js';
 
 import { withRecoverableFileLock } from '../../platform/fs/plugin-store.js';
 
@@ -16,8 +22,6 @@ import type {
   MemoryRuntimeState,
   MemorySyncResult,
 } from './types.js';
-
-const execFileAsync = promisify(execFile);
 
 const DEFAULT_LOCK_TIMEOUT_MS = 30_000;
 const DEFAULT_LOCK_RETRY_MS = 20;
@@ -94,6 +98,8 @@ export class FileMemoryRepository implements MemoryRepository {
   private readonly lockRetryMs: number;
   private readonly projectKey?: string;
   private readonly projectName?: string;
+  private stateWriteNeeded = true;
+  private stateCache?: { signature: string; state: MemoryRuntimeState; content: string };
 
   public constructor(root: string, options: FileMemoryRepositoryOptions = {}) {
     this.root = path.resolve(root);
@@ -141,7 +147,38 @@ export class FileMemoryRepository implements MemoryRepository {
     await fs.rename(temporary, target);
   }
 
+  private async stateSignature(): Promise<string | null> {
+    try {
+      const stat = await fs.stat(this.resolve('.comet/runtime/memory-state.json'), {
+        bigint: true,
+      });
+      if (
+        typeof stat.dev !== 'bigint' ||
+        stat.dev < 0n ||
+        typeof stat.ino !== 'bigint' ||
+        stat.ino <= 0n ||
+        typeof stat.size !== 'bigint' ||
+        stat.size < 0n ||
+        typeof stat.mtimeNs !== 'bigint' ||
+        stat.mtimeNs <= 0n ||
+        typeof stat.ctimeNs !== 'bigint' ||
+        stat.ctimeNs <= 0n
+      )
+        return null;
+      return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+      throw error;
+    }
+  }
+
   public async readState(): Promise<MemoryRuntimeState> {
+    const signature = await this.stateSignature();
+    if (signature !== null && this.stateCache?.signature === signature) {
+      return structuredClone(this.stateCache.state);
+    }
+    this.stateCache = undefined;
+    this.stateWriteNeeded = true;
     const content = await this.readText('.comet/runtime/memory-state.json');
     if (content === null || content.trim().length === 0) return emptyMemoryState();
     let parsed: unknown;
@@ -152,11 +189,29 @@ export class FileMemoryRepository implements MemoryRepository {
         cause: error,
       });
     }
-    return validateState(parsed);
+    const state = validateState(parsed);
+    this.stateWriteNeeded = !isDeepStrictEqual(parsed, state);
+    // 仅缓存读取期间未被其他进程替换的文件；返回副本，调用者不能修改缓存。
+    if (signature !== null && signature === (await this.stateSignature())) {
+      this.stateCache = { signature, state: structuredClone(state), content };
+    }
+    return state;
+  }
+
+  public needsStateWrite(): boolean {
+    return this.stateWriteNeeded;
   }
 
   public async writeState(state: MemoryRuntimeState): Promise<void> {
-    await this.writeText('.comet/runtime/memory-state.json', `${JSON.stringify(state, null, 2)}\n`);
+    const content = `${JSON.stringify(state, null, 2)}\n`;
+    if (
+      this.stateCache?.content === content &&
+      this.stateCache.signature === (await this.stateSignature())
+    )
+      return;
+    this.stateCache = undefined;
+    await this.writeText('.comet/runtime/memory-state.json', content);
+    this.stateWriteNeeded = false;
   }
 
   public async withLock<T>(operation: () => Promise<T>): Promise<T> {
@@ -177,7 +232,7 @@ export class FileMemoryRepository implements MemoryRepository {
         message: 'No memory Git remote is configured',
       };
     }
-    return this.withLock(() => this.git!.sync());
+    return this.git.sync();
   }
 
   public async remote(): Promise<string | null> {
@@ -186,7 +241,7 @@ export class FileMemoryRepository implements MemoryRepository {
 
   public async configureRemote(url: string): Promise<void> {
     if (!this.git?.configureRemote) throw new Error('Memory Git sync is unavailable');
-    await this.withLock(() => this.git!.configureRemote!(url));
+    await this.git.configureRemote(url);
   }
 
   private resolve(relativePath: string): string {
@@ -212,6 +267,8 @@ export class GitMemorySync implements MemoryGitSync {
   private readonly root: string;
   private readonly remoteName: string;
   private readonly commitMessage: string;
+  private readonly timeoutMs: number;
+  private readonly deadline = new AsyncLocalStorage<number>();
   private readonly runCommand: (args: readonly string[]) => Promise<{
     readonly stdout: string;
     readonly stderr: string;
@@ -221,30 +278,74 @@ export class GitMemorySync implements MemoryGitSync {
     this.root = path.resolve(root);
     this.remoteName = options.remoteName ?? 'origin';
     this.commitMessage = options.commitMessage ?? 'chore(memory): sync personal memory';
-    this.runCommand =
-      options.run ??
-      (async (args) => {
-        const result = await execFileAsync('git', [...args], {
+    this.timeoutMs = options.timeoutMs ?? 30_000;
+    if (!Number.isSafeInteger(this.timeoutMs) || this.timeoutMs < 1)
+      throw new Error('Memory Git sync timeout must be a positive integer');
+    this.runCommand = async (args) => {
+      throwIfOperationAborted();
+      const remaining = Math.ceil(
+        remainingOperationMs(
+          (this.deadline.getStore() ?? performance.now() + this.timeoutMs) - performance.now(),
+        ),
+      );
+      if (remaining <= 0)
+        throw new Error(
+          'Memory Git sync exceeded its total time budget; retry synchronization later.',
+        );
+      if (options.run) return options.run(args, { timeoutMs: remaining });
+      return {
+        stdout: await runExternalCommandAsync('git', args, {
           cwd: this.root,
-          env: independentGitEnvironment(),
-          windowsHide: true,
-          maxBuffer: 1024 * 1024,
-        });
-        return { stdout: result.stdout, stderr: result.stderr };
-      });
+          env: { ...independentGitEnvironment(), GIT_TERMINAL_PROMPT: '0' },
+          timeoutMs: remaining,
+          signal: operationSignal(),
+          maxBufferBytes: 1024 * 1024,
+        }),
+        stderr: '',
+      };
+    };
   }
 
   public async sync(): Promise<MemorySyncResult> {
+    try {
+      return await this.deadline.run(performance.now() + this.timeoutMs, () =>
+        this.withGitLock(() => this.synchronize()),
+      );
+    } catch (error) {
+      return failedSync(error, false);
+    }
+  }
+
+  private async withGitLock<T>(operation: () => Promise<T>): Promise<T> {
+    const directory = path.join(this.root, '.comet', 'runtime');
+    await fs.mkdir(directory, { recursive: true });
+    return withRecoverableFileLock(path.join(directory, '.git-sync.lock'), operation, {
+      timeoutMs: Math.max(
+        1,
+        Math.ceil(
+          (this.deadline.getStore() ?? performance.now() + this.timeoutMs) - performance.now(),
+        ),
+      ),
+    });
+  }
+
+  private withMemoryLock<T>(operation: () => Promise<T>): Promise<T> {
+    return new FileMemoryRepository(this.root).withLock(operation);
+  }
+
+  private async synchronize(): Promise<MemorySyncResult> {
     await fs.mkdir(this.root, { recursive: true });
     try {
-      await this.ensureDedicatedRepository();
+      await this.withMemoryLock(() => this.ensureDedicatedRepository());
     } catch (error) {
       return failedSync(error, false);
     }
 
     try {
       await this.runCommand(['remote', 'get-url', this.remoteName]);
-    } catch {
+    } catch (error) {
+      if (performance.now() >= (this.deadline.getStore() ?? Infinity))
+        return failedSync(error, false);
       return {
         status: 'local-only',
         retryable: false,
@@ -303,58 +404,65 @@ export class GitMemorySync implements MemoryGitSync {
       if (branches.includes(branch)) {
         await this.runCommand(['fetch', this.remoteName, `refs/heads/${branch}:${remoteRef}`]);
       }
-      const paths: string[] = [];
-      for (const candidate of ['profile.md', '.comet/runtime/memory-state.json']) {
-        try {
-          await fs.access(path.join(this.root, candidate));
-          paths.push(candidate);
-        } catch {
-          // A scope is optional until its first memory exists.
-        }
-      }
-      try {
-        await fs.access(path.join(this.root, 'projects'));
-        paths.push('projects');
-      } catch {
-        // The project memory directory is optional until the first project memory exists.
-      }
-      if (paths.length === 0 && branches.length === 0) {
-        return { status: 'local-only', retryable: false, message: 'No memory files exist yet' };
-      }
-      let changed = false;
-      if (paths.length > 0) {
-        await this.runCommand(['add', '--', ...paths]);
-        changed =
-          (await this.runCommand(['status', '--porcelain', '--', ...paths])).stdout.trim().length >
-          0;
-        if (changed)
-          await this.runCommand(['commit', '--only', '-m', this.commitMessage, '--', ...paths]);
-      }
-      if (branches.includes(branch)) {
-        let hasHead = false;
-        try {
-          await this.runCommand(['rev-parse', '--verify', 'HEAD']);
-          hasHead = true;
-        } catch {
-          /* First pull into an unborn branch. */
-        }
-        if (!hasHead) {
-          await this.runCommand(['merge', '--ff-only', remoteRef]);
-        } else {
-          let related = false;
+      const local = await this.withMemoryLock(async () => {
+        if (await this.hasConflicts())
+          throw new Error('Resolve memory merge conflicts before retrying sync.');
+        const paths: string[] = [];
+        for (const candidate of ['profile.md', '.comet/runtime/memory-state.json']) {
           try {
-            await this.runCommand(['merge-base', 'HEAD', remoteRef]);
-            related = true;
+            await fs.access(path.join(this.root, candidate));
+            paths.push(candidate);
           } catch {
-            /* Independently initialized memory repositories. */
+            // A scope is optional until its first memory exists.
           }
-          await this.runCommand(
-            related
-              ? ['rebase', remoteRef]
-              : ['merge', '--allow-unrelated-histories', '--no-edit', remoteRef],
-          );
         }
-      }
+        try {
+          await fs.access(path.join(this.root, 'projects'));
+          paths.push('projects');
+        } catch {
+          // The project memory directory is optional until the first project memory exists.
+        }
+        if (paths.length === 0 && branches.length === 0) {
+          return null;
+        }
+        let changed = false;
+        if (paths.length > 0) {
+          await this.runCommand(['add', '--', ...paths]);
+          changed =
+            (await this.runCommand(['status', '--porcelain', '--', ...paths])).stdout.trim()
+              .length > 0;
+          if (changed)
+            await this.runCommand(['commit', '--only', '-m', this.commitMessage, '--', ...paths]);
+        }
+        if (branches.includes(branch)) {
+          let hasHead = false;
+          try {
+            await this.runCommand(['rev-parse', '--verify', 'HEAD']);
+            hasHead = true;
+          } catch {
+            /* First pull into an unborn branch. */
+          }
+          if (!hasHead) {
+            await this.runCommand(['merge', '--ff-only', remoteRef]);
+          } else {
+            let related = false;
+            try {
+              await this.runCommand(['merge-base', 'HEAD', remoteRef]);
+              related = true;
+            } catch {
+              /* Independently initialized memory repositories. */
+            }
+            await this.runCommand(
+              related
+                ? ['rebase', remoteRef]
+                : ['merge', '--allow-unrelated-histories', '--no-edit', remoteRef],
+            );
+          }
+        }
+        return changed;
+      });
+      if (local === null)
+        return { status: 'local-only', retryable: false, message: 'No memory files exist yet' };
       await this.runCommand([
         'push',
         '--set-upstream',
@@ -364,7 +472,7 @@ export class GitMemorySync implements MemoryGitSync {
       return {
         status: 'synced',
         retryable: false,
-        ...(!changed ? { message: 'Memory repository is up to date' } : {}),
+        ...(!local ? { message: 'Memory repository is up to date' } : {}),
       };
     } catch (error) {
       return failedSync(error, await this.hasConflicts());
@@ -396,13 +504,17 @@ export class GitMemorySync implements MemoryGitSync {
     const normalized = url.trim();
     if (!normalized) throw new Error('Memory Git remote must not be empty');
     await fs.mkdir(this.root, { recursive: true });
-    await this.ensureDedicatedRepository();
-    try {
-      await this.runCommand(['remote', 'get-url', this.remoteName]);
-      await this.runCommand(['remote', 'set-url', this.remoteName, normalized]);
-    } catch {
-      await this.runCommand(['remote', 'add', this.remoteName, normalized]);
-    }
+    await this.withGitLock(() =>
+      this.withMemoryLock(async () => {
+        await this.ensureDedicatedRepository();
+        try {
+          await this.runCommand(['remote', 'get-url', this.remoteName]);
+          await this.runCommand(['remote', 'set-url', this.remoteName, normalized]);
+        } catch {
+          await this.runCommand(['remote', 'add', this.remoteName, normalized]);
+        }
+      }),
+    );
   }
 
   private async isDedicatedRepository(): Promise<boolean> {

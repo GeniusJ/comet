@@ -62,6 +62,16 @@ describe('Classic operational help', () => {
     expect(classicCommandHelp('state', ['transition', '--help'])).toContain('archive-confirm');
   });
 
+  it('explains batched field reads and revision-bound SDK continuations', () => {
+    const get = classicCommandHelp('state', ['get', '--help'])!;
+    expect(get).toContain('<field> [<field> ...]');
+    expect(get).toContain('one state snapshot');
+    expect(get).toContain('data.fields');
+    expect(get).toContain('bare stdout value');
+    expect(classicCommandHelp('state', ['check', '--help'])).toContain('nextAction');
+    expect(classicCommandHelp('check', ['run', '--help'])).toContain('data.nextAction');
+  });
+
   it('provides JSON help without invoking a state handler', async () => {
     const result = await runClassicCli(['state', 'record-check', '--help', '--json'], {
       state: async () => {
@@ -71,6 +81,15 @@ describe('Classic operational help', () => {
     const output = JSON.parse(result.stdout!);
     expect(output.exitCode).toBe(0);
     expect(output.stdout).toContain('does not execute');
+  });
+
+  it.each(['revise-design', 'revise-plan'])('explains safe %s recovery', (command) => {
+    const help = classicCommandHelp('state', [command, '--help'])!;
+    expect(help).toContain(`comet state ${command}`);
+    expect(help).toContain('--expected-revision <number>');
+    expect(help).toContain('stale revision is rejected');
+    expect(help).toContain('Revision does not');
+    expect(help).toContain('proposal hash');
   });
 
   it.each([['check', 'run'], ['state', 'record-check'], ['state', 'check'], ['guard']])(

@@ -154,7 +154,10 @@ function runScript(
   };
   const scriptPath = path.join(scripts, name);
   if (executor === 'node') {
-    return spawnSync(process.execPath, [scriptPath, ...args], {
+    // Compare the supported compatibility runtime with the frozen shell contract.
+    // New SDK initialization has its own lifecycle and authorization tests.
+    const commandArgs = args[0] === 'init' ? [...args, '--runtime', 'compat'] : args;
+    return spawnSync(process.execPath, [scriptPath, ...commandArgs], {
       cwd,
       encoding: 'utf8',
       input,
@@ -206,6 +209,11 @@ function normalizeOutput(value: string, root: string): string {
 }
 
 function legacyProjection(document: Record<string, unknown>): Record<string, unknown> {
+  if (document.change_id !== undefined) {
+    expect(document.change_id).toMatch(
+      /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/u,
+    );
+  }
   // Strip Run/engine projection keys that only the active TypeScript runtime
   // adds (not part of the 0.3.9 bash contract). All other fields — including
   // review_mode, direct_override, base_ref — are 0.3.9-era fields that both
@@ -215,6 +223,8 @@ function legacyProjection(document: Record<string, unknown>): Record<string, unk
     'classic_profile',
     'classic_migration',
     'run_id',
+    // Workspace-local storage has a portable instance UUID, absent in 0.3.9.
+    'change_id',
     'skill_version',
     'skill_hash',
     'orchestration',

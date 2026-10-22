@@ -5,6 +5,7 @@ import os from 'os';
 import { EventEmitter } from 'events';
 import { spawn } from 'child_process';
 import { spawnSync } from 'node:child_process';
+import { readNodeHookArguments } from '../../platform/process/hook-command.js';
 import { select } from '@inquirer/prompts';
 import { parse } from 'yaml';
 import { getLatestVersion } from '../../platform/version/version.js';
@@ -690,9 +691,13 @@ describe('update command helpers', () => {
       '# Personal\n',
     );
     const hooks = JSON.parse(await fs.readFile(path.join(tmpDir, '.codex', 'hooks.json'), 'utf8'));
-    expect(hooks.hooks.PreToolUse[0].hooks[0].command.replaceAll('\\', '/')).toContain(
-      '/.agents/skills/comet/scripts/comet-hook-router.mjs',
-    );
+    expect(readNodeHookArguments(hooks.hooks.PreToolUse[0].hooks[0].command)).toEqual([
+      path.join(tmpDir, '.agents/skills/comet/scripts/comet-hook-router.mjs'),
+      '--platform',
+      'codex',
+      '--project-root',
+      tmpDir,
+    ]);
     const legacy = JSON.parse(
       await fs.readFile(path.join(tmpDir, '.codex', 'settings.local.json'), 'utf8'),
     );
@@ -1269,21 +1274,27 @@ describe('update command helpers', () => {
       homedirSpy.mockRestore();
     }
 
-    expect(mockedSpawn).toHaveBeenCalledTimes(6);
-    expect(mockedSpawn.mock.calls.at(-1)?.[0]).toBe(process.execPath);
-    expect(mockedSpawn.mock.calls.at(-1)?.[1]?.slice(1)).toEqual([
+    const globalInstalls = mockedSpawn.mock.calls.filter(
+      ([command, args]) =>
+        command === process.execPath && args?.[1] === 'install' && args.includes('-g'),
+    );
+    expect(globalInstalls).toHaveLength(1);
+    expect(globalInstalls[0]?.[1]?.slice(1)).toEqual([
       'install',
       '-g',
       '@rpamis/comet@0.4.0-beta.8',
       '--registry',
       'https://registry.npmjs.org',
     ]);
-    expect(mockedSpawn.mock.calls.every((call) => call[2]?.shell === false)).toBe(true);
-    expect(mockedSpawn.mock.calls.every((call) => call[0] === process.execPath)).toBe(true);
     const candidateBinCalls = mockedSpawn.mock.calls.filter((call) =>
       String(call[1]?.[0]).endsWith(path.join('bin', 'comet.js')),
     );
     expect(candidateBinCalls).toHaveLength(3);
+    const packageCommands = mockedSpawn.mock.calls.filter(
+      (call) => String(call[1]?.[0]).endsWith('npm-cli.js') || candidateBinCalls.includes(call),
+    );
+    expect(packageCommands.every((call) => call[2]?.shell === false)).toBe(true);
+    expect(packageCommands.every((call) => call[0] === process.execPath)).toBe(true);
     expect(candidateBinCalls.every((call) => path.isAbsolute(String(call[1]?.[0])))).toBe(true);
   });
 
@@ -1802,6 +1813,58 @@ describe('update command helpers', () => {
     expect(registry.projects.every((project) => project.lastSource === 'update')).toBe(true);
   });
 
+  it('runs confirmed all-project updates with human-readable logs and no further prompts', async () => {
+    const home = path.join(tmpDir, 'confirmed-update-home');
+    const projects = [path.join(tmpDir, 'confirmed-a'), path.join(tmpDir, 'confirmed-b')];
+    for (const project of projects) {
+      const skill = path.join(project, '.claude', 'skills', 'comet');
+      await fs.mkdir(skill, { recursive: true });
+      await fs.writeFile(path.join(skill, 'SKILL.md'), '# Comet');
+      await upsertProjectInstallation(project, [{ platform: 'claude', language: 'en' }], 'init', {
+        homeDir: home,
+      });
+    }
+    const homedir = vi.spyOn(os, 'homedir').mockReturnValue(home);
+    const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    mockedSelect.mockClear();
+    try {
+      expect(
+        await updateCommand(projects[0], { allProjects: true, yes: true, skipSelfUpdate: true }),
+      ).toEqual({ status: 'complete' });
+      const output = log.mock.calls.map((call) => call.join(' ')).join('\n');
+      expect(output).toContain('Updated 2 indexed project(s).');
+      for (const project of projects) expect(output).toContain(project);
+      expect(mockedSelect).not.toHaveBeenCalled();
+    } finally {
+      log.mockRestore();
+      homedir.mockRestore();
+    }
+  });
+  it('pins an approved npm version even when latest changes before installation', async () => {
+    const skill = path.join(tmpDir, '.claude', 'skills', 'comet');
+    await fs.mkdir(skill, { recursive: true });
+    await fs.writeFile(path.join(skill, 'SKILL.md'), '# Comet');
+    mockedGetLatestVersion.mockResolvedValue('0.4.0-beta.9');
+    const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    try {
+      await updateCommand(tmpDir, {
+        currentProject: true,
+        json: true,
+        targetVersion: '0.4.0-beta.8',
+      });
+      const result = JSON.parse(log.mock.calls.map((call) => call.join(' ')).join('\n'));
+      expect(result.npm).toMatchObject({
+        status: 'updated',
+        command: 'npm install -g @rpamis/comet@0.4.0-beta.8 --registry https://registry.npmjs.org',
+      });
+      expect(mockedGetLatestVersion).not.toHaveBeenCalled();
+    } finally {
+      log.mockRestore();
+    }
+    await expect(updateCommand(tmpDir, { targetVersion: 'latest;echo invalid' })).rejects.toThrow(
+      '--target-version',
+    );
+  });
   it('does not run local npm installs for all-projects entries without project package dependencies', async () => {
     const fakeHome = path.join(tmpDir, 'fake-home-global-npm-once');
     const projectA = path.join(tmpDir, 'project-a-global-package');
@@ -1828,7 +1891,19 @@ describe('update command helpers', () => {
       const npmArgs = call[1]?.slice(1) ?? [];
       return npmArgs[0] === 'install' && !npmArgs.includes('--prefix');
     });
-    expect(mockedSpawn).toHaveBeenCalledTimes(6);
+    // 进程身份探测也会调用 spawn；只核对本用例承诺的包安装行为。
+    const npmInstalls = mockedSpawn.mock.calls.filter(
+      (call) =>
+        path.basename(String(call[1]?.[0])).toLowerCase() === 'npm-cli.js' &&
+        call[1]?.[1] === 'install',
+    );
+    expect(npmInstalls).toHaveLength(2);
+    const candidateInstalls = npmInstalls.filter((call) => call[1]?.includes('--prefix'));
+    expect(candidateInstalls).toHaveLength(1);
+    const candidateArgs = candidateInstalls[0][1]!;
+    expect([projectA, projectB]).not.toContain(
+      candidateArgs[candidateArgs.indexOf('--prefix') + 1],
+    );
     expect(installCalls).toHaveLength(1);
     expect(installCalls[0][1]?.slice(1)).toEqual([
       'install',
@@ -2209,6 +2284,48 @@ describe('update command helpers', () => {
     ).resolves.toBe('# Stale Claude Comet\n');
   });
 
+  it.each(['project', 'global'] as const)(
+    'updates Prime Agent in %s scope without inventing Hook support',
+    async (scope) => {
+      const fakeHome = path.join(tmpDir, 'prime-home');
+      vi.spyOn(os, 'homedir').mockReturnValue(fakeHome);
+      await writeProjectConfig(tmpDir, defaultProjectConfig('docs', 'zh-CN'));
+      const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+      try {
+        await updateCommand(tmpDir, {
+          json: true,
+          yes: true,
+          skipNpm: true,
+          scope,
+          platform: 'prime-agent',
+        });
+        const result = JSON.parse(log.mock.calls.map((call) => call.join(' ')).join('\n'));
+        expect(result.skills.targets).toContainEqual(
+          expect.objectContaining({ platform: 'prime-agent', scope }),
+        );
+        const root = scope === 'project' ? tmpDir : fakeHome;
+        await expect(
+          fs.access(path.join(root, '.prime/agent/skills/comet/SKILL.md')),
+        ).resolves.toBeUndefined();
+        await expect(
+          fs.access(path.join(root, '.prime/agent/settings.local.json')),
+        ).rejects.toMatchObject({ code: 'ENOENT' });
+        await expect(fs.access(path.join(root, '.prime/agent/rules'))).rejects.toMatchObject({
+          code: 'ENOENT',
+        });
+      } finally {
+        log.mockRestore();
+      }
+    },
+  );
+
+  it('rejects unknown update platforms before running package updates', async () => {
+    await expect(updateCommand(tmpDir, { json: true, platform: 'prime-agnet' })).rejects.toThrow(
+      'Unknown platform',
+    );
+    expect(mockedSpawn).not.toHaveBeenCalled();
+  });
+
   it('updates project-scoped custom platform workflow assets', async () => {
     const fakeHome = path.join(tmpDir, 'explicit-custom-home');
     const homeSpy = vi.spyOn(os, 'homedir').mockReturnValue(fakeHome);
@@ -2219,6 +2336,7 @@ describe('update command helpers', () => {
         json: true,
         skipNpm: true,
         platform: 'test',
+        customPlatform: true,
       });
       json = log.mock.calls.map((call) => call.join(' ')).join('\n');
     } finally {
@@ -2242,7 +2360,13 @@ describe('update command helpers', () => {
     const settings = JSON.parse(
       await fs.readFile(path.join(tmpDir, '.test', 'settings.local.json'), 'utf8'),
     ) as { hooks: { PreToolUse: Array<{ hooks: Array<{ command: string }> }> } };
-    expect(JSON.stringify(settings.hooks)).toContain('comet-hook-router.mjs');
+    expect(readNodeHookArguments(settings.hooks.PreToolUse[0].hooks[0].command)).toEqual([
+      path.join(tmpDir, '.test/skills/comet/scripts/comet-hook-router.mjs'),
+      '--platform',
+      'test',
+      '--project-root',
+      tmpDir,
+    ]);
   });
 
   it('applies the project workflow selection to an explicit custom update target', async () => {
@@ -2260,6 +2384,7 @@ describe('update command helpers', () => {
         json: true,
         skipNpm: true,
         platform: 'test',
+        customPlatform: true,
       });
       json = log.mock.calls.map((call) => call.join(' ')).join('\n');
     } finally {
@@ -3023,6 +3148,7 @@ describe('update command helpers', () => {
         skipNpm: true,
         scope: 'global',
         platform: 'test',
+        customPlatform: true,
       }),
     ).rejects.toThrow('custom --platform targets are only supported with project scope');
   });
@@ -3803,6 +3929,7 @@ describe('update command helpers', () => {
 
   it('installs ambient resume instructions for Classic-only projects', async () => {
     await arrangeClassicDocsOpenSpecUpdate(tmpDir);
+    await fs.writeFile(path.join(tmpDir, '.gitignore'), 'node_modules/\n', 'utf8');
     await fs.writeFile(path.join(tmpDir, 'AGENTS.md'), '# User\n\nKeep this.\n', 'utf8');
     await fs.writeFile(path.join(tmpDir, 'CLAUDE.md'), '# User\n\nAlso keep this.\n', 'utf8');
 
@@ -3829,6 +3956,10 @@ describe('update command helpers', () => {
     }
     expect(agents).toContain('# User\n\nKeep this.');
     expect(claude).toContain('# User\n\nAlso keep this.');
+    const gitignore = await fs.readFile(path.join(tmpDir, '.gitignore'), 'utf8');
+    expect(gitignore).toContain('node_modules/\n');
+    expect(gitignore).toContain('!/.comet/config.yaml\n');
+    expect(gitignore).toContain('.comet-archive-staging/\n');
   });
 
   it('removes ambient resume instructions when the project disables the probe', async () => {

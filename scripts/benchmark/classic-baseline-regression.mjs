@@ -5,6 +5,7 @@ import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { parse } from 'yaml';
+import { resolveClassicRunDirectoryForRead } from '../../dist/domains/comet-classic/classic-runtime-paths.js';
 
 const SCRIPT_PATH = fileURLToPath(import.meta.url);
 const REPO_ROOT = path.resolve(path.dirname(SCRIPT_PATH), '..', '..');
@@ -50,18 +51,31 @@ function state(cwd, ...args) {
     // benchmark scenarios.
     options.env = { ...process.env, COMET_FORCE_PHASE: '1' };
   }
-  return run(cwd, ['state', ...args], options);
+  return run(
+    cwd,
+    ['state', ...args, ...(args[0] === 'init' ? ['--runtime', 'compat'] : [])],
+    options,
+  );
 }
 
 function camelToSnake(str) {
   return str.replace(/[A-Z]/g, (letter) => `_${letter.toLowerCase()}`);
 }
 
+async function runtimeDirectory(changeDir) {
+  const directory = await resolveClassicRunDirectoryForRead(changeDir);
+  if (directory === null) throw new Error(`Classic benchmark state is missing: ${changeDir}`);
+  return directory;
+}
+
 async function readState(changeDir) {
   const yamlState = parse(await fs.readFile(path.join(changeDir, '.comet.yaml'), 'utf8'));
   try {
     const runJson = JSON.parse(
-      await fs.readFile(path.join(changeDir, '.comet', 'run-state.json'), 'utf8'),
+      await fs.readFile(
+        path.join(await runtimeDirectory(changeDir), '.comet', 'run-state.json'),
+        'utf8',
+      ),
     );
     for (const [key, value] of Object.entries(runJson)) {
       yamlState[camelToSnake(key)] = value;
@@ -72,6 +86,7 @@ async function readState(changeDir) {
     if (runJson.retries != null) yamlState.run_retries = runJson.retries;
   } catch (err) {
     if (err.code !== 'ENOENT') throw err;
+    throw new Error(`Classic benchmark Run is missing: ${changeDir}`, { cause: err });
   }
   return yamlState;
 }
@@ -238,7 +253,7 @@ async function handoffResumeScenario(workspace) {
   const initial = await readState(changeDir);
   const actionId = `classic-handoff:${initial.handoff_hash}`;
   await fs.writeFile(
-    path.join(changeDir, initial.pending_ref),
+    path.join(await runtimeDirectory(changeDir), initial.pending_ref),
     JSON.stringify(
       {
         id: actionId,
@@ -253,7 +268,12 @@ async function handoffResumeScenario(workspace) {
   state(directory, 'set', name, 'pending', actionId);
   const resumed = run(directory, ['handoff', name, 'design', '--write']);
   const recovered = await readState(changeDir);
-  const trajectory = (await fs.readFile(path.join(changeDir, recovered.trajectory_ref), 'utf8'))
+  const trajectory = (
+    await fs.readFile(
+      path.join(await runtimeDirectory(changeDir), recovered.trajectory_ref),
+      'utf8',
+    )
+  )
     .trim()
     .split(/\r?\n/u)
     .filter(Boolean)
@@ -335,7 +355,12 @@ async function archiveRecoveryScenario(workspace) {
     `${new Date().toISOString().slice(0, 10)}-${name}`,
   );
   const recovered = await readState(archiveDir);
-  const trajectory = (await fs.readFile(path.join(archiveDir, recovered.trajectory_ref), 'utf8'))
+  const trajectory = (
+    await fs.readFile(
+      path.join(await runtimeDirectory(archiveDir), recovered.trajectory_ref),
+      'utf8',
+    )
+  )
     .trim()
     .split(/\r?\n/u)
     .filter(Boolean)

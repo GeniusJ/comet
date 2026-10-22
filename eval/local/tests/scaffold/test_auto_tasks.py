@@ -11,6 +11,7 @@ from scaffold.python.auto_tasks import (
     GenerationOutput,
     build_skill_snapshot,
     ensure_generated_manifest,
+    _generation_prompt,
 )
 
 
@@ -43,6 +44,54 @@ def _generated_payload():
     }
 
 
+def test_generator_prompt_explains_supported_expect_shapes_and_relative_paths(tmp_path):
+    prompt = _generation_prompt(build_skill_snapshot(_write_skill(tmp_path)), profile="generic")
+    for contract in (
+        "workspace-relative paths", "CONTEXT.md", "src/calculator.py",
+        '"contains": {"CONTEXT.md": ["confirmed requirement"]}',
+        '"json": [{"file": "result.json", "path": "$.status", "equals": "completed"}]',
+        '"commands": [{"run": "python -m pytest", "timeout": 120}]',
+        "1..3600", "Do not prefix artifact paths with /workspace",
+        "Rubric alone does not satisfy", "Do not infer new workflow files",
+    ):
+        assert contract in prompt
+    from scaffold.python.manifests import _parse_inline_expect
+    start = prompt.index('{\n  "files"')
+    end = prompt.index("\n}", start) + 2
+    example = json.loads(prompt[start:end])
+    assert _parse_inline_expect(example, "example") == example
+
+
+def test_generator_prompt_keeps_every_snapshot_file_and_all_content():
+    from scaffold.python.auto_tasks import SkillSnapshot, SnapshotFile
+    first = "long Skill content\n" + "x" * 20000 + "\nEND OF SKILL"
+    second = "full application implementation\n" + "y" * 20000 + "\nEND OF MODULE"
+    snapshot = SkillSnapshot((SnapshotFile("SKILL.md", first, "first-hash"), SnapshotFile("scripts/application/application.mjs", second, "second-hash")), "snapshot-hash")
+    prompt = _generation_prompt(snapshot, profile="generic")
+    assert first in prompt
+    assert second in prompt
+
+
+@pytest.mark.parametrize("expect", [
+    {"files": ["/workspace/eval-grill-normal/CONTEXT.md"]},
+    {"contains": {"/workspace/CONTEXT.md": ["confirmed"]}},
+    {"json": [{"file": "/workspace/result.json", "path": "$.status", "equals": "completed"}]},
+])
+def test_generation_rejects_absolute_expect_paths_instead_of_converting_them_to_success(tmp_path, expect):
+    skill = _write_skill(tmp_path)
+    calls = []
+    def generate(prompt):
+        calls.append(prompt)
+        payload = _generated_payload()
+        payload["tasks"][0]["expect"] = expect
+        return payload
+    with pytest.raises(AutoTaskError, match=r"expect.*does not match"):
+        ensure_generated_manifest(skill, tmp_path, agent="codex", model="test", profile="generic", interaction={"mode": "none"}, generate=generate)
+    assert len(calls) == 2
+    assert "does not match" in calls[1]
+    assert not list(tmp_path.rglob("eval.yaml"))
+
+
 def test_skill_snapshot_is_bounded_to_relevant_package_files(tmp_path: Path):
     skill = _write_skill(tmp_path)
 
@@ -52,6 +101,197 @@ def test_skill_snapshot_is_bounded_to_relevant_package_files(tmp_path: Path):
     assert paths == {"SKILL.md", "references/format.md"}
     assert "unrelated.txt" not in paths
     assert snapshot.content_hash.startswith("sha256:")
+
+
+def _write_sdk_snapshot(tmp_path):
+    skill = _write_skill(tmp_path)
+    (skill / "scripts/application/skills/dependency").mkdir(parents=True)
+    (skill / "scripts/application/application.json").write_text('{"id":"fixed-app"}', encoding="utf-8")
+    (skill / "references/workflows.json").write_text('{"workflows":[]}', encoding="utf-8")
+    return skill
+
+
+def test_sdk_snapshot_includes_all_fixed_dependency_text_without_generic_limits(tmp_path):
+    skill = _write_sdk_snapshot(tmp_path)
+    dependency = skill / "scripts/application/skills/dependency"
+    resources = {}
+    for index in range(140):
+        content = f"Resource {index}\n" + "完整说明" * 1024 + f"\nEND {index}"
+        file = dependency / f"resource-{index:03}.md"
+        file.write_bytes(content.encode("utf-8"))
+        resources[file.relative_to(skill).as_posix()] = content
+    (skill / "RULE.md").write_text("Entire application Rule", encoding="utf-8")
+    snapshot = build_skill_snapshot(skill)
+    actual = {item.path: item for item in snapshot.files}
+    assert len(snapshot.files) > 128
+    assert sum(len(item.content.encode("utf-8")) for item in snapshot.files) > 512 * 1024
+    for path, content in resources.items():
+        assert actual[path].content == content
+    assert actual["RULE.md"].content == "Entire application Rule"
+    original = snapshot.content_hash
+    (dependency / "resource-139.md").write_text("Changed last fixed resource", encoding="utf-8")
+    assert build_skill_snapshot(skill).content_hash != original
+    calls = []
+    def generate(prompt):
+        calls.append(prompt)
+        return _generated_payload()
+    options = {"agent": "codex", "model": "test", "profile": "generic", "interaction": {"mode": "none"}, "generate": generate}
+    first = ensure_generated_manifest(skill, tmp_path, **options)
+    second = ensure_generated_manifest(skill, tmp_path, **options)
+    assert first.manifest_path == second.manifest_path
+    assert second.reused
+    assert len(calls) == 1
+    assert resources["scripts/application/skills/dependency/resource-138.md"] in calls[0]
+
+
+def test_sdk_snapshot_records_binary_identity_without_decoding_it_into_prompt_text(tmp_path):
+    from scaffold.python.generated_task_cache import sha256
+    skill = _write_sdk_snapshot(tmp_path)
+    resource = skill / "scripts/application/skills/dependency/image.bin"
+    payload = b"\x00\xff\x80binary resource"
+    resource.write_bytes(payload)
+    snapshot = build_skill_snapshot(skill)
+    item = next(item for item in snapshot.files if item.path.endswith("image.bin"))
+    metadata = json.loads(item.content)
+    assert metadata == {"type": "binary", "path": item.path, "size_bytes": len(payload), "sha256": sha256(payload)}
+    assert item.content_hash == sha256(payload)
+    resource.write_bytes(payload + b"changed")
+    assert build_skill_snapshot(skill).content_hash != snapshot.content_hash
+
+
+def test_sdk_snapshot_refuses_linked_fixed_resources(tmp_path):
+    import os
+    import subprocess
+    skill = _write_sdk_snapshot(tmp_path)
+    target = tmp_path / "outside"
+    target.mkdir()
+    (target / "resource.txt").write_text("outside resource", encoding="utf-8")
+    link = skill / "scripts/application/skills/dependency/linked"
+    if os.name == "nt":
+        subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)], check=True, capture_output=True)
+    else:
+        link.symlink_to(target, target_is_directory=True)
+    with pytest.raises(ValueError, match="link"):
+        build_skill_snapshot(skill)
+
+
+def test_sdk_snapshot_reports_unreadable_resource_instead_of_omitting_it(tmp_path, monkeypatch):
+    skill = _write_sdk_snapshot(tmp_path)
+    resource = skill / "scripts/application/skills/dependency/resource.md"
+    resource.write_text("full resource", encoding="utf-8")
+    original = Path.read_bytes
+    def read_bytes(path):
+        if path == resource:
+            raise PermissionError("Cannot read fixed resource")
+        return original(path)
+    monkeypatch.setattr(Path, "read_bytes", read_bytes)
+    with pytest.raises(PermissionError, match="fixed resource"):
+        build_skill_snapshot(skill)
+
+
+def test_generic_snapshot_keeps_its_existing_resource_budget(tmp_path):
+    skill = _write_skill(tmp_path)
+    for index in range(140):
+        (skill / "references" / f"resource-{index}.md").write_text("generic resource", encoding="utf-8")
+    snapshot = build_skill_snapshot(skill)
+    assert len(snapshot.files) == 128
+    assert {item.path for item in snapshot.files}.issuperset({"SKILL.md", "references/format.md"})
+
+
+@pytest.mark.parametrize("budget,expected", [(3600, 900), (1200, 300), (40, 10), (30, 7), (None, 300)])
+def test_default_generator_passes_the_approved_per_attempt_timeout(tmp_path, monkeypatch, budget, expected):
+    import subprocess
+    from scaffold.python.auto_tasks import _default_generate
+    if budget is not None:
+        skill = _write_sdk_snapshot(tmp_path)
+        preview = {"settings": {"timeoutSeconds": budget}}
+        (skill / "references/workflows.json").write_text(json.dumps(preview), encoding="utf-8")
+        monkeypatch.setenv("COMET_APPLICATION_EVAL_CONTEXT", json.dumps({"skillRoot": str(skill), "preview": preview}))
+    else:
+        monkeypatch.delenv("COMET_APPLICATION_EVAL_CONTEXT", raising=False)
+    calls = []
+    def run(*args, **kwargs):
+        calls.append(kwargs)
+        return subprocess.CompletedProcess([], 0, json.dumps(_generated_payload()), "")
+    monkeypatch.setattr("scaffold.python.auto_tasks.run_agent_in_docker", run)
+    _default_generate("Complete unchanged input", agent="claude-code", model="selected-model")
+    assert len(calls) == 1
+    assert calls[0]["timeout"] == expected
+    assert calls[0]["model"] == "selected-model"
+
+
+@pytest.mark.parametrize("context", ["not-json", {"preview": {"settings": {"timeoutSeconds": True}}}, {"preview": {"settings": {"timeoutSeconds": 9000}}}])
+def test_generator_rejects_invalid_sdk_budget_context_before_model_execution(tmp_path, monkeypatch, context):
+    from scaffold.python.auto_tasks import _default_generate
+    skill = _write_sdk_snapshot(tmp_path)
+    if isinstance(context, dict):
+        context = {**context, "skillRoot": str(skill)}
+        (skill / "references/workflows.json").write_text(json.dumps(context["preview"]), encoding="utf-8")
+        context = json.dumps(context)
+    monkeypatch.setenv("COMET_APPLICATION_EVAL_CONTEXT", context)
+    calls = []
+    monkeypatch.setattr("scaffold.python.auto_tasks.run_agent_in_docker", lambda *args, **kwargs: calls.append(True))
+    with pytest.raises(ValueError):
+        _default_generate("Input", agent="claude-code", model=None)
+    assert not calls
+
+
+def test_timeout_exceptions_are_counted_without_inventing_usage(tmp_path):
+    skill = _write_skill(tmp_path)
+    calls = []
+    def generate(prompt):
+        calls.append(prompt)
+        raise TimeoutError("Generation timed out")
+    with pytest.raises(AutoTaskError) as failure:
+        ensure_generated_manifest(skill, tmp_path, agent="claude-code", model="selected", profile="generic", interaction={"mode": "none"}, generate=generate)
+    report = Path(str(failure.value).split("Partial report: ", 1)[1])
+    metadata = json.loads((report.parent / "metadata.json").read_text())
+    assert len(calls) == metadata["attempt_count"] == 2
+    assert metadata["generation_overhead"]["total_tokens"] is None
+    assert metadata["generation_overhead"]["total_cost_usd"] is None
+    assert all(item["status"] == "failed" and "timed out" in item["reason"] for item in metadata["generation_overhead"]["attempts"])
+
+
+def test_unknown_container_cleanup_stops_generation_after_one_attempt_and_reports_real_partial_usage(tmp_path, monkeypatch):
+    from scaffold.python.utils import AgentContainerCleanupError
+    skill = _write_skill(tmp_path)
+    monkeypatch.delenv("COMET_APPLICATION_EVAL_CONTEXT", raising=False)
+    calls = []
+    partial = json.dumps({"type": "result", "usage": {"input_tokens": 11, "output_tokens": 7}, "total_cost_usd": 0.02})
+    def run(*args, **kwargs):
+        calls.append(True)
+        raise AgentContainerCleanupError("Cleanup not confirmed", container_name="owned-test", stdout=partial, returncode=124)
+    monkeypatch.setattr("scaffold.python.auto_tasks.run_agent_in_docker", run)
+    with pytest.raises(AutoTaskError) as failure:
+        ensure_generated_manifest(skill, tmp_path, agent="claude-code", model="selected", profile="generic", interaction={"mode": "none"})
+    report = Path(str(failure.value).split("Partial report: ", 1)[1])
+    metadata = json.loads((report.parent / "metadata.json").read_text())
+    assert len(calls) == metadata["attempt_count"] == 1
+    overhead = metadata["generation_overhead"]
+    assert overhead["input_tokens"] == 11
+    assert overhead["output_tokens"] == 7
+    assert overhead["total_cost_usd"] == 0.02
+    assert overhead["attempts"][0]["status"] == "failed"
+    assert "Cleanup not confirmed" in metadata["error"]
+
+
+def test_nonzero_generator_result_keeps_actual_partial_telemetry_in_each_failed_attempt(tmp_path, monkeypatch):
+    import subprocess
+    skill = _write_skill(tmp_path)
+    monkeypatch.delenv("COMET_APPLICATION_EVAL_CONTEXT", raising=False)
+    stdout = json.dumps({"type": "result", "usage": {"input_tokens": 10, "output_tokens": 4}})
+    monkeypatch.setattr("scaffold.python.auto_tasks.run_agent_in_docker", lambda *args, **kwargs: subprocess.CompletedProcess([], 124, stdout, "Timeout after 300s"))
+    with pytest.raises(AutoTaskError) as failure:
+        ensure_generated_manifest(skill, tmp_path, agent="claude-code", model="selected", profile="generic", interaction={"mode": "none"})
+    report = Path(str(failure.value).split("Partial report: ", 1)[1])
+    metadata = json.loads((report.parent / "metadata.json").read_text())
+    assert metadata["attempt_count"] == 2
+    for attempt in metadata["generation_overhead"]["attempts"]:
+        assert attempt["returncode"] == 124
+        assert attempt["input_tokens"] == 10
+        assert attempt["output_tokens"] == 4
+        assert attempt["status"] == "failed"
+    assert metadata["generation_overhead"]["total_cost_usd"] is None
 
 
 def test_generated_manifest_is_cached_and_reused(tmp_path: Path):

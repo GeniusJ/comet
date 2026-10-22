@@ -5,6 +5,7 @@ import os from 'os';
 import path from 'path';
 import { statusCommand } from '../../app/commands/status.js';
 import { ensureClassicRuntimeRun } from '../../domains/comet-classic/classic-runtime-run.js';
+import { resolveClassicRunDirectory } from '../../domains/comet-classic/classic-runtime-paths.js';
 import { createNativeChange } from '../../domains/comet-native/native-change.js';
 import {
   defaultProjectConfig,
@@ -112,12 +113,12 @@ describe('status command', () => {
 
   it('classifies mixed Comet and OpenSpec changes in sorted JSON output', async () => {
     const changesDir = classicChangesDir(tmpDir);
-    state(tmpDir, 'init', 'z-comet-ready', 'full');
+    state(tmpDir, 'init', 'z-comet-ready', 'full', '--runtime', 'compat');
     state(tmpDir, 'set', 'z-comet-ready', 'phase', 'archive');
     state(tmpDir, 'set', 'z-comet-ready', 'verify_result', 'pass');
     await fs.writeFile(path.join(changesDir, 'z-comet-ready', 'tasks.md'), '- [ ] ignored\n');
 
-    state(tmpDir, 'init', 'b-invalid-comet', 'full');
+    state(tmpDir, 'init', 'b-invalid-comet', 'full', '--runtime', 'compat');
     await fs.appendFile(
       path.join(changesDir, 'b-invalid-comet', '.comet.yaml'),
       'unknown_root_field: true\n',
@@ -231,7 +232,7 @@ describe('status command', () => {
   });
 
   it('includes latest build and verify command checks for a synchronized Comet Run', async () => {
-    state(tmpDir, 'init', 'audited', 'full');
+    state(tmpDir, 'init', 'audited', 'full', '--runtime', 'compat');
     await ensureClassicRuntimeRun(path.join(classicChangesDir(tmpDir), 'audited'));
     expect(
       state(
@@ -303,10 +304,10 @@ describe('status command', () => {
 
   it('labels mixed text output and recommends archive commands only for ready changes', async () => {
     const changesDir = classicChangesDir(tmpDir);
-    state(tmpDir, 'init', 'comet-ready', 'full');
+    state(tmpDir, 'init', 'comet-ready', 'full', '--runtime', 'compat');
     state(tmpDir, 'set', 'comet-ready', 'phase', 'archive');
     state(tmpDir, 'set', 'comet-ready', 'verify_result', 'pass');
-    state(tmpDir, 'init', 'comet-not-ready', 'full');
+    state(tmpDir, 'init', 'comet-not-ready', 'full', '--runtime', 'compat');
     await fs.mkdir(path.join(changesDir, 'open-ready'), { recursive: true });
     await fs.writeFile(path.join(changesDir, 'open-ready', 'tasks.md'), '- [x] done\n');
     await fs.mkdir(path.join(changesDir, 'open-not-ready'), { recursive: true });
@@ -338,7 +339,7 @@ describe('status command', () => {
 
   it('prints the next command for active changes', async () => {
     const changeDir = path.join(classicChangesDir(tmpDir), 'next-build');
-    state(tmpDir, 'init', 'next-build', 'full');
+    state(tmpDir, 'init', 'next-build', 'full', '--runtime', 'compat');
     state(tmpDir, 'set', 'next-build', 'phase', 'build');
     state(tmpDir, 'set', 'next-build', 'build_mode', 'executing-plans');
     state(tmpDir, 'set', 'next-build', 'tdd_mode', 'tdd');
@@ -365,19 +366,19 @@ describe('status command', () => {
 
   it('prints branch-bound workspace modes with bound branch and omits bound suffix for null isolation', async () => {
     const changesDir = classicChangesDir(tmpDir);
-    state(tmpDir, 'init', 'current-bound', 'full');
+    state(tmpDir, 'init', 'current-bound', 'full', '--runtime', 'compat');
     await setCometYamlField(path.join(changesDir, 'current-bound'), 'isolation', 'current');
     await setCometYamlField(path.join(changesDir, 'current-bound'), 'bound_branch', 'feature-A');
 
-    state(tmpDir, 'init', 'branch-bound', 'full');
+    state(tmpDir, 'init', 'branch-bound', 'full', '--runtime', 'compat');
     await setCometYamlField(path.join(changesDir, 'branch-bound'), 'isolation', 'branch');
     await setCometYamlField(path.join(changesDir, 'branch-bound'), 'bound_branch', 'feature-B');
 
-    state(tmpDir, 'init', 'worktree-bound', 'full');
+    state(tmpDir, 'init', 'worktree-bound', 'full', '--runtime', 'compat');
     await setCometYamlField(path.join(changesDir, 'worktree-bound'), 'isolation', 'worktree');
     await setCometYamlField(path.join(changesDir, 'worktree-bound'), 'bound_branch', 'feature-C');
 
-    state(tmpDir, 'init', 'null-bound', 'full');
+    state(tmpDir, 'init', 'null-bound', 'full', '--runtime', 'compat');
     await setCometYamlField(path.join(changesDir, 'null-bound'), 'bound_branch', 'feature-D');
 
     const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
@@ -397,7 +398,7 @@ describe('status command', () => {
 
   it('includes boundBranch in JSON status output', async () => {
     const changeDir = path.join(classicChangesDir(tmpDir), 'current-bound');
-    state(tmpDir, 'init', 'current-bound', 'full');
+    state(tmpDir, 'init', 'current-bound', 'full', '--runtime', 'compat');
     await setCometYamlField(changeDir, 'isolation', 'current');
     await setCometYamlField(changeDir, 'bound_branch', 'feature-A');
 
@@ -419,7 +420,7 @@ describe('status command', () => {
 
   it('keeps legacy state without a Run byte-for-byte read-only in text and JSON status', async () => {
     const changeDir = path.join(classicChangesDir(tmpDir), 'next-verify');
-    state(tmpDir, 'init', 'next-verify', 'full');
+    state(tmpDir, 'init', 'next-verify', 'full', '--runtime', 'compat');
     state(tmpDir, 'set', 'next-verify', 'phase', 'verify');
     const yamlPath = path.join(changeDir, '.comet.yaml');
     const yaml = (await fs.readFile(yamlPath, 'utf8')).replace(/^run_id:.*\r?\n/mu, '');
@@ -460,7 +461,7 @@ describe('status command', () => {
     'reports %s as invalid without changing the synchronized change',
     async (_label, fault, error) => {
       const changeDir = path.join(classicChangesDir(tmpDir), `invalid-${fault}`);
-      state(tmpDir, 'init', `invalid-${fault}`, 'full');
+      state(tmpDir, 'init', `invalid-${fault}`, 'full', '--runtime', 'compat');
       await ensureClassicRuntimeRun(changeDir);
       if (fault === 'marker') {
         const yamlPath = path.join(changeDir, '.comet.yaml');
@@ -470,7 +471,11 @@ describe('status command', () => {
         );
         await fs.writeFile(yamlPath, yaml);
       } else {
-        const runPath = path.join(changeDir, '.comet', 'run-state.json');
+        const runPath = path.join(
+          await resolveClassicRunDirectory(changeDir),
+          '.comet',
+          'run-state.json',
+        );
         const run = JSON.parse(await fs.readFile(runPath, 'utf8'));
         run.skill = 'not-comet-classic';
         await fs.writeFile(runPath, `${JSON.stringify(run, null, 2)}\n`);
@@ -499,7 +504,7 @@ describe('status command', () => {
 
   it('reports invalid state without modifying it', async () => {
     const changeDir = path.join(classicChangesDir(tmpDir), 'invalid');
-    state(tmpDir, 'init', 'invalid', 'full');
+    state(tmpDir, 'init', 'invalid', 'full', '--runtime', 'compat');
     await fs.appendFile(
       path.join(changeDir, '.comet.yaml'),
       'build_command: npm run build\nunknown_root_field: true\n',
@@ -525,10 +530,10 @@ describe('status command', () => {
 
   it('keeps invalid errors visible and only prints the invalid recovery hint for invalid changes', async () => {
     const changeDir = path.join(classicChangesDir(tmpDir), 'invalid');
-    state(tmpDir, 'init', 'invalid', 'full');
+    state(tmpDir, 'init', 'invalid', 'full', '--runtime', 'compat');
     await fs.appendFile(path.join(changeDir, '.comet.yaml'), 'unknown_root_field: true\n');
 
-    state(tmpDir, 'init', 'runtime-eval-fail', 'full');
+    state(tmpDir, 'init', 'runtime-eval-fail', 'full', '--runtime', 'compat');
 
     const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
     let output: string;
@@ -540,13 +545,15 @@ describe('status command', () => {
     }
 
     expect(output).toContain('error: Invalid Classic state: unknown field(s): unknown_root_field');
-    expect(output).toContain('next: inspect .comet.yaml and rerun comet doctor');
+    expect(output).toContain('next: inspect the Classic state file and rerun comet doctor');
     expect(output).toContain('runtime-eval-fail [Comet] [phase: open]');
-    expect(output.match(/next: inspect \.comet\.yaml and rerun comet doctor/g)).toHaveLength(1);
+    expect(
+      output.match(/next: inspect the Classic state file and rerun comet doctor/g),
+    ).toHaveLength(1);
   });
 
   it('prints actionable runtime-eval recovery guidance for valid changes', async () => {
-    state(tmpDir, 'init', 'runtime-eval-fail', 'full');
+    state(tmpDir, 'init', 'runtime-eval-fail', 'full', '--runtime', 'compat');
     await ensureClassicRuntimeRun(path.join(classicChangesDir(tmpDir), 'runtime-eval-fail'));
 
     const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
@@ -568,7 +575,7 @@ describe('status command', () => {
 
   it('reports Classic runtime mode from shared diagnostics', async () => {
     const changeDir = path.join(classicChangesDir(tmpDir), 'demo');
-    state(tmpDir, 'init', 'demo', 'full');
+    state(tmpDir, 'init', 'demo', 'full', '--runtime', 'compat');
     await fs.writeFile(path.join(changeDir, 'proposal.md'), '# Proposal\n');
     await fs.writeFile(path.join(changeDir, 'design.md'), '# Design\n');
     await fs.writeFile(path.join(changeDir, 'tasks.md'), '- [ ] build\n');
@@ -592,6 +599,11 @@ describe('status command', () => {
   });
 
   it('renders the default entry and workflow partitions in text output', async () => {
+    const initialized = spawnSync('git', ['init', '-b', 'main'], {
+      cwd: tmpDir,
+      encoding: 'utf8',
+    });
+    expect(initialized.status, initialized.stderr).toBe(0);
     await writeProjectConfig(tmpDir, defaultProjectConfig('docs'));
     const paths = await nativeProjectPaths(tmpDir, 'docs');
     await createNativeChange({ paths, name: 'native-text', language: 'en' });

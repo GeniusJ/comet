@@ -5,6 +5,7 @@ import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { nativeProjectPaths } from '../../../domains/comet-native/native-paths.js';
+import { withCometRuntimeMetrics } from '../../../platform/process/runtime-metrics.js';
 import {
   assertNativeWorkspaceBindingCurrent,
   inspectNativeWorkspaceBinding,
@@ -176,16 +177,59 @@ describe('Native workspace identity', () => {
     try {
       await fs.mkdir(path.join(otherRoot, 'docs', 'comet'), { recursive: true });
       const copiedPaths = await nativeProjectPaths(otherRoot, 'docs');
-      await expect(
+      const inspected = await withCometRuntimeMetrics(() =>
         inspectNativeWorkspaceAdvisory({ paths: copiedPaths, identity }),
-      ).resolves.toEqual({
+      );
+      expect(inspected.result).toEqual({
         state: 'drifted',
         findingCodes: ['workspace-root-changed'],
         driftComponents: ['project-root-path', 'native-root-path'],
       });
+      expect(inspected.metrics.gitCommands).toBe(0);
     } finally {
       await fs.rm(otherRoot, { recursive: true, force: true });
     }
+  });
+
+  it('checks directory drift without Git while keeping branch bindings fresh', async () => {
+    execFileSync('git', ['init', '-b', 'main'], { cwd: projectRoot, stdio: 'ignore' });
+    execFileSync('git', ['config', 'user.email', 'workspace@example.test'], { cwd: projectRoot });
+    execFileSync('git', ['config', 'user.name', 'Workspace Test'], { cwd: projectRoot });
+    execFileSync('git', ['commit', '--allow-empty', '-m', 'initial'], {
+      cwd: projectRoot,
+      stdio: 'ignore',
+    });
+    const paths = await nativeProjectPaths(projectRoot, 'docs');
+    const identity = await inspectNativeWorkspaceIdentity({
+      paths,
+      name: 'example',
+      revision: 1,
+      binding: { isolation: 'current', changeBranch: 'main', targetBranch: 'main' },
+    });
+    expect(identity.git).toMatchObject({
+      provider: 'git',
+      baseCommit: expect.stringMatching(/^[a-f0-9]{40,64}$/u),
+      targetBranch: 'main',
+      targetCommit: identity.git?.baseCommit,
+    });
+    const bound = await withCometRuntimeMetrics(() =>
+      inspectNativeWorkspaceBinding({ paths, identity }),
+    );
+    expect(bound.result.state).toBe('aligned');
+    expect(bound.metrics.gitCommands).toBeGreaterThan(0);
+
+    execFileSync('git', ['switch', '-c', 'other'], { cwd: projectRoot, stdio: 'ignore' });
+    const advisory = await withCometRuntimeMetrics(() =>
+      inspectNativeWorkspaceAdvisory({ paths, identity }),
+    );
+    expect(advisory.result).toEqual({ state: 'aligned', findingCodes: [], driftComponents: [] });
+    expect(advisory.metrics.gitCommands).toBe(0);
+
+    const changed = await withCometRuntimeMetrics(() =>
+      inspectNativeWorkspaceBinding({ paths, identity }),
+    );
+    expect(changed.result).toMatchObject({ state: 'drifted', code: 'workspace-branch-changed' });
+    expect(changed.metrics.gitCommands).toBeGreaterThan(0);
   });
 
   it('identifies native-root-ref drift separately from physical root drift', async () => {
@@ -237,7 +281,7 @@ describe('Native workspace identity', () => {
       name: 'example',
       revision: 1,
     });
-    const file = path.join(projectRoot, 'docs/comet/changes/example/runtime/workspace.json');
+    const file = nativeWorkspaceFile(paths, 'example');
 
     await fs.writeFile(file, JSON.stringify({ ...written, nativeRootRef: '../other' }));
     await expect(readNativeWorkspaceIdentity(paths, 'example')).rejects.toThrow(
@@ -250,7 +294,7 @@ describe('Native workspace identity', () => {
 
   it('ignores legacy Git-backed v1 metadata as a non-blocking advisory', async () => {
     const paths = await nativeProjectPaths(projectRoot, 'docs');
-    const file = path.join(projectRoot, 'docs/comet/changes/example/runtime/workspace.json');
+    const file = nativeWorkspaceFile(paths, 'example');
     await fs.writeFile(
       file,
       JSON.stringify({
@@ -268,7 +312,7 @@ describe('Native workspace identity', () => {
   it('rejects symlinked identity files instead of following them', async () => {
     if (process.platform === 'win32') return;
     const paths = await nativeProjectPaths(projectRoot, 'docs');
-    const file = path.join(projectRoot, 'docs/comet/changes/example/runtime/workspace.json');
+    const file = nativeWorkspaceFile(paths, 'example');
     const outside = path.join(projectRoot, 'outside.json');
     await fs.writeFile(outside, '{}');
     await fs.symlink(outside, file);

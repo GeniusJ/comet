@@ -2,23 +2,74 @@
 
 Read only the sections needed for the current operation. Supervisor coordination, memory integration, and exception handling each have their own triggers.
 
+## SDK Run
+
+Use this section when the current response has `runtimeFormat: sdk`, or `data.schema` is `comet.native.sdk-status.v1`, `comet.native.dispatch-result.v1`, or `comet.native.run-view.v1`. Identify the current response directly without another status query. Use its `data.run.id` or `data.runId`; current `pendingActions`, `activeActions`, `action`, and `stateVersion` determine work. Claim responses already include Action input and outcome templates; use them directly, retrieving details only when necessary content is missing. Save SDK requests as temporary UTF-8 JSON and submit through `comet runtime dispatch --application native --project-root <projectRoot> --request <file>`. Keep requests out of artifacts, commits, and reports. After `status: succeeded`, verify the same Action's claim or persisted outcome identity. Idempotent acknowledgment of the same claim or outcome may retain the original revision; success does not require another state change. Continue with the returned identity and continuation.
+
+### Shape and Runtime Actions
+
+Complete the formal brief and target Specs, then run `comet native next <change> --json` until `shape.confirm` or `supervisor.shape.confirm` appears in `run.waits`. Present the full Shape; for Supervisor also present the Child plan and ask whether to use multiple or one session. After explicit confirmation, execute the current `continuation.commandAlternatives` with its state version and expected action. Re-propose if documents change. Each later `next` executes one Runtime Action. Use `pendingActions` for the entire queue; `pendingAction` is only the first. Claim and report `build.builder`, `verify.verifier`, `supervisor.child.builder`, `supervisor.child.verifier`, `supervisor.child.integration-repair`, and `supervisor.parent.builder` as described below. Children may work concurrently, but integration Actions and their checks run serially in Run order. Refresh Actions, Waits, and state after every submission.
+
+If a Supervisor Child's Runtime check or independent verification definitively fails, the Run creates another `supervisor.child.builder` bound to the failed Action. Read the actual failure, repair in the original Child worktree, submit a new candidate, and repeat checks and independent verification. A blocked or unknown result does not authorize this repair loop.
+
+If a merged Child's integration check definitively fails, the Run creates `supervisor.child.integration-repair` bound to the failed check, Child, integration worktree, and original integration commit. Repair on that branch and submit a descendant commit. Successful output includes a nonempty `summary`, new `integrationCommit`, and nonempty reproducible `integrationChecks`. Runtime verifies ancestry and workspace before rerunning integration checks; other accepted Children remain queued. On repair failure, merge conflict, or unknown execution, preserve the original Action and investigate rather than assuming success or redispatching.
+
+After an integration repair reports `failed`, preserve the original Action and uncommitted changes and wait for `supervisor.child.integration-resume`. Explain the failure and preserved workspace. Only after the user chooses to continue, use the current continuation's `continue-builder` command with its latest proposal hash and state version to create a successor repair Action. If an older Run terminated on this failure, first run read-only `native doctor <change>` and use `--repair` only as it recommends, then resolve the same confirmation. For an unknown outcome, reconcile the original claim and execution first; this failure recovery path does not apply.
+
+If `supervisor.child.integrate` returns `EXECUTION_UNKNOWN`, inspect its Action, claim, and integration worktree Git state. Only when `MERGE_HEAD` matches that Child's candidate commit and the branch is still at the last successful integration check commit (or the preparation target for the first Child) may you resolve that original merge and create the merge commit. Report once against the original Action using its `attempt`, `inputHash`, and `claimToken`; successful output includes `child`, `candidateCommit`, `baseCommit`, `integrationCommit`, `integrationBranch`, and `integrationWorktree`. Runtime checks both merge parents before scheduling checks. Otherwise establish whether execution occurred; retry through SDK reconciliation only with evidence that this merge did not occur.
+
+If independent parent verification definitively fails, or the user rejects the parent result, the Run creates another `supervisor.parent.builder`. Repair in the original integration worktree and report a new `candidateCommit`. Runtime binds later checks, verification, and delivery to that commit. Even if code did not change, submit a new Builder result and checks; do not reuse the old candidate's acceptance.
+
+### SDK Action claims and outcomes
+
+Before Builder starts an iteration or an independent Verifier starts, copy the current Action's `claimRequest`, fill the receiving session and stable claim token, and submit `claim`. Independent claims validate `actionId`, `attempt`, and `inputHash`; do not add an old global revision. Progress by another task does not require redispatching this one. Include `operation: "claim"`, `runId`, `actionId`, `attempt`, `inputHash`, `executorId: "native-host"`, `sessionId`, and a unique `claimToken` stable across recovery. Use a platform session or task ID; if unavailable, use a stable execution reference and do not imply that it authenticates the executor. Work only after that Action is returned as `running` with the matching claim. If another executor holds it, investigate that work instead of claiming or starting it again.
+
+After completion, submit `record-outcome` with the same `runId`. The outcome contains the original `actionId`, `attempt`, `inputHash`, `claimToken`, a unique `outcomeId`, the real `status`, and `output`. Never report unfinished, unexecuted, or unknown work as `succeeded`. Continue only after SDK validates and stores the receipt.
+
+### SDK Builder handoff
+
+Successful `build.builder` and `supervisor.parent.builder` output contains nonempty `summary`, `addressedAcceptanceIds`, an item-by-item self-review in `acceptanceReview`, development `checks` (each with `name`, `result`, `note`), `knownLimits`, ISO `submittedAt`, and optional `review` and `verificationChecks`. Provide exactly one `{id,status,evidence,note}` entry in `acceptanceReview` for every confirmed acceptance ID. Submit only when every entry has `status: implemented-with-evidence` and nonempty `evidence`; remain in Build when work is unimplemented, known to fail, or lacks evidence. `verificationChecks` plans real Runtime checks; Builder-reported checks and self-review are not independent verification verdicts. Run `native next` for `verify.checks` after submission. Repair failed checks according to the returned state; do not invent passing results.
+### SDK Verify protocol
+
+An independent, read-only platform session must claim `verify.verifier`. Launch it with the current candidate ID, acceptance items and references, workspace, and Runtime check locations; its first Runtime action should claim. Platform dispatch alone means dispatched, not confirmed started. On a wait-tool timeout, continue tracking the same task. The Verifier evaluates every current acceptance item. Successful output includes the current `candidateId`, the same `verifierExecutionRef` used at claim, and a `response`: `final-result` for a complete verdict or `request-checks` for additional Runtime checks. For the latter, execute checks with `native next`, then have the same Verifier session claim the new Action; reuse unchanged check receipts.
+
+Submit `status: "failed"` with a truthful nonempty `summary` only when the platform confirms that the Verifier did not start, failed, timed out, was lost, or ended without a usable result. SDK keeps the candidate and completed checks and creates a limited number of replacement Actions. At the limit, await a user decision. If independent verification is unavailable, stop and report; do not invent a verdict.
+
+### User decisions, Archive, and recovery
+
+At `verify.confirm`, show the independent verdict and wait for the user. Use the current `run.waits[].proposalHash`, `stateVersion`, and `--expected-action` with `native next <change> --accept-result|--revise-implementation --summary <text> --proposal-hash <hash> --expected-state-version <n> --expected-action <action>`. Runtime rechecks the report before Archive. For changed requirements or acceptance criteria, explain Shape reconfirmation and, after explicit choice, use `native next <change> --revise-requirements --summary <text> --expected-state-version <n> --expected-action revise-requirements`. This versioned SDK command replaces unclaimed work; it does not use the Verify proposal hash. Do not reuse acceptance for the new Shape. Revision also applies in Archive before `archive.execute` succeeds, but not afterward. At `verify.retry`, use `--retry-verifier` with the same guards only after the user chooses to retry; retain the candidate and valid checks.
+
+In Archive, directly execute the `native archive <change> --json` command returned by the current continuation. Runtime advances `archive.prepare`, `archive.execute`, and `archive.finalize` together where safe, retaining each Action’s real outcome. Use `native archive <change> --dry-run --json` only for preview or diagnosis. Follow the latest continuation after each call; do not repeat Archive on a fixed schedule or replay an old state version. Supervisor also schedules `supervisor.cleanup`: Runtime removes only the Child and integration worktrees created for this Run when the target branch still points to the accepted commit, the temporary worktrees are clean, and their branches have been merged. Preserve a dirty worktree or an unknown outcome and reconcile the original Action; do not force removal. Declare SDK archive complete only when the Run is `completed` and business state is `done`. Merge, push, PR, and non-Supervisor temporary workspace cleanup still require separate authorization and verification; SDK archive alone does not prove external delivery is complete.
+
+After interruption, read `native status <change> --details --json` and use SDK `inspect` when necessary. A pending Action can continue. For a `running` or `unknown` host Action, inspect the original platform session, task handle, and `claimToken`. The original claimant reports a known actual outcome. Reopen through SDK `retry`/reconciliation only with authoritative evidence that the work did not execute. Otherwise preserve the state and report the blocker; do not redispatch side-effecting work. Original Runtime `continuation` and `--runner-input` instructions do not apply to an SDK Run. If the entire local Run history is missing, follow the explicit restoration steps in the main Skill.
+
+If a Builder partially executed and its original Action has a recorded `failed` outcome, preserve the workspace and that failure. Do not reconcile the Action as "not executed" or redispatch it yourself. Run `native next <change> --json` and read the matching `build.resume`, `supervisor.child.resume`, or `supervisor.parent.resume` Wait from `pendingBuilderDecisions`. Explain the partial changes, failure, and risk of continuing to the user first. After an explicit decision to continue, fill in `--summary` in its `commandArgs`, retain the proposal hash, state version, and expected action, and execute `--continue-builder`. Runtime creates a new Builder Action bound to the failed one. Claim and continue that new Action in the original workspace, then rerun checks and verification. While the user has not decided or the proposal is stale, stop and inspect the current Run again; leave the original failure unchanged.
+
+If `supervisor.parent.deliver`, `archive.execute`, `archive.finalize`, or `supervisor.cleanup` is the only `unknown` Action and the original execution process is confirmed stopped, run `native archive <change> --recover --json`. Delivery recovery reports the outcome against the original Action only when the target branch still points exactly to the verified integration commit. It rejects a target that has not received the commit or has moved since delivery; it does not repeat the fast-forward. Archive and cleanup recovery verify the original claim, durable evidence, and worktrees, complete any remaining safe work, and report against the same Action. Recovery does not create another attempt. If evidence is insufficient, a worktree has uncommitted changes, or the original process may still be running, preserve the state and resolve those facts first. After success, refresh the Run and handle any newly pending Action.
+
 ## Memory integration
 
-After entering the change workspace and reading Runtime's current `phase`, the Agent automatically runs once:
+After entering the change workspace and obtaining its current `phase`, prefer the current task packet's `contextRequest`, including Compat `supervisorTask.contextRequest`; use `continuation.contextRequest` when no task-specific request exists. SDK Builders, Verifiers and children use the `contextRequest` of their corresponding `pendingActions[]` or `activeActions[]`, after the receiver successfully claims the Action. Supply the original user request and the receiving Agent's own stable session ID. If the original request is missing, first recover the goal from the current brief.
+
+Read a full snapshot once on first entering a phase, handing off to a new Agent, or recovering after context compression or in a new session. For older responses without `contextRequest`, use:
 
 ```text
-comet task <project-root> --task "<original user request>" --phase "<phase>" --session "<stable task identifier>" --json
+comet task <project-root> --task "<original user request>" --phase "<phase>" --session "<receiving Agent stable identifier>" --context-mode snapshot --json
 ```
 
-Add only the returned JSON `text` to context. `manifest` (`<context_manifest>` in injected text) is the Context Manifest: a list of context items containing only summaries, reasons for use, and stable IDs.
+Add the returned JSON `context[].text` to context. A snapshot returns the currently applicable content even when this session received it before; repeated retrieval does not imply repeated use or successful execution. `manifest` (`<context_manifest>` in injected text) is the Context Manifest: a list of context items containing only summaries, reasons for use, and stable IDs.
 
-When the task needs full text, sources, or verification methods, run `comet task <project-root> --task "<original user request>" --phase "<phase>" --session "<same identifier>" --expand-context "<id>" --json`. When paths, operations, or phase change, retain the same `--session` and retrieve again with the new `--path`, `--operation`, and `--phase`; unchanged items are not returned again.
+When the task needs full text, sources, or verification methods, run `comet task <project-root> --task "<original user request>" --phase "<phase>" --session "<same identifier>" --expand-context "<id>" --json`. Reuse context during uninterrupted work in the same phase. When paths or operations change, retain the session ID and retrieve with the new `--path` and `--operation`; the default incremental mode returns applicable content not yet delivered for that context.
+
+Include the receiver's `contextRequest` in handoffs, preserving the user's wording, applicability and sources. Give Verifiers applicable verification preferences, project constraints and objective evidence; do not pass Builder self-assessment as a verdict. Use the host's actual Skill loading interface for applicable Skill preferences, and explain unavailable Skills, conflicts with current instructions or incompatibility with a read-only role. Check context delivery, Skill loading and actual compliance separately. Skills do not replace Runtime checks, user authorization or independent verification. Continue with explicit instructions after empty or failed retrieval, without retry loops or workflow rollback caused by changed retrieval results.
 
 If `<active_policies>` includes `<verification command="...">`, include those commands in current Verify checks and record actual results. Runtime makes the policy mandatory only after its command executes successfully.
 
 Save memory as follows:
 
-- When the user explicitly asks to remember a preference or project convention long term, call `comet memory remember <project-root> --text "<preference or convention>" --scope global|project --json` to save it immediately as explicit user memory.
+At task completion, prefer [Task learning completion](../../comet/reference/task-learning.md): prepare one learning file and use `comet task --complete --learning-file <file>` to submit personal observations, project lessons, pending review decisions, and actual-use feedback together. The separate save, review, and completion commands below remain available for immediate saves, individual corrections, and older versions; do not repeat them when using a learning file.
+
+- When the user explicitly asks to remember a preference or project convention long term, call `comet memory remember <project-root> --text "<preference or convention>" --scope global|project --json` to save it immediately as explicit user memory. Add repeatable `--phase` only when the user explicitly limits applicability, for example `--phase build --phase verify`. Correct phase applicability with `comet memory correct <project-root> --id <id> --phase <phase> --json`. Preserve the user's wording; do not automatically limit a preference to the current phase.
 - Only when the user has not requested long-term memory, but a collaboration practice is stable and reusable in future tasks, call `comet memory observe <project-root> --text "<collaboration practice>" --workflow <workflow> --change <change-id> --candidate-key <stable-topic-key> --json`.
 - Neither command may save task summaries, implementation progress, command output, or test results.
 
@@ -27,10 +78,17 @@ Save memory as follows:
 Project Memory is separate from Personal Memory. Before task completion, write facts, decisions, patterns, procedures, constraints, or failure resolutions that are verified in the current project and reusable in future tasks:
 
 ```text
-comet knowledge remember <project-root> --title "<concise title>" --text "<symptom, approach, verification>" --type <fact|decision|pattern|procedure|constraint|failure-resolution> --json
+comet knowledge remember <project-root> --title "<concise title>" --text "<symptom, approach, verification>" --type <fact|decision|pattern|procedure|constraint|failure-resolution> --workflow native --change <change-id> --evidence "<source files, comma-separated>" --json
 ```
 
-The same title updates the existing entry instead of creating a duplicate. Skip the write when nothing is reusable. The project memory index is injected with task context; expand one entry with the same task arguments plus `--expand-context "project-memory:<slug>"`. Never save task summaries, one-off command output, or unverified guesses in Project Memory.
+The same title updates the existing entry instead of creating a duplicate. Skip the write when nothing is reusable. `--evidence` binds project files that support the conclusion; omit it for collaboration decisions without file evidence. The returned `slug` is the write receipt. Before applying an existing lesson, expand it with the same task arguments plus `--expand-context "project-memory:<slug>"` and check its current sources. Verify and update the lesson when a source changes or becomes unreadable. Never save task summaries, one-off command output, or unverified guesses.
+
+Before task completion, the Agent performs a separate project learning check:
+
+1. Run `comet knowledge review <project-root> --workflow native --change <change-id> --json` and process only this change's pending reviews.
+2. Using the returned `recordFields` and source evidence, the Agent writes review actions and submits them with `--id <id> --file <actions.json>`. Submit `[]` when no reusable lesson is supported. The user does not write JSON. Confirm `submission.status` is `applied`; `accepted` means the actions were received.
+3. Save verified reusable lessons that have not yet been recorded. Pass `--project-learning-check submitted --memory <slug>` to the completion command after saving; separate multiple receipts with commas. Pass `no-observation` if there is no reusable lesson, or `not-run` if the check was not performed.
+4. Inspect `projectLearning` in the completion response. Report the project learning check complete only when `submissionVerified` is `true` and both `pendingHostReviewCount` and `pendingReflectionCount` are `0`. Otherwise follow `nextActions` and report unfinished work. Learning failures do not block completed development work.
 
 Before every task ends, complete one learning check. When the task contains a user correction, preference, or collaboration practice with a clear reuse condition, call `comet memory observe` and then pass `--learning-check submitted` to `comet task ... --complete`. If you checked and found no qualifying observation, pass `--learning-check no-observation`; if no check was performed, pass `--learning-check not-run`. The first observation creates only a `trial` candidate; a second independent successful observation from a different change may promote it. Do not submit a task summary or test result to manufacture a record.
 
@@ -38,7 +96,7 @@ The observation JSON `learning.result` reports `candidate-created`, `candidate-p
 
 After actually using an item, obtain its identifier from JSON `applications[].applicationId` (`application_id` in Hook text). Once the outcome is known, record it with `comet task <project-root> --task "<original user request>" --application "<application-id>" --outcome used-successfully|ignored|overridden|corrected|contributed-to-failure --json`. Never report successful use of an unused item.
 
-If verification, compilation, or linting fails, address the error and rerun. At task completion, still call `comet task <project-root> --task "<original user request>" --complete --workflow <workflow> --change <change-id> --learning-check submitted|no-observation|not-run --json` to record completion. An unavailable command, empty result, or failed automatic retrieval does not block the task. On platforms without Hooks, this Skill calls the same interfaces; `comet memory context` is a compatibility entry only.
+If verification, compilation, or linting fails, address the error and rerun. At task completion, call `comet task <project-root> --task "<original user request>" --complete --workflow native --change <change-id> --learning-check submitted|no-observation|not-run --project-learning-check submitted|no-observation|not-run [--memory <slug>] --json` to record completion. The two checks cover Personal Memory and project experience independently. An unavailable command, empty result, or failed automatic retrieval does not block the task. On platforms without Hooks, this Skill calls the same interfaces; `comet memory context` is a compatibility entry only.
 
 ## User Hook writes
 
@@ -61,6 +119,8 @@ When the user explicitly wants to revoke a capability association, first run `co
 
 ## Filling command inputs
 
+Runner templates in this section apply only to Compat. SDK uses the Action protocol above and current `claimRequest` / `outcomeRequest`, without `--runner-input`.
+
 Read this section before first filling a Runtime template or returning a result through `returnAction`.
 
 Copy `inputOptions.template` into a system temporary JSON file, replace only the requested values, then execute `continuation.commandArgs` or the selected `commandAlternative.commandArgs`. Delete the temporary file after Runtime accepts the input; retain rejected input, correct it as directed, and resubmit. Preserve all supplied iteration, attempt, state-version, and task identifiers exactly; fill only fields exposed by the template.
@@ -71,7 +131,25 @@ Supervisor children work in the task package's `projectRoot`. Return results thr
 
 Submit directly once the template is filled completely; Runtime validates the input on submission, so no pre-check pass is needed. Use `comet native next <change> --runner-input <file> --validate-only --json` only when a submission was rejected and you need to distinguish a JSON structure error from a business validation error; it does not write workflow state (comet-state.yaml) or start checks. Actual submission must still use the state version, task identifiers, and arguments in the current `continuation`.
 
+### Enumerated input values
+
+Template placeholders and validation errors list every legal value for the fields below. Each set belongs to that field only; never reuse a value from one field for another.
+
+| Input | Field | Legal values |
+|-------|-------|--------------|
+| `builder-handoff` | `checks[].result` | `passed` / `failed` / `not-run` — development checks the Builder ran or did not run |
+| `builder-handoff` | `acceptance_review[].status` | `implemented-with-evidence` / `implemented-no-evidence` / `not-implemented` / `known-fail` |
+| `builder-handoff` | `review.status` | `passed` |
+| `verifier-response` (`final-result`) | `result.verdict` | `pass` / `fail` / `blocked` — the Verifier's overall verdict |
+| `verifier-response` (`final-result`) | `result.acceptance[].result` | `passed` / `failed` / `blocked` — one result per acceptance item |
+| `supervisor-verifier-result` | `verdict` | `pass` / `fail` / `blocked` |
+| `supervisor-verifier-result` | `evidence.acceptance[].result` | `passed` / `failed` / `blocked` |
+
+Per-item results and Builder check results use the past tense (`passed`, `failed`); the overall verdict uses the base form (`pass`, `fail`). `not-run` exists only for Builder development checks, `blocked` only for Verifier fields, and `pending` is an internal Runtime state that never appears in an input.
+
 ## Builder handoff
+
+Compat only. SDK uses [SDK Builder handoff](#sdk-builder-handoff) and the current `outcomeRequest`.
 
 Read this section before submitting `builder-handoff`.
 
@@ -90,6 +168,8 @@ Runtime saves the summary in `comet-state.yaml`, not a separate file; it does no
 Complete when implementation and relevant checks are ready for verification, all acceptance items have been rechecked, and Runtime accepts the handoff and enters Verify.
 
 ## Verify protocol
+
+Compat only. SDK uses [SDK Verify protocol](#sdk-verify-protocol); the claim receipt replaces `startupInput`, without a legacy Runner response.
 
 Read before launching, adding checks for, or waiting on a Verifier. Follow [filling command inputs](#filling-command-inputs) for submissions.
 
@@ -151,6 +231,8 @@ Complete when Runtime accepts the complete Verifier result and explicitly enters
 
 ## Supervisor coordination
 
+Compat `childSummary`, `readyChildren`, and Runner packages only. SDK children, integration, and recovery follow the [SDK Run](#sdk-run) Action protocol.
+
 Read before dispatching, receiving results, or integrating. Read [filling command inputs](#filling-command-inputs) before first filling input or executing `returnAction`.
 
 ### Dispatch and task identifiers
@@ -170,7 +252,7 @@ Each dispatch must identify the role, task package, worktree, baseline commit, `
 - While waiting for external input, read [external input and monitoring](recovery.md#external-input-and-monitoring). Silence in chat does not pause monitoring. Keep only monitors that still have runnable work or external state to check, and explain blockers and recovery conditions promptly.
 - In Codex, when user-visible independent sessions can be managed, create one for each ready child instead of using only subagents within the current session. Use the existing project when creating a session; do not let Codex create another worktree. The new session must first enter Runtime's child worktree, and all subsequent file and Git operations stay there. Save session information, wait on or read sessions to monitor progress, and send follow-up instructions when correction or added context is needed.
 - In Claude Code, create a Claude Code Agent Team when available in an interactive session. The current session coordinates; assign each ready child to a clearly named team member. Members enter Runtime's child worktree. Add only Runtime-ready children to the team task list; Runtime remains authoritative for readiness and completion. Members must not create another Claude Code Agent Team, integrate the parent branch directly, or expand scope. Continue reading messages and task state and provide timely guidance.
-- If Codex independent sessions or a Claude Code Agent Team are unavailable, or original sessions or teams are missing after recovery, reread Runtime state, explain the reason, and automatically switch to a subagent under `multi-session`; do not ask for the coordination mode again. Prepare undispatched children from the latest `readyChildren`. A dispatched task whose session is lost is not complete. When session information (including all `runId` values) is unavailable, run `next --summary` first: the recovery path's response carries complete task packages (runId, worktree, and base commit) for every in-flight task. Then submit `supervisor-cancel` with each lost task's current `runId`, obtain a new package and `runId` from the latest `continuation`, and dispatch to a subagent. Runtime rejects late results from the old execution. If subagents are also unavailable, report the actual execution blocker; do not automatically switch to single-session progression.
+- If Codex independent sessions or a Claude Code Agent Team are unavailable, or original sessions or teams are missing after recovery, reread Runtime state, explain the reason, and switch to a subagent under `multi-session`; do not ask for the coordination mode again. Prepare undispatched children from the latest `readyChildren`. When a dispatched task's session is lost, run `next --summary` to obtain complete task packages (including `runId`, worktree, and base commit) for every in-flight task, then use the original platform to check whether the original execution and its descendants have stopped. An inaccessible session or a rejected late result does not prove that execution has stopped. Only after the platform confirms that the original execution and its descendants have stopped may you submit `supervisor-cancel` with the current `runId`, obtain a new package and `runId` from the latest `continuation`, and dispatch to a subagent. If stopping cannot be confirmed, preserve the original `runId` and worktree, report the blocker and the required evidence of stopping, and wait for reconciliation; do not cancel or redispatch the task or continue modifying that worktree. If subagents are also unavailable, report the actual execution blocker; do not automatically switch to single-session progression.
 
 ### Final Supervisor verification
 
@@ -197,6 +279,8 @@ Use `supervisor-integrate` without `runId`. When integration reports a Git confl
 Runtime can validate saved check records and their candidate, workspace, machine, and input associations. The execution platform still owns write-permission isolation for ordinary external files.
 
 ## Command inputs and exceptions
+
+SDK reconciles the same Action, claim, and outcome through [SDK Run](#sdk-run) and the current continuation. Runner templates, `verifier-unavailable`, and `--finish` below apply only to Compat.
 
 For normal flow, execute the commands Runtime supplies in `continuation`. During recovery, `next --summary` without action input returns the current template and preserves the phase; fill that template directly without another status query. This section explains returned fields and handles rejected input, unavailable Verifiers, Verifier execution errors, missing external information, and decisions to accept results without complete independent verification. `continuation.disposition` says whether to continue, wait for the user, address a blocker, or finish. Execute commands containing `--confirmed` only after explicit user confirmation. CLI text begins with a readable `summary`, a single `NEXT:`, and optional `RELAY TO USER:`. Use `--json` for structured responses; use `--verbose` only to diagnose local execution.
 

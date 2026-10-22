@@ -41,6 +41,56 @@ function classifyIssue(
 }
 
 describe('CI workflows', () => {
+  it('validates pull requests and master pushes without duplicating development branch runs', async () => {
+    for (const name of ['ci.yml', 'security.yml']) {
+      const workflow = parse(await readWorkflow(name));
+      expect(workflow.on.push.branches).toEqual(['master']);
+      expect(workflow.on).toHaveProperty('pull_request');
+      expect(workflow.on).not.toHaveProperty('paths');
+      expect(workflow.on.pull_request?.paths).toBeUndefined();
+      expect(workflow.concurrency['cancel-in-progress']).toBe(true);
+    }
+    const ci = parse(await readWorkflow('ci.yml'));
+    const security = parse(await readWorkflow('security.yml'));
+    expect(ci.on).toHaveProperty('workflow_dispatch');
+    expect(security.on.schedule).toEqual([{ cron: '31 2 * * 4' }]);
+  });
+
+  it('uploads Dashboard browser reports and traces from the configured root coverage directory', async () => {
+    const ci = parse(await readWorkflow('ci.yml'));
+    const report = ci.jobs['dashboard-e2e'].steps.find((step: { uses?: string }) =>
+      step.uses?.startsWith('actions/upload-artifact@'),
+    );
+    expect(report.if).toBe('always()');
+    expect(report.with.path.trim().split('\n')).toEqual([
+      'coverage/playwright-report/',
+      'coverage/playwright-results/',
+    ]);
+    expect(report.with['if-no-files-found']).toBe('warn');
+    const config = await fs.readFile('test/domains/dashboard/playwright.config.ts', 'utf8');
+    expect(config).toContain("new URL('../../../coverage/playwright-results', import.meta.url)");
+    expect(config).toContain("new URL('../../../coverage/playwright-report', import.meta.url)");
+    expect(config).toContain("trace: 'retain-on-failure'");
+  });
+
+  it('finishes the complete Node 22 suite in independent shards with retained failure reports', async () => {
+    const ci = parse(await readWorkflow('ci.yml'));
+    const node = ci.jobs['node-compatibility'];
+    expect(node.strategy['fail-fast']).toBe(false);
+    expect(node.strategy.matrix.shard).toEqual([1, 2]);
+    expect(node['timeout-minutes']).toBeGreaterThanOrEqual(40);
+    const tests = node.steps.find((step: { id?: string }) => step.id === 'node22-tests');
+    expect(tests.run).toContain('pnpm test --shard=${{ matrix.shard }}/2');
+    expect(tests.run).not.toContain('--exclude');
+    expect(tests.run).toContain('--outputFile.json=coverage/node22/results.json');
+    const report = node.steps.find((step: { uses?: string }) =>
+      step.uses?.startsWith('actions/upload-artifact@'),
+    );
+    expect(report.if).toContain('always()');
+    expect(report.with.name).toContain('${{ matrix.shard }}');
+    expect(ci.jobs['ci-required'].needs).toContain('node-compatibility');
+  });
+
   it('executes DSH installation and PowerShell protocol regressions on the OS matrix', async () => {
     const workflow = parse(await readWorkflow('ci.yml'));
     const runtime = workflow.jobs['runtime-smoke'];
@@ -50,6 +100,55 @@ describe('CI workflows', () => {
     expect(commands).toContain('test/platform/dsh-profiles.test.ts');
   });
 
+  it('exercises workspace identity and storage regressions on every runtime OS', async () => {
+    const workflow = parse(await readWorkflow('ci.yml'));
+    const runtime = workflow.jobs['runtime-smoke'];
+    expect(runtime.strategy.matrix.os).toEqual(['ubuntu-latest', 'macos-latest', 'windows-latest']);
+    const commands = runtime.steps.map((step: { run?: string }) => step.run ?? '').join('\n');
+    expect(commands).toContain('test/platform/workspace-runtime.test.ts');
+    expect(commands).toContain('test/domains/workflow-contract/workspace-runtime.test.ts');
+  });
+
+  it('builds and requires the real Runtime API cases in Eval static checks', async () => {
+    const workflow = parse(await readWorkflow('ci.yml'));
+    const job = workflow.jobs['eval-static'];
+    const steps = job.steps as Array<{
+      name?: string;
+      run?: string;
+      shell?: string;
+      'working-directory'?: string;
+      if?: string;
+      'continue-on-error'?: boolean;
+    }>;
+    const install = steps.findIndex((step) => step.run?.startsWith('pnpm install'));
+    const build = steps.findIndex((step) => step.run === 'pnpm exec tsc --pretty false');
+    const tests = steps.findIndex((step) => step.run?.startsWith('uv run pytest'));
+    const required = steps.findIndex(
+      (step) => step.name === 'Require real Runtime API cases to pass',
+    );
+
+    expect(install).toBeGreaterThanOrEqual(0);
+    expect(build).toBeGreaterThan(install);
+    expect(tests).toBeGreaterThan(build);
+    expect(required).toBeGreaterThan(tests);
+    expect(steps[build]['working-directory']).toBe('.');
+    expect(steps[build].if).toBeUndefined();
+    expect(steps[build]['continue-on-error']).toBeUndefined();
+    expect(job.defaults.run['working-directory']).toBe('eval');
+    expect(steps[tests].run).toContain('--junitxml=eval-static.xml');
+    expect(steps[required].shell).toBe('python {0}');
+    expect(steps[required].if).toBeUndefined();
+    expect(steps[required]['continue-on-error']).toBeUndefined();
+    expect(steps[required].run).toContain(
+      'test_current_checkpoint_api_validates_generated_v1_and_v2_content',
+    );
+    for (const scenario of ['foreign-fence', 'history-owner', 'owner-symlink', 'runtime-symlink']) {
+      expect(steps[required].run).toContain(
+        `test_current_runtime_owner_api_uses_workspace_identity_not_fence_target[${scenario}]`,
+      );
+    }
+  });
+
   it('runs the required CI contract for every pull request', async () => {
     const workflow = await readWorkflow('ci.yml');
     const packageJson = JSON.parse(await fs.readFile('package.json', 'utf8')) as {
@@ -57,7 +156,7 @@ describe('CI workflows', () => {
       engines?: { node?: string };
     };
 
-    expect(workflow).toMatch(/pull_request:\s*\n\s*permissions:/);
+    expect((parse(workflow) as { on: Record<string, unknown> }).on).toHaveProperty('pull_request');
     expect(workflow).toContain('cancel-in-progress: true');
     expect(workflow).toContain('pnpm check:generated');
     expect(workflow.indexOf('pnpm check:generated')).toBeLessThan(workflow.indexOf('pnpm build'));
@@ -105,6 +204,57 @@ describe('CI workflows', () => {
     );
   });
 
+  it('requires native Windows Eval artifact safety with locked base dependencies and non-skipped cases', async () => {
+    const ci = parse(await readWorkflow('ci.yml'));
+    const job = ci.jobs['eval-windows'];
+    expect(job['runs-on']).toBe('windows-latest');
+    expect(job.if).toBeUndefined();
+    expect(job['continue-on-error']).toBeUndefined();
+    expect(job.defaults.run['working-directory']).toBe('eval');
+    expect(job.steps.map((step: { run?: string }) => step.run)).toContain(
+      'uv sync --locked --no-default-groups',
+    );
+    const tests = job.steps.find((step: { id?: string }) => step.id === 'artifact-tests');
+    expect(tests.run).toContain('uv run --locked --no-sync pytest -q');
+    for (const file of [
+      'test_workspace_artifacts.py',
+      'test_workspace_artifacts_windows.py',
+      'test_logging.py',
+      'test_profiles.py',
+    ]) {
+      expect(tests.run).toContain(`local/tests/scaffold/${file}`);
+    }
+    expect(tests.run).toContain('--junitxml=windows-artifacts.xml');
+    const guard = job.steps.find((step: { shell?: string }) => step.shell === 'python {0}');
+    expect(guard.run).toContain('sys.platform == "win32"');
+    expect(guard.run).toContain('ET.parse("windows-artifacts.xml")');
+    for (const name of [
+      'test_windows_reads_unicode_nested_text',
+      'test_windows_reads_long_path',
+      'test_windows_skips_junctions',
+      'test_windows_releases_handles',
+      'test_windows_rejects_junction_root',
+      'test_windows_skips_sharing_conflict',
+      'test_windows_api_errors_are_environment_failures',
+    ]) {
+      expect(guard.run).toContain(name);
+    }
+    expect(guard.run).toContain('assert matches');
+    expect(guard.run).toContain('case.find("skipped") is None');
+    expect(guard.run).toContain('case.find("failure") is None');
+    expect(guard.run).toContain('case.find("error") is None');
+    expect(guard.if).toBeUndefined();
+    expect(guard['continue-on-error']).toBeUndefined();
+    expect(job.steps.indexOf(guard)).toBeGreaterThan(job.steps.indexOf(tests));
+    const report = job.steps.find((step: { uses?: string }) =>
+      step.uses?.startsWith('actions/upload-artifact@'),
+    );
+    expect(report.if).toContain('always()');
+    expect(report.with.path).toBe('eval/windows-artifacts.xml');
+    expect(report.with['if-no-files-found']).toBe('error');
+    expect(ci.jobs['ci-required'].needs).toContain('eval-windows');
+  });
+
   it('pins third-party actions to immutable commit SHAs', async () => {
     const names = await fs.readdir('.github/workflows');
     for (const name of names.filter((entry) => entry.endsWith('.yml'))) {
@@ -115,6 +265,237 @@ describe('CI workflows', () => {
         expect(reference, `${name}: ${reference}`).toMatch(/@[0-9a-f]{40}$/);
       }
     }
+  });
+
+  it('canonicalizes only the existing macOS host temporary directory before package and SDK tests', async () => {
+    const ci = parse(await readWorkflow('ci.yml')) as {
+      jobs: Record<string, { steps?: Array<{ name?: string; run?: string; if?: string }> }>;
+    };
+    const prepared = Object.entries(ci.jobs).flatMap(([job, config]) =>
+      (config.steps ?? [])
+        .filter((step) => step.run?.includes('TMPDIR='))
+        .map((step) => ({ job, step })),
+    );
+    expect(prepared.map(({ job }) => job).sort()).toEqual(['package-e2e', 'sdk-contracts']);
+    for (const { job, step } of prepared) {
+      expect(step.if).toBe("matrix.os == 'macos-latest'");
+      const steps = ci.jobs[job].steps ?? [];
+      expect(steps.indexOf(step)).toBeLessThan(
+        steps.findIndex((item) => item.run === 'pnpm build'),
+      );
+      const source = step.run?.match(/^node -e "([\s\S]+)"$/)?.[1];
+      expect(source).toBeDefined();
+      const writes: Array<[string, string]> = [];
+      runInNewContext(source!, {
+        process: { env: { GITHUB_ENV: '/job/environment' } },
+        require: (name: string) => {
+          if (name === 'node:os') return { tmpdir: () => '/var/host-temp' };
+          if (name === 'node:fs')
+            return {
+              realpathSync: (target: string) => {
+                expect(target).toBe('/var/host-temp');
+                return '/private/var/host-temp';
+              },
+              appendFileSync: (target: string, content: string) => writes.push([target, content]),
+            };
+          throw new Error(`Unexpected preparation dependency: ${name}`);
+        },
+      });
+      expect(writes).toEqual([['/job/environment', 'TMPDIR=/private/var/host-temp\n']]);
+    }
+  });
+
+  it('uses the real existing Windows temporary directory for both TEMP and TMP before package and SDK tests', async () => {
+    const ci = parse(await readWorkflow('ci.yml')) as {
+      jobs: Record<string, { steps?: Array<{ name?: string; run?: string; if?: string }> }>;
+    };
+    const prepared = Object.entries(ci.jobs).flatMap(([job, config]) =>
+      (config.steps ?? [])
+        .filter((step) => step.run?.includes('TEMP='))
+        .map((step) => ({ job, step })),
+    );
+    expect(prepared.map(({ job }) => job).sort()).toEqual(['package-e2e', 'sdk-contracts']);
+    for (const { job, step } of prepared) {
+      expect(step.if).toBe("matrix.os == 'windows-latest'");
+      const steps = ci.jobs[job].steps ?? [];
+      expect(steps.indexOf(step)).toBeLessThan(
+        steps.findIndex((item) => item.run === 'pnpm build'),
+      );
+      const source = step.run?.match(/^node -e "([\s\S]+)"$/)?.[1];
+      expect(source).toBeDefined();
+      const writes: Array<[string, string]> = [];
+      const shortRoot = 'C:\\Users\\RUNNER~1\\AppData\\Local\\Temp';
+      const realRoot = 'C:\\Users\\runneradmin\\AppData\\Local\\Temp';
+      runInNewContext(source!, {
+        process: { env: { GITHUB_ENV: 'D:\\job\\environment' } },
+        require: (name: string) => {
+          if (name === 'node:os') return { tmpdir: () => shortRoot };
+          if (name === 'node:fs')
+            return {
+              realpathSync: Object.assign(() => shortRoot, {
+                native: (target: string) => {
+                  expect(target).toBe(shortRoot);
+                  return realRoot;
+                },
+              }),
+              appendFileSync: (target: string, content: string) => writes.push([target, content]),
+            };
+          throw new Error(`Unexpected preparation dependency: ${name}`);
+        },
+      });
+      expect(writes).toEqual([['D:\\job\\environment', `TEMP=${realRoot}\nTMP=${realRoot}\n`]]);
+    }
+  });
+
+  it('runs the Windows Classic lifecycle separately from other process-heavy SDK fixtures', async () => {
+    const ci = parse(await readWorkflow('ci.yml')) as {
+      jobs: Record<
+        string,
+        { steps: Array<{ name?: string; id?: string; run?: string; if?: string }> }
+      >;
+    };
+    const steps = ci.jobs['sdk-contracts'].steps;
+    const sdk = steps.find((step) => step.id === 'sdk-tests')!;
+    const classic = steps.find((step) => step.id === 'classic-sdk-tests')!;
+    expect(sdk.run).toContain("matrix.os == 'windows-latest'");
+    expect(sdk.run).toContain('--exclude test/domains/comet-classic/classic-application.test.ts');
+    expect(classic.if).toBe(
+      "${{ !cancelled() && matrix.os == 'windows-latest' && matrix.shard == 1 && steps.sdk-tests.outcome != 'skipped' }}",
+    );
+    expect(classic.run).toContain(
+      'vitest run test/domains/comet-classic/classic-application.test.ts',
+    );
+    expect(classic.run).toContain('--maxWorkers=1');
+    expect(steps.indexOf(classic)).toBeGreaterThan(steps.indexOf(sdk));
+  });
+
+  it('requires SDK contracts on every supported CI platform and the minimum Node version', async () => {
+    const ci = parse(await readWorkflow('ci.yml')) as {
+      on: { push: { branches: string[] }; workflow_dispatch?: unknown };
+      jobs: Record<
+        string,
+        {
+          needs?: string[];
+          'timeout-minutes'?: number | string;
+          strategy?: {
+            'fail-fast'?: boolean;
+            matrix?: {
+              include?: Array<{ os: string; node: string; shard: number; shards: number }>;
+            };
+          };
+          steps?: Array<{
+            id?: string;
+            run?: string;
+            if?: string;
+            uses?: string;
+            with?: Record<string, unknown>;
+          }>;
+        }
+      >;
+    };
+    const contracts = ci.jobs['sdk-contracts'];
+    expect(contracts?.strategy?.matrix?.include).toEqual([
+      { os: 'ubuntu-latest', node: '22.16.0', shard: 1, shards: 1 },
+      { os: 'macos-latest', node: '24', shard: 1, shards: 1 },
+      ...Array.from({ length: 8 }, (_, index) => ({
+        os: 'windows-latest',
+        node: '24',
+        shard: index + 1,
+        shards: 8,
+      })),
+    ]);
+    expect(contracts['timeout-minutes']).toBe("${{ matrix.os == 'windows-latest' && 50 || 40 }}");
+    expect(contracts.strategy?.['fail-fast']).toBe(false);
+    const test = contracts.steps?.find((step) => step.id === 'sdk-tests');
+    expect(test?.run).toContain('pnpm test:sdk');
+    expect(test?.run).toContain('--shard=${{ matrix.shard }}/${{ matrix.shards }}');
+    expect(test?.run).toContain("matrix.os == 'windows-latest' && '--maxWorkers=1 --exclude");
+    expect(test?.run).toContain('--outputFile.json=coverage/sdk/results.json');
+    expect(
+      contracts.steps?.find((step) => step.uses?.startsWith('actions/upload-artifact@'))?.if,
+    ).toContain('always()');
+    expect(
+      contracts.steps?.find((step) => step.uses?.startsWith('actions/upload-artifact@'))?.with
+        ?.name,
+    ).toContain('-shard-${{ matrix.shard }}-of-${{ matrix.shards }}');
+    expect(ci.jobs['ci-required'].needs).toEqual(
+      expect.arrayContaining(['sdk-contracts', 'quality']),
+    );
+    expect(ci.jobs).not.toHaveProperty('sdk-api');
+    expect(ci.jobs['ci-required'].needs).not.toContain('sdk-api');
+    const qualitySteps = ci.jobs.quality.steps ?? [];
+    expect(
+      qualitySteps.find((step) => step.uses?.startsWith('actions/setup-node@'))?.with?.[
+        'node-version'
+      ],
+    ).toBe(24);
+    expect(qualitySteps.some((step) => step.run?.startsWith('pnpm test:coverage'))).toBe(true);
+    expect(ci.on).toHaveProperty('workflow_dispatch');
+  });
+
+  it('checks frozen SDK recovery evidence before building and prevents install hooks from masking stale assets', async () => {
+    const ci = parse(await readWorkflow('ci.yml')) as {
+      jobs: Record<
+        string,
+        { steps?: Array<{ run?: string; uses?: string; with?: Record<string, unknown> }> }
+      >;
+    };
+    const steps = ci.jobs.quality?.steps ?? [];
+    expect(
+      steps.find((step) => step.uses?.startsWith('actions/checkout@'))?.with?.['fetch-depth'],
+    ).toBe(0);
+    expect(steps.some((step) => step.run?.includes('pnpm check:sdk-fixtures'))).toBe(true);
+    expect(steps.some((step) => step.run === 'pnpm check:sdk-api')).toBe(true);
+    expect(steps.findIndex((step) => step.run?.includes('pnpm check:sdk-fixtures'))).toBeLessThan(
+      steps.findIndex((step) => step.run === 'pnpm build'),
+    );
+    expect(steps.findIndex((step) => step.run === 'pnpm check:sdk-api')).toBeGreaterThan(
+      steps.findIndex((step) => step.run === 'pnpm build'),
+    );
+    expect(steps.findIndex((step) => step.run?.includes('pnpm check:generated'))).toBeLessThan(
+      steps.findIndex((step) => step.run === 'pnpm build'),
+    );
+    for (const job of Object.values(ci.jobs))
+      for (const step of job.steps ?? [])
+        if (step.run?.startsWith('pnpm install ')) expect(step.run).toContain('--ignore-scripts');
+    expect(ci.jobs['package-e2e'].steps?.some((step) => step.run === 'pnpm check:sdk-api')).toBe(
+      false,
+    );
+  });
+
+  it('builds Dashboard once through the browser test server', async () => {
+    const ci = parse(await readWorkflow('ci.yml'));
+    const commands = ci.jobs['dashboard-e2e'].steps.map((step: { run?: string }) => step.run);
+    expect(commands).toContain('pnpm test:dashboard-e2e');
+    expect(commands).not.toContain('pnpm build:dashboard');
+    const config = await fs.readFile('test/domains/dashboard/playwright.config.ts', 'utf8');
+    const server = await fs.readFile('scripts/dashboard-e2e-server.mjs', 'utf8');
+    expect(config).toContain('node ../../../scripts/dashboard-e2e-server.mjs');
+    expect(server).toContain("await run(pnpm, ['run', 'build:dashboard'])");
+  });
+
+  it('keeps the SDK suite connected to protocol, Creator, composition and public CLI regressions', async () => {
+    const scripts = (
+      JSON.parse(await fs.readFile('package.json', 'utf8')) as { scripts: Record<string, string> }
+    ).scripts;
+    for (const target of [
+      'test/domains/engine',
+      'test/domains/workflow-application',
+      'test/domains/workflow-generation',
+      'test/domains/workflow-creation',
+      'test/domains/eval/application-eval.test.ts',
+      'test/domains/comet-plugin/plugin-sdk.test.ts',
+      'test/domains/comet-classic/classic-sdk',
+      'test/domains/comet-native/native-sdk',
+      'test/domains/comet-classic/classic-application.test.ts',
+      'test/domains/comet-native/native-application.test.ts',
+      'test/domains/comet-native/native-cli-v4-surface.test.ts',
+      'test/app/application-distribution.test.ts',
+      'test/app/application-eval.test.ts',
+      'test/scripts/sdk-api.test.ts',
+      'test/scripts/sdk-fixtures.test.ts',
+    ])
+      expect(scripts['test:sdk']).toContain(target);
   });
 
   it('keeps paid model regression manual and runs offline Eval tests in CI', async () => {
@@ -174,7 +555,6 @@ describe('CI workflows', () => {
       'workflow',
       'bundle',
       'engine',
-      'factory',
       'integrations',
       'eval',
       'repo',

@@ -115,7 +115,7 @@ describe('Classic change paths', () => {
     await fs.mkdir(path.join(archived, '.comet.yaml'), { recursive: true });
 
     await expect(resolveClassicChangeDirectory('demo', projectRoot)).rejects.toThrow(
-      /must be a real file/iu,
+      /Classic state must be a regular file/iu,
     );
   });
 

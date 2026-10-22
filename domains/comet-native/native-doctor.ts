@@ -1,3 +1,4 @@
+import { migrateWorkspaceRuntimeDirectory } from '../workflow-contract/workspace-runtime.js';
 import { promises as fs, type Dirent } from 'fs';
 import path from 'path';
 
@@ -26,10 +27,7 @@ import {
   inspectNativeRuntimeStorage,
   resolveContainedNativePath,
 } from './native-paths.js';
-import {
-  captureNativeProtectedDirectoryGuard,
-  readNativeProtectedDirectory,
-} from './native-protected-file.js';
+import { readNativeProtectedDirectory } from './native-protected-file.js';
 import { recoverNativeRootMove } from './native-root-move.js';
 import { continueNativeCheckpoint } from './native-checkpoint-journal.js';
 import {
@@ -508,7 +506,7 @@ async function inspectChanges(
         severity: artifact.severity,
         code: artifact.code,
         message: `${status.name}: ${artifact.message}`,
-        ...(artifact.path ? { path: path.join(paths.projectRoot, artifact.path) } : {}),
+        ...(artifact.path ? { path: path.resolve(paths.projectRoot, artifact.path) } : {}),
       });
     }
   }
@@ -607,32 +605,14 @@ async function inspectRuntimeLayoutMigrations(
     }
     try {
       await withNativeLockRecovery([paths], `migrate Runtime layout for ${name}`, async () => {
-        const guard = await captureNativeProtectedDirectoryGuard({
-          root: paths.nativeRoot,
-          directory: legacy,
-          label: `Legacy Native Runtime ${name}`,
+        await migrateWorkspaceRuntimeDirectory(legacy, preferred, {
+          projectRoot: paths.projectRoot,
         });
-        await resolveContainedNativePath(paths.runtimeDir, preferred);
-        await fs.mkdir(paths.changesRuntimeDir, { recursive: true });
-        const targetParentGuard = await captureNativeProtectedDirectoryGuard({
-          root: paths.runtimeDir,
-          directory: paths.changesRuntimeDir,
-          label: `Native Runtime migration target parent ${name}`,
-        });
-        try {
-          await fs.lstat(preferred);
-          throw new Error(`Target Native Runtime already exists: ${preferred}`);
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-        }
-        await guard.verify();
-        await targetParentGuard.verify();
-        await fs.rename(legacy, preferred);
       });
       findings.push({
         severity: 'info',
         code: 'runtime-layout-migrated',
-        message: `Moved Native Runtime for ${name} to project-local .comet storage`,
+        message: `Moved Native Runtime for ${name} to workspace-isolated user storage`,
         path: preferred,
       });
     } catch (error) {
@@ -993,7 +973,22 @@ export async function doctorNativeProject(options: {
   });
   findings.push(...transactions.findings);
   if (!options.projectOnly) {
-    findings.push(...(await inspectRuntimeLayoutMigrations(paths, { name: options.name, repair })));
+    const runtimeLayouts = await inspectRuntimeLayoutMigrations(paths, {
+      name: options.name,
+      repair,
+    });
+    findings.push(...runtimeLayouts);
+    if (
+      runtimeLayouts.some((finding) =>
+        [
+          'runtime-layout-legacy',
+          'runtime-layout-migration-failed',
+          'runtime-storage-invalid',
+        ].includes(finding.code),
+      )
+    ) {
+      return { healthy: false, findings };
+    }
     findings.push(...(await inspectSchemaMigrations(paths, { name: options.name, repair })));
     findings.push(
       ...(await inspectWorkspaceIdentityMigrations(paths, { name: options.name, repair })),

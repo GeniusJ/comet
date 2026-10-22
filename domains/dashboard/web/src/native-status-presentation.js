@@ -1,11 +1,12 @@
-const LOCAL_EXECUTION_PRESENTATIONS = {
+import { t, localized } from './dashboard-i18n.js';
+const LOCAL_EXECUTION_PRESENTATIONS = localized({
   building: { label: '构建中', tone: 'info', phase: 'build' },
   checking: { label: '检查中', tone: 'info', phase: 'verify' },
   verifying: { label: '验证中', tone: 'info', phase: 'verify' },
   archiving: { label: '归档中', tone: 'ok', phase: 'archive' },
-};
+});
 
-const LOOP_PRESENTATIONS = {
+const LOOP_PRESENTATIONS = localized({
   shape: { label: '需求澄清', tone: 'info', phase: 'shape', running: true },
   building: { label: '构建中', tone: 'info', phase: 'build', running: true },
   repairing: { label: '修复中', tone: 'danger', phase: 'build', running: true },
@@ -14,20 +15,20 @@ const LOOP_PRESENTATIONS = {
   'await-user': { label: '等待用户', tone: 'warn', phase: null, running: false },
   blocked: { label: '已阻塞', tone: 'danger', phase: null, running: false },
   done: { label: '已完成', tone: 'ok', phase: 'archive', running: false },
-};
+});
 
-const VERIFICATION_PRESENTATIONS = {
+const VERIFICATION_PRESENTATIONS = localized({
   pending: { label: '待验证', tone: 'neutral' },
   pass: { label: '验收通过', tone: 'ok' },
   fail: { label: '验证失败', tone: 'danger' },
   blocked: { label: '验证阻塞', tone: 'warn' },
-};
+});
 
 export function nativeChangeStatusPresentation(change) {
-  if (change.status === 'archived') return { label: '已归档', tone: 'neutral' };
+  if (change.status === 'archived') return { label: t('已归档'), tone: 'neutral' };
 
   if (change.localExecution?.status === 'interrupted') {
-    return { label: '执行中断', tone: 'warn' };
+    return { label: t('执行中断'), tone: 'warn' };
   }
 
   if (change.localExecution?.status === 'running') {
@@ -35,12 +36,14 @@ export function nativeChangeStatusPresentation(change) {
     if (local) return { label: local.label, tone: local.tone };
   }
 
+  if (nativeChangeBlockers(change).length) return { label: t('已阻塞'), tone: 'danger' };
+
   const loop = LOOP_PRESENTATIONS[change.loop?.stage];
   if (loop) return { label: loop.label, tone: loop.tone };
 
   return (
     VERIFICATION_PRESENTATIONS[change.verificationResult] ?? {
-      label: '状态未知',
+      label: t('状态未知'),
       tone: 'neutral',
     }
   );
@@ -54,6 +57,23 @@ export function isNativePhaseRunning(change) {
     return local?.phase === change.phase;
   }
 
+  if (nativeChangeBlockers(change).length) return false;
+
   const loop = LOOP_PRESENTATIONS[change.loop?.stage];
   return Boolean(loop?.running && loop.phase === change.phase);
+}
+
+/** 合并页面已有的父级阻塞与子级阻塞，不改变 Runtime 的生命周期状态。 */
+export function nativeChangeBlockers(change) {
+  return [
+    ...(change.blockers ?? []),
+    ...(change.children ?? [])
+      .filter((child) => child.status === 'blocked')
+      .map((child) => ({
+        owner: child.name,
+        reason: { text: child.message ?? t('子变更需要处理阻塞。'), truncated: false },
+        acceptanceIds: child.covers ?? [],
+        resolutionAction: t('处理子变更阻塞'),
+      })),
+  ];
 }

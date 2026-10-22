@@ -8,6 +8,27 @@ const PROJECT_GITIGNORE_PATH = '.gitignore';
 const PROJECT_GITIGNORE_MAX_BYTES = 4 * 1024 * 1024;
 const MANAGED_BLOCK_START = '# >>> Comet managed project state >>>';
 const MANAGED_BLOCK_END = '# <<< Comet managed project state <<<';
+const LOCAL_ARTIFACT_PATTERNS = [
+  '.comet-archive-staging/',
+  '.*.comet-archive-cas-*',
+  '.*.comet-runtime-migration.json*',
+  '.*.comet-runtime-source-*',
+  '.*.comet-runtime-stage-*',
+  '**/comet/changes/*/runtime',
+  '**/comet/archive/*/runtime',
+  '**/.comet/run-state.json',
+  '**/.comet/pending-action.json',
+  '**/.comet/trajectory.jsonl',
+  '**/.comet/context.md',
+  '**/.comet/artifacts.json',
+  '**/.comet/checkpoint.json',
+  '**/.comet/skill-snapshots',
+  '**/.comet/checks',
+  '**/.comet/coordination.json',
+  '**/.comet/subagent-progress.md',
+  '.comet-state.lock',
+  '.comet-state-transaction.json',
+] as const;
 
 function lineEnding(source: string): '\n' | '\r\n' {
   return source.includes('\r\n') ? '\r\n' : '\n';
@@ -46,7 +67,11 @@ function hasLegacyCometRuntimeCoverage(source: string): boolean {
   const lines = withoutManagedBlocks(source)
     .split(/\r?\n/u)
     .map((line) => line.trim());
-  return lines.includes('.comet/runtime/') && lines.includes('.comet/current-change.json');
+  return (
+    lines.includes('.comet/runtime') &&
+    lines.includes('.comet/current-change.json') &&
+    LOCAL_ARTIFACT_PATTERNS.every((pattern) => lines.includes(pattern))
+  );
 }
 
 export function renderCometProjectGitignore(source: string): string {
@@ -60,6 +85,7 @@ export function renderCometProjectGitignore(source: string): string {
       '!/.comet/',
       '/.comet/*',
       '!/.comet/config.yaml',
+      ...LOCAL_ARTIFACT_PATTERNS,
       MANAGED_BLOCK_END,
       '',
     ].join(newline)
@@ -88,11 +114,8 @@ export async function ensureCometProjectGitignore(projectRoot: string): Promise<
     ).bytes;
     source = Buffer.from(sourceBytes).toString('utf8');
   }
-  // Existing projects may already carry the two legacy rules that isolate all
-  // Runtime state used by the workflow. Preserve that user-authored setup so a
-  // Native `new` does not create an unrelated dirty .gitignore in the middle
-  // of a change; the managed block remains the migration path for broader
-  // `.comet/` rules.
+  // 保留等价的用户配置。旧目录规则不覆盖迁移标记或同卷归档暂存目录，
+  // 因此必须先补齐规则，再写入新的本机状态。
   if (
     inspection.exists &&
     !source.includes(MANAGED_BLOCK_START) &&

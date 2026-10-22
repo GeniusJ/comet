@@ -1,11 +1,13 @@
 import { createReadStream, promises as fs } from 'fs';
 import http from 'http';
+import { pipeline } from 'node:stream/promises';
 import net from 'net';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import {
   collectDashboardChangeDetail,
   collectDashboardChangePage,
+  collectDashboardChangeSummary,
   collectDashboardOverview,
   collectDashboardSnapshot,
   DashboardChangeQueryError,
@@ -28,6 +30,21 @@ import {
 } from './project-directory.js';
 import { DashboardPluginHostError, type DashboardPluginHostFactory } from './plugin-host.js';
 import type { DashboardChangeTab } from './types.js';
+import { handleDashboardEvalRequest } from './eval-routes.js';
+import { handleDashboardApplicationRequest } from './application-routes.js';
+import { handleDashboardApplicationDeliveryRequest } from './application-delivery.js';
+import { DashboardApplicationQueryError } from './application-collector.js';
+import { collectRuntimePerformance } from './runtime-performance.js';
+import { collectRuntimeInsights } from './runtime-insights.js';
+import { collectChangeTraceIndex, collectChangeTrace } from './change-traces.js';
+import { readObservabilityRange } from './observability-range.js';
+import {
+  readUserEvalSettings,
+  saveUserEvalSettings,
+  evalEnvironmentChecks,
+} from '../eval/index.js';
+import { EvalRunError } from '../eval/index.js';
+import { createDashboardUpdateService, DashboardUpdateError } from './update-service.js';
 
 export interface DashboardServerOptions {
   projectPath: string;
@@ -115,32 +132,50 @@ export async function startDashboardServer(
   const requestedPort = options.port ?? DEFAULT_PORT;
   const port = requestedPort === 0 ? 0 : await findAvailablePort(requestedPort);
   const pluginHostAccess = createDashboardPluginHostAccess(options.pluginHost);
+  const updates = createDashboardUpdateService(options.projectPath);
   const currentProjectPath = await fs
     .realpath(options.projectPath)
     .catch(() => path.resolve(options.projectPath));
 
   const server = http.createServer((req, res) => {
-    handleRequest(req, res, currentProjectPath, webRoot, pluginHostAccess).catch((error) => {
-      if (
-        error instanceof DashboardChangeQueryError ||
-        error instanceof NativeDashboardQueryError
-      ) {
-        respondJson(res, req.method ?? 'GET', 400, { error: error.message });
-        return;
-      }
-      if (error instanceof DashboardPluginHostError) {
-        respondJson(res, req.method ?? 'GET', error.statusCode, {
-          error: error.message,
-          ...(error.pluginId ? { pluginId: error.pluginId } : {}),
-        });
-        return;
-      }
-      if (error instanceof DashboardProjectConfigError) {
-        respondJson(res, req.method ?? 'GET', error.statusCode, { error: error.message });
-        return;
-      }
-      respondError(res, 500, `Internal server error: ${(error as Error).message}`);
-    });
+    handleRequest(req, res, currentProjectPath, webRoot, pluginHostAccess, updates).catch(
+      (error) => {
+        if (error instanceof DashboardApplicationQueryError) {
+          respondJson(res, req.method ?? 'GET', error.statusCode, {
+            code: error.code,
+            error: error.message,
+          });
+          return;
+        }
+        if (error instanceof DashboardUpdateError) {
+          respondJson(res, req.method ?? 'GET', error.statusCode, { error: error.message });
+          return;
+        }
+        if (error instanceof EvalRunError) {
+          respondJson(res, req.method ?? 'GET', error.statusCode, { error: error.message });
+          return;
+        }
+        if (
+          error instanceof DashboardChangeQueryError ||
+          error instanceof NativeDashboardQueryError
+        ) {
+          respondJson(res, req.method ?? 'GET', 400, { error: error.message });
+          return;
+        }
+        if (error instanceof DashboardPluginHostError) {
+          respondJson(res, req.method ?? 'GET', error.statusCode, {
+            error: error.message,
+            ...(error.pluginId ? { pluginId: error.pluginId } : {}),
+          });
+          return;
+        }
+        if (error instanceof DashboardProjectConfigError) {
+          respondJson(res, req.method ?? 'GET', error.statusCode, { error: error.message });
+          return;
+        }
+        respondError(res, 500, `Internal server error: ${(error as Error).message}`);
+      },
+    );
   });
 
   await new Promise<void>((resolve, reject) => {
@@ -170,6 +205,7 @@ async function handleRequest(
   projectPath: string,
   webRoot: string,
   pluginHostAccess?: DashboardPluginHostAccess,
+  updates?: ReturnType<typeof createDashboardUpdateService>,
 ): Promise<void> {
   const authority = req.headers.host;
   const localPort = req.socket.localPort;
@@ -206,18 +242,63 @@ async function handleRequest(
   const isPluginRequest = pathname.includes('/plugins');
   const isProjectConfigRequest = pathname.endsWith('/config');
   const isProjectForgetRequest = pathname.endsWith('/forget');
+  const isEvalSettingsRequest = /^\/api\/dashboard\/eval\/settings(?:\/check)?$/u.test(pathname);
+  const isEvalRequest =
+    isEvalSettingsRequest || /^\/api\/dashboard\/projects\/[^/]+\/eval(?:\/|$)/u.test(pathname);
+  const isUpdateRequest = pathname === '/api/dashboard/update';
+  const isApplicationDeliveryRequest =
+    /^\/api\/dashboard\/projects\/[^/]+\/application-delivery$/u.test(pathname);
   if (
     req.method !== 'GET' &&
     req.method !== 'HEAD' &&
     !(
       req.method === 'POST' &&
-      (isPluginRequest || isProjectConfigRequest || isProjectForgetRequest)
+      (isPluginRequest ||
+        isProjectConfigRequest ||
+        isProjectForgetRequest ||
+        isEvalRequest ||
+        isUpdateRequest ||
+        isApplicationDeliveryRequest)
     )
   ) {
     respondError(res, 405, 'Method not allowed');
     return;
   }
 
+  if (isUpdateRequest && updates) {
+    const result =
+      req.method === 'POST'
+        ? await updates.start(await readJsonBody(req))
+        : await updates.status(url.searchParams.get('refresh') === '1');
+    respondJson(res, req.method, req.method === 'POST' ? 202 : 200, result);
+    return;
+  }
+  if (pathname === '/api/dashboard/update/job' && updates) {
+    const after = Number(url.searchParams.get('after') ?? 0);
+    if (!Number.isSafeInteger(after) || after < 0)
+      throw new DashboardUpdateError('无效的日志位置', 400);
+    respondJson(res, req.method, 200, updates.readJob(after));
+    return;
+  }
+  if (isEvalSettingsRequest) {
+    if (pathname.endsWith('/check')) {
+      const { defaults } = await readUserEvalSettings();
+      const environment = await evalEnvironmentChecks({
+        target: '',
+        targetType: 'skill',
+        ...defaults,
+        ...(defaults.judgeEnabled ? {} : { judgeModel: undefined }),
+      });
+      respondJson(res, req.method, 200, { environment, noModelsStarted: true });
+      return;
+    }
+    const result =
+      req.method === 'POST'
+        ? await saveUserEvalSettings(await readJsonBody(req))
+        : await readUserEvalSettings();
+    respondJson(res, req.method, 200, result);
+    return;
+  }
   if (pathname === '/api/dashboard') {
     const snapshot = await collectDashboardSnapshot(projectPath);
     respondJson(res, req.method, 200, snapshot);
@@ -279,12 +360,125 @@ async function handleRequest(
       return;
     }
 
+    if (subpath === '/application-delivery') {
+      const result = await handleDashboardApplicationDeliveryRequest(
+        project.path,
+        req.method ?? 'GET',
+        req.method === 'POST' ? await readJsonBody(req) : undefined,
+      );
+      respondJson(res, req.method, result.status, result.body);
+      return;
+    }
+
+    if (subpath === '/change-traces' || subpath === '/change-trace') {
+      if (req.method !== 'GET' && req.method !== 'HEAD') {
+        respondError(res, 405, 'Method not allowed');
+        return;
+      }
+      const workflow = url.searchParams.get('workflow') ?? 'all';
+      if (!['all', 'native', 'classic'].includes(workflow)) {
+        respondError(res, 400, 'Invalid trace workflow filter');
+        return;
+      }
+      if (subpath === '/change-traces') {
+        let range;
+        try {
+          range = readObservabilityRange(url.searchParams);
+        } catch {
+          respondError(res, 400, 'Invalid observation time range');
+          return;
+        }
+        respondJson(
+          res,
+          req.method,
+          200,
+          await collectChangeTraceIndex(
+            project.path,
+            workflow as 'all' | 'native' | 'classic',
+            range,
+          ),
+        );
+      } else {
+        const traceId = url.searchParams.get('traceId');
+        if (!traceId || traceId.length > 512) {
+          respondError(res, 400, 'Invalid trace identity');
+          return;
+        }
+        const trace = await collectChangeTrace(project.path, traceId);
+        respondJson(res, req.method, trace ? 200 : 404, trace ?? { error: 'Trace unavailable' });
+      }
+      return;
+    }
+    if (subpath === '/runtime-insights') {
+      if (req.method !== 'GET' && req.method !== 'HEAD') {
+        respondError(res, 405, 'Method not allowed');
+        return;
+      }
+      respondJson(res, req.method, 200, await collectRuntimeInsights(project.path));
+      return;
+    }
+    if (subpath === '/runtime-performance') {
+      if (req.method !== 'GET' && req.method !== 'HEAD') {
+        respondError(res, 405, 'Method not allowed');
+        return;
+      }
+      const workflow = url.searchParams.get('workflow') ?? 'all';
+      if (!['all', 'native', 'classic'].includes(workflow)) {
+        respondJson(res, req.method, 400, { error: 'Invalid runtime workflow filter' });
+        return;
+      }
+      let range;
+      try {
+        range = readObservabilityRange(url.searchParams);
+      } catch {
+        respondError(res, 400, 'Invalid observation time range');
+        return;
+      }
+      respondJson(
+        res,
+        req.method,
+        200,
+        await collectRuntimePerformance(
+          project.path,
+          workflow as 'all' | 'native' | 'classic',
+          range,
+        ),
+      );
+      return;
+    }
     if (subpath === '/overview') {
       const overview = await collectDashboardOverview(project.path, {
         projectName: project.name,
         query: url.searchParams.get('q') ?? undefined,
       });
       respondJson(res, req.method, 200, overview);
+      return;
+    }
+
+    if (
+      [
+        '/application-runs',
+        '/application-run',
+        '/application-run-records',
+        '/application-run-artifact',
+      ].includes(subpath)
+    ) {
+      const result = await handleDashboardApplicationRequest(
+        project.path,
+        subpath,
+        url.searchParams,
+      );
+      respondJson(res, req.method, result.status, result.body);
+      return;
+    }
+
+    if (subpath === '/change-summary') {
+      const summary = await collectDashboardChangeSummary(project.path, {
+        status: parseChangeTab(url.searchParams.get('status')),
+        query: url.searchParams.get('q') ?? undefined,
+        limit: parseChangeLimit(url.searchParams.get('limit')),
+      });
+      respondJson(res, req.method, 200, summary);
       return;
     }
 
@@ -373,6 +567,18 @@ async function handleRequest(
 
     if (subpath === '/plugins' || subpath.startsWith('/plugins/')) {
       await handlePluginRequest(req, res, project, subpath, pluginHostAccess);
+      return;
+    }
+
+    if (subpath === '/eval' || subpath.startsWith('/eval/')) {
+      const result = await handleDashboardEvalRequest(
+        project.path,
+        req.method ?? 'GET',
+        subpath.slice(5),
+        url.searchParams,
+        req.method === 'POST' ? await readJsonBody(req) : undefined,
+      );
+      respondJson(res, req.method, result.status, result.body);
       return;
     }
 
@@ -559,14 +765,9 @@ async function serveStatic(
       res.end();
       return;
     }
-    await new Promise<void>((resolve, reject) => {
-      const stream = createReadStream(targetPath);
-      stream.on('error', reject);
-      stream.on('end', resolve);
-      stream.pipe(res);
-    });
+    await pipeline(createReadStream(targetPath), res);
   } catch {
-    respondError(res, 404, 'Not found');
+    if (!res.destroyed) respondError(res, 404, 'Not found');
   }
 }
 

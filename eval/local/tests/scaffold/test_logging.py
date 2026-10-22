@@ -35,6 +35,56 @@ def test_save_artifacts_excludes_nested_git_metadata(tmp_path: Path):
     assert not (snapshot / ".git").exists()
 
 
+@pytest.mark.parametrize(
+    "treatment",
+    [
+        "comet-native-workflow-COMET_NATIVE_SDK_CURRENT-r1",
+        "comet-classic-layout-lifecycle-COMET_CLASSIC_DOCS_LAYOUT-r1",
+        "COMET-FULL",
+    ],
+)
+def test_artifact_references_point_to_the_saved_workflow_snapshot(tmp_path: Path, treatment: str):
+    from conftest import _save_artifacts
+    from scaffold.python.evidence import build_eval_artifact_references
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "result.md").write_text("verified output", encoding="utf-8")
+
+    _save_artifacts(tmp_path, treatment, 1, workspace)
+    references = build_eval_artifact_references(tmp_path, treatment, 1)
+
+    assert (Path(references["artifacts"]) / "claude/result.md").read_text(
+        encoding="utf-8"
+    ) == "verified output"
+
+
+@pytest.mark.parametrize("root", ["docs/openspec/changes", "openspec/changes"])
+def test_save_artifacts_preserves_classic_state_without_other_hidden_files(
+    tmp_path: Path, root: str
+):
+    from conftest import _save_artifacts
+
+    workspace = tmp_path / "workspace"
+    archived = workspace / root / "archive/2026-10-01-example"
+    archived.mkdir(parents=True)
+    source = "# comet-execution: managed-run\nphase: archive\narchived: true\n"
+    (archived / ".comet.yaml").write_text(source, encoding="utf-8")
+    (archived / ".env").write_text("do not export", encoding="utf-8")
+    private = workspace / ".claude"
+    private.mkdir()
+    (private / ".comet.yaml").write_text("private config", encoding="utf-8")
+
+    _save_artifacts(tmp_path, "COMET_CLASSIC_DOCS_LAYOUT", 1, workspace)
+
+    saved = tmp_path / "artifacts/comet_classic_docs_layout_rep1/claude"
+    assert (saved / archived.relative_to(workspace) / ".comet.yaml").read_text(
+        encoding="utf-8"
+    ) == source
+    assert not list(saved.rglob(".env"))
+    assert not (saved / ".claude").exists()
+
+
 def test_save_artifacts_redacts_configured_credentials(tmp_path: Path, monkeypatch):
     from conftest import _save_artifacts
 
@@ -98,6 +148,32 @@ def test_save_artifacts_excludes_controller_cli_snapshot(tmp_path: Path):
     snapshot = tmp_path / "artifacts/comet_native_phase1_rep1/claude"
     assert (snapshot / "result.md").is_file()
     assert not (snapshot / "_eval_current_comet").exists()
+
+
+def test_save_artifacts_ignores_inaccessible_excluded_node_modules(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from conftest import _save_artifacts
+
+    workspace = tmp_path / "workspace"
+    excluded = workspace / ".comet" / "openspec-runtime" / "node_modules" / ".bin"
+    excluded.mkdir(parents=True)
+    inaccessible = excluded / "node-which"
+    inaccessible.write_text("shim", encoding="utf-8")
+    (workspace / "result.md").write_text("ok", encoding="utf-8")
+    original_is_file = Path.is_file
+
+    def is_file(path: Path) -> bool:
+        if path == inaccessible:
+            raise OSError("inaccessible Windows reparse point")
+        return original_is_file(path)
+
+    monkeypatch.setattr(Path, "is_file", is_file)
+    _save_artifacts(tmp_path, "COMET_CLASSIC_DOCS_LAYOUT", 1, workspace)
+
+    snapshot = tmp_path / "artifacts/comet_classic_docs_layout_rep1/claude"
+    assert (snapshot / "result.md").read_text(encoding="utf-8") == "ok"
+    assert not (snapshot / ".comet/openspec-runtime/node_modules").exists()
 
 
 def test_extract_events_captures_token_usage_and_cost():
@@ -221,9 +297,7 @@ def test_extract_events_trims_shell_suffix_from_runtime_skill_path():
                     {
                         "type": "tool_use",
                         "name": "Bash",
-                        "input": {
-                            "command": 'ls -la /workspace/.claude/skills/demo; echo "---"'
-                        },
+                        "input": {"command": 'ls -la /workspace/.claude/skills/demo; echo "---"'},
                     }
                 ]
             },
@@ -267,9 +341,7 @@ def test_extract_events_ignores_shell_glob_in_runtime_skill_path():
                     {
                         "type": "tool_use",
                         "name": "Bash",
-                        "input": {
-                            "command": "find . -not -path '*/.claude/skills/*'"
-                        },
+                        "input": {"command": "find . -not -path '*/.claude/skills/*'"},
                     }
                 ]
             },

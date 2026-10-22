@@ -1,3 +1,7 @@
+import {
+  resolveWorkspaceRuntimeRootSync,
+  isWorkspaceRuntimeMigrationFence,
+} from '../../../domains/workflow-contract/workspace-runtime.js';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { promises as fs } from 'fs';
 import os from 'os';
@@ -75,19 +79,24 @@ describe('Native artifact root safety', () => {
       process.platform === 'win32' ? 'junction' : 'dir',
     );
 
-    await expect(nativeProjectPaths(projectRoot, 'docs')).rejects.toThrow(
-      'Native Runtime root resolves outside the project root',
-    );
+    await expect(nativeProjectPaths(projectRoot, 'docs')).rejects.toThrow();
   });
 
-  it('keeps Runtime project-local when the document artifact root changes', async () => {
+  it('keeps Runtime user-local when the document artifact root changes', async () => {
     const rootPaths = await nativeProjectPaths(projectRoot, '.');
     const docsPaths = await nativeProjectPaths(projectRoot, 'docs');
 
-    expect(rootPaths.runtimeDir).toBe(path.join(projectRoot, '.comet', 'runtime', 'native'));
+    expect(rootPaths.runtimeDir).toBe(
+      path.join(resolveWorkspaceRuntimeRootSync(projectRoot), 'native'),
+    );
     expect(docsPaths.runtimeDir).toBe(rootPaths.runtimeDir);
     expect(nativePreferredChangeRuntimeDir(docsPaths, 'focused-change')).toBe(
-      path.join(projectRoot, '.comet', 'runtime', 'native', 'changes', 'focused-change'),
+      path.join(
+        resolveWorkspaceRuntimeRootSync(projectRoot),
+        'native',
+        'changes',
+        'focused-change',
+      ),
     );
   });
 
@@ -107,7 +116,7 @@ describe('Native artifact root safety', () => {
     await fs.mkdir(preferred, { recursive: true });
     await expect(inspectNativeRuntimeStorage(paths, name)).resolves.toMatchObject({
       status: 'available',
-      layout: 'project-local',
+      layout: 'user-local',
       path: preferred,
     });
     expect(nativeChangeRuntimeDir(paths, name)).toBe(preferred);
@@ -119,13 +128,13 @@ describe('Native artifact root safety', () => {
       layout: 'legacy',
       path: legacy,
     });
-    expect(nativeChangeRuntimeDir(paths, name)).toBe(legacy);
+    expect(() => nativeChangeRuntimeDir(paths, name)).toThrow('requires migration');
 
     await fs.mkdir(preferred, { recursive: true });
     await expect(inspectNativeRuntimeStorage(paths, name)).resolves.toMatchObject({
       status: 'invalid',
-      layout: 'project-local',
-      message: 'Both project-local and legacy Native Runtime directories exist',
+      layout: 'user-local',
+      message: 'Both user-local and legacy Native Runtime directories exist',
     });
 
     await fs.rm(legacy, { recursive: true });
@@ -133,9 +142,93 @@ describe('Native artifact root safety', () => {
     await fs.writeFile(preferred, 'not a directory');
     await expect(inspectNativeRuntimeStorage(paths, name)).resolves.toMatchObject({
       status: 'invalid',
-      layout: 'project-local',
+      layout: 'user-local',
       message: 'Native Runtime path must be a real directory',
     });
+  });
+
+  it('reports linked legacy Runtime as invalid without opening the target', async () => {
+    const paths = await nativeProjectPaths(projectRoot, 'docs');
+    const legacy = nativeLegacyChangeRuntimeDir(paths, 'linked-legacy');
+    await fs.mkdir(path.dirname(legacy), { recursive: true });
+    await fs.symlink(outside, legacy, process.platform === 'win32' ? 'junction' : 'dir');
+    await expect(inspectNativeRuntimeStorage(paths, 'linked-legacy')).resolves.toMatchObject({
+      status: 'invalid',
+      layout: 'legacy',
+    });
+    expect(() => nativeChangeRuntimeDir(paths, 'linked-legacy')).toThrow('requires migration');
+  });
+
+  it('migrates change-local evidence before returning paths and fences the old writer', async () => {
+    const legacy = path.join(projectRoot, 'docs/comet/changes/migrate-me/runtime');
+    await fs.mkdir(path.join(legacy, 'evidence'), { recursive: true });
+    await fs.writeFile(path.join(legacy, 'evidence/receipt.json'), '{"preserved":true}');
+    const paths = await nativeProjectPaths(projectRoot, 'docs');
+    const runtime = nativeChangeRuntimeDir(paths, 'migrate-me');
+    expect(runtime).toBe(nativePreferredChangeRuntimeDir(paths, 'migrate-me'));
+    expect(await fs.readFile(path.join(runtime, 'evidence/receipt.json'), 'utf8')).toBe(
+      '{"preserved":true}',
+    );
+    expect(await isWorkspaceRuntimeMigrationFence(legacy, runtime)).toBe(true);
+    expect((await inspectNativeRuntimeStorage(paths, 'migrate-me')).layout).toBe('user-local');
+    await expect(fs.mkdir(legacy, { recursive: true })).rejects.toThrow();
+    expect((await nativeProjectPaths(projectRoot, 'docs')).runtimeDir).toBe(paths.runtimeDir);
+  });
+
+  it('rescans legacy directories created after a previous successful path resolution', async () => {
+    const initial = await nativeProjectPaths(projectRoot, 'docs');
+    const legacy = nativeLegacyChangeRuntimeDir(initial, 'late-runtime');
+    await fs.mkdir(legacy, { recursive: true });
+    await fs.writeFile(path.join(legacy, 'trajectory.jsonl'), '{"type":"history-preserved"}\n');
+
+    const refreshed = await nativeProjectPaths(projectRoot, 'docs');
+    const runtime = nativeChangeRuntimeDir(refreshed, 'late-runtime');
+    expect(refreshed.workspaceRuntimeRoot).toBe(initial.workspaceRuntimeRoot);
+    expect(await fs.readFile(path.join(runtime, 'trajectory.jsonl'), 'utf8')).toBe(
+      '{"type":"history-preserved"}\n',
+    );
+    expect(await isWorkspaceRuntimeMigrationFence(legacy, runtime)).toBe(true);
+    await expect(fs.mkdir(legacy, { recursive: true })).rejects.toThrow();
+  });
+
+  it('retains legacy execution evidence when migration cannot prove it stopped', async () => {
+    const legacy = path.join(projectRoot, 'docs/comet/changes/still-running/runtime');
+    await fs.mkdir(legacy, { recursive: true });
+    const evidence = JSON.stringify({
+      actions: [{ status: 'running', claim: { token: 'fixture' } }],
+    });
+    await fs.writeFile(path.join(legacy, 'state.json'), evidence);
+    await expect(nativeProjectPaths(projectRoot, 'docs')).rejects.toThrow();
+    expect(await fs.readFile(path.join(legacy, 'state.json'), 'utf8')).toBe(evidence);
+    await expect(
+      fs.stat(
+        path.join(resolveWorkspaceRuntimeRootSync(projectRoot), 'native/changes/still-running'),
+      ),
+    ).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('does not follow a copied workspace fence when reconstructing a portable checkout', async () => {
+    const legacy = path.join(projectRoot, 'docs/comet/changes/copied-change/runtime');
+    await fs.mkdir(legacy, { recursive: true });
+    await fs.writeFile(path.join(legacy, 'source-evidence.json'), '{}');
+    const source = await nativeProjectPaths(projectRoot, 'docs');
+    await fs.cp(path.join(projectRoot, 'docs'), path.join(outside, 'docs'), { recursive: true });
+    const copy = await nativeProjectPaths(outside, 'docs');
+    const target = nativeChangeRuntimeDir(copy, 'copied-change');
+    expect(target).not.toBe(nativeChangeRuntimeDir(source, 'copied-change'));
+    await expect(fs.stat(target)).rejects.toMatchObject({ code: 'ENOENT' });
+    expect((await inspectNativeRuntimeStorage(copy, 'copied-change')).status).toBe('missing');
+  });
+
+  it('isolates equal change names in separate workspaces and rejects linked runtime roots', async () => {
+    const first = await nativeProjectPaths(projectRoot, 'docs');
+    const second = await nativeProjectPaths(outside, 'docs');
+    expect(first.workspaceRuntimeRoot).not.toBe(second.workspaceRuntimeRoot);
+    expect(nativePreferredChangeRuntimeDir(first, 'same-name')).not.toBe(
+      nativePreferredChangeRuntimeDir(second, 'same-name'),
+    );
+    await fs.symlink(outside, first.runtimeDir, process.platform === 'win32' ? 'junction' : 'dir');
+    await expect(nativeProjectPaths(projectRoot, 'docs')).rejects.toThrow();
   });
 
   it('keeps Runtime references and storage roots contained', async () => {

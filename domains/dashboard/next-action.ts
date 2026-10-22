@@ -38,7 +38,7 @@ export function recommendNextAction(input: NextActionInput): NextAction {
     return {
       command: null,
       reason: '当前 change 的 phase 未知。',
-      description: '检查 .comet.yaml 是否完整；可能需要重新运行 /comet-open 重新初始化状态。',
+      description: '检查 Classic 状态文件是否完整；可能需要重新运行 /comet-open 重新初始化状态。',
     };
   }
 

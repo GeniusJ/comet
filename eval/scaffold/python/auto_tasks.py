@@ -27,7 +27,8 @@ from scaffold.python.generated_task_cache import (
     validate_generated_manifest,
 )
 from scaffold.python.manifests import load_eval_manifest
-from scaffold.python.utils import run_agent_in_docker
+from scaffold.python.utils import AgentContainerCleanupError, run_agent_in_docker
+from scaffold.python.progress import publish_eval_progress
 
 
 GENERATOR_VERSION = "comet-auto-task-generator.v1"
@@ -110,7 +111,7 @@ def _add_snapshot_file(root: Path, files: dict[str, SnapshotFile], path: Path) -
 
 
 def build_skill_snapshot(skill_path: Path | str) -> SkillSnapshot:
-    """Capture only the Skill and its bounded, relevant package context."""
+    """Capture complete SDK application inputs or bounded generic Skill context."""
     snapshot = _shared_build_skill_snapshot(skill_path)
     return SkillSnapshot(
         tuple(SnapshotFile(item.path, item.content, item.content_hash) for item in snapshot.files),
@@ -406,18 +407,43 @@ def _manifest_source(
 
 
 def _generation_prompt(snapshot: SkillSnapshot, *, profile: str, repair: str | None = None) -> str:
+    from scaffold.python.application_eval import application_generation_guidance
     files = "\n\n".join(
         f"FILE: {item.path}\nHASH: {item.content_hash}\n{item.content}" for item in snapshot.files
     )
     repair_text = f"\nRepair the previous output because: {repair}\n" if repair else ""
     return f"""You are Comet's task-generator session. Generate only JSON and no Markdown.
 Produce {MIN_GENERATED_TASKS}-{MAX_GENERATED_TASKS} adaptive Skill evaluation tasks for profile {profile!r}.
-Each task must have a unique name, a concrete prompt, and at least one deterministic #250 expect
-from files, contains, json, or commands. Rubric is optional. Do not invent source task packages.
-Use only paths visible in the bounded Skill snapshot. Return exactly:
-{{"tasks":[{{"name":"...","prompt":"...","expect":{{...}},"rubric":["..."]}}]}}
+Return one JSON object with a tasks array and no other top-level fields.
+Each task may contain only name, prompt, expect, rubric and workspace. Use a unique name matching
+[A-Za-z0-9][A-Za-z0-9._-]{{0,99}} and a non-empty concrete prompt. Rubric is an optional array of
+non-empty strings. An optional workspace must refer to an existing fixture directory in the snapshot;
+do not invent source task packages or fixture directories.
+
+The expect object supports only files, contains, json and commands. Include at least one actual,
+non-empty deterministic assertion. Rubric alone does not satisfy the deterministic expect requirement.
+Supported expect shapes (choose the checks that match actual business outputs):
+{{
+  "files": ["CONTEXT.md", "src/calculator.py"],
+  "contains": {{"CONTEXT.md": ["confirmed requirement"]}},
+  "json": [{{"file": "result.json", "path": "$.status", "equals": "completed"}}],
+  "commands": [{{"run": "python -m pytest", "timeout": 120}}]
+}}
+files is an array of paths; contains maps each file path to an array of literal text strings.
+json is an array of checks: file, path and equals are all required. path is a JSON selector such as
+$.status or $.items.0.name (use $ to compare the entire document); equals is the expected JSON value.
+commands is an array of objects with required non-empty run and optional integer timeout in 1..3600
+seconds (default 120); a command passes only when its exit code is zero.
+Every files entry, contains key and json.file must be workspace-relative paths with no leading slash
+or '..' component, for example CONTEXT.md or src/calculator.py. Do not prefix artifact paths with /workspace
+or a host path. Command run strings are shell commands, not file-path entries.
+Derive the actual scenarios and output artifacts from the complete snapshot below. Do not infer new workflow files
+or replacement Runtime definitions; do not copy the illustrative outputs when they do not match this Skill.
+Binary resources are recorded by path, byte size and content hash rather than decoded as text. Their bytes remain
+in the fixed package; do not claim to have inspected their contents from this metadata alone.
 {repair_text}
-Bounded Skill snapshot:
+{application_generation_guidance(snapshot)}
+Complete provided Skill snapshot (all supplied file contents follow):
 {files}
 """
 
@@ -431,44 +457,63 @@ def _default_generate(
     environment: dict[str, str] | None = None,
 ) -> GenerationOutput:
     from scaffold.python.manifest_tasks import _generic_environment_dir
-    from scaffold.python.logging import extract_events, parse_output
+
+    timeout = _generation_timeout()
 
     with tempfile.TemporaryDirectory(prefix="comet-task-generator-") as directory:
         workdir = Path(directory)
         shutil.copytree(_generic_environment_dir(), workdir, dirs_exist_ok=True)
         started = time.monotonic()
-        result = run_agent_in_docker(
-            workdir,
-            prompt,
-            agent=agent,
-            model=model,
-            base_url=base_url,
-            environment=environment,
-            timeout=300,
-        )
+        try:
+            result = run_agent_in_docker(
+                workdir, prompt, agent=agent, model=model, base_url=base_url,
+                environment=environment, timeout=timeout,
+            )
+        except AgentContainerCleanupError as error:
+            error.telemetry = _generation_telemetry(error.stdout, agent, model, time.monotonic() - started)
+            error.telemetry["returncode"] = error.returncode
+            raise
         elapsed = time.monotonic() - started
+        stdout = result.stdout or ""
+        telemetry = _generation_telemetry(stdout, agent, model, elapsed)
+        telemetry["returncode"] = result.returncode
         if result.returncode != 0:
-            raise AutoTaskError(
+            error = AutoTaskError(
                 f"task_generation: generator agent failed ({result.returncode}): "
                 f"{(result.stderr or result.stdout or '')[-1000:]}"
             )
-        stdout = result.stdout or ""
-        events = extract_events(parse_output(stdout), agent=agent)
-        return GenerationOutput(
-            stdout,
-            {
-                "duration_seconds": events.get("duration_seconds") or elapsed,
-                "input_tokens": events.get("input_tokens"),
-                "output_tokens": events.get("output_tokens"),
-                "total_tokens": events.get("total_tokens"),
-                "total_cost_usd": events.get("total_cost_usd"),
-                "model_usage": events.get("model_usage") or {},
-                "model": model or "runtime-default",
-                "telemetry_status": (
-                    "N/A" if not get_agent_adapter(agent).supports_telemetry else "available"
-                ),
-            },
-        )
+            error.telemetry = telemetry
+            raise error
+        return GenerationOutput(stdout, telemetry)
+
+
+def _generation_timeout() -> int:
+    from scaffold.python.application_eval import application_eval_context
+    try:
+        context = application_eval_context()
+        if context is None:
+            return 300
+        settings = context["preview"]["settings"]
+        if not isinstance(settings, dict):
+            raise ValueError("Invalid SDK application Eval settings")
+        total = settings.get("timeoutSeconds", 1200)
+        if isinstance(total, bool) or not isinstance(total, int) or not 30 <= total <= 3600:
+            raise ValueError("SDK application Eval timeoutSeconds must be an integer in 30..3600")
+        return min(900, total // 4)
+    except (KeyError, TypeError) as error:
+        raise ValueError("Invalid SDK application Eval context") from error
+
+
+def _generation_telemetry(stdout: str, agent: AgentId, model: str | None, elapsed: float) -> dict[str, Any]:
+    from scaffold.python.logging import extract_events, parse_output
+    events = extract_events(parse_output(stdout or ""), agent=agent)
+    return {
+        "duration_seconds": events.get("duration_seconds") or elapsed,
+        "input_tokens": events.get("input_tokens"), "output_tokens": events.get("output_tokens"),
+        "total_tokens": events.get("total_tokens"), "total_cost_usd": events.get("total_cost_usd"),
+        "model_usage": events.get("model_usage") or {}, "model": model or "runtime-default",
+        "telemetry_status": "available" if get_agent_adapter(agent).supports_telemetry and any(events.get(key) is not None for key in ("input_tokens", "output_tokens", "total_cost_usd")) else "N/A",
+    }
 
 
 def _manifest_hash_matches(manifest_path: Path, metadata: Mapping[str, Any]) -> bool:
@@ -528,7 +573,7 @@ def _generation_lock(path: Path) -> Iterator[None]:
 
 def _merge_generation_telemetry(attempts: list[dict[str, Any]]) -> dict[str, Any]:
     def total(key: str) -> int | float | None:
-        values = [item[key] for item in attempts if isinstance(item.get(key), (int, float))]
+        values = [item[key] for item in attempts if isinstance(item.get(key), (int, float)) and not isinstance(item.get(key), bool)]
         return sum(values) if values else None
 
     merged_models: dict[str, dict[str, int | float]] = {}
@@ -575,7 +620,7 @@ def ensure_generated_manifest(
     """Return a valid frozen generated manifest, or generate it once and cache it."""
     selected_agent = validate_agent_id(agent, field="task-generator agent")
     skill_root = _safe_skill_root(Path(skill_path))
-    snapshot = build_skill_snapshot(skill_root)
+    snapshot = build_skill_snapshot(skill_path)
     canonical_interaction = normalize_interaction(interaction)
     generation_hash = _generation_hash(
         snapshot,
@@ -616,21 +661,23 @@ def ensure_generated_manifest(
         tasks: list[dict[str, Any]] | None = None
         attempts: list[dict[str, Any]] = []
         for attempt in range(2):
+            telemetry = {"attempt": attempt + 1, "model": model or "runtime-default", "telemetry_status": "N/A", "status": "running"}
+            attempts.append(telemetry)
+            started = time.monotonic()
             try:
+                publish_eval_progress("generating")
                 generated = generator(_generation_prompt(snapshot, profile=profile, repair=error))
                 if isinstance(generated, GenerationOutput):
                     raw_output = generated.output
-                    telemetry = dict(generated.telemetry)
+                    telemetry.update(generated.telemetry)
                 else:
                     raw_output = generated
-                    telemetry = {}
                 telemetry.setdefault("model", model or "runtime-default")
                 telemetry.setdefault(
                     "telemetry_status",
                     "N/A" if not get_agent_adapter(selected_agent).supports_telemetry else "available",
                 )
                 telemetry["attempt"] = attempt + 1
-                attempts.append(telemetry)
                 payload = _extract_json_payload(raw_output)
                 tasks = _validate_generated_payload(payload)
                 _reject_generated_bundled_collisions(tasks)
@@ -646,10 +693,19 @@ def ensure_generated_manifest(
                     load_eval_manifest(candidate_path)
                 finally:
                     candidate_path.unlink(missing_ok=True)
+                telemetry["status"] = "succeeded"
+                telemetry.setdefault("duration_seconds", time.monotonic() - started)
                 break
-            except (AutoTaskError, OSError, ValueError, yaml.YAMLError) as exc:
+            except Exception as exc:
+                partial = getattr(exc, "telemetry", None)
+                if isinstance(partial, dict):
+                    telemetry.update(partial)
                 error = str(exc)
+                telemetry.update({"status": "failed", "reason": error, "attempt": attempt + 1})
+                telemetry.setdefault("duration_seconds", time.monotonic() - started)
                 tasks = None
+                if isinstance(exc, AgentContainerCleanupError):
+                    break
         if tasks is None:
             message = error or "task_generation: generated manifest is invalid"
             report_path = _write_generation_failure_report(

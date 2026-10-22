@@ -1,4 +1,4 @@
-import { spawnSync } from 'child_process';
+import { execFileSync, spawnSync } from 'child_process';
 import { promises as fs } from 'fs';
 import os from 'os';
 import path from 'path';
@@ -21,6 +21,11 @@ import {
   resolveCometDaemonEndpoint,
   sendCometDaemonRequest,
 } from '../../platform/process/comet-daemon.js';
+
+vi.mock('child_process', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('child_process')>();
+  return { ...actual, execFileSync: vi.fn(actual.execFileSync) };
+});
 
 describe('Git worktree inspection', () => {
   let primary: string;
@@ -97,6 +102,47 @@ describe('Git worktree inspection', () => {
     ).toBeNull();
   });
 
+  it('reads current worktree identity and branch without a redundant Git process', () => {
+    vi.mocked(execFileSync).mockClear();
+    expect(inspectGitWorktree(secondary)).toMatchObject({
+      isGitWorktree: true,
+      isSecondaryWorktree: true,
+      currentBranch: 'feature/secondary',
+    });
+    // Count actual operating-system calls while retaining real Git behavior.
+    // Branch ownership must come from this inspection, never a prior-command cache.
+    expect(vi.mocked(execFileSync).mock.calls.length).toBeLessThanOrEqual(2);
+    expect(
+      spawnSync('git', ['-C', secondary, 'switch', '-c', 'feature/changed'], {
+        encoding: 'utf8',
+        timeout: 20_000,
+      }).status,
+    ).toBe(0);
+    expect(inspectGitWorktree(secondary).currentBranch).toBe('feature/changed');
+  });
+
+  it('inspects a nested directory and detached HEAD without borrowing another branch', async () => {
+    const nested = path.join(secondary, 'nested folder');
+    await fs.mkdir(nested);
+    expect(inspectGitWorktree(nested)).toMatchObject({
+      isGitWorktree: true,
+      isSecondaryWorktree: true,
+      currentBranch: 'feature/secondary',
+    });
+    expect(
+      spawnSync('git', ['-C', secondary, 'switch', '--detach'], {
+        encoding: 'utf8',
+        timeout: 20_000,
+      }).status,
+    ).toBe(0);
+    expect(inspectGitWorktree(nested)).toMatchObject({
+      isGitWorktree: true,
+      isSecondaryWorktree: true,
+      currentBranch: null,
+    });
+    expect(currentGitBranch(primary)).toBe('master');
+  });
+
   it('returns a stable non-Git result outside a repository', async () => {
     const outside = await fs.mkdtemp(path.join(os.tmpdir(), 'comet-no-git-'));
     try {
@@ -134,6 +180,35 @@ describe('Git worktree inspection', () => {
       'feature/next-next',
     );
     expect(snapshotCometRuntimeMetrics().gitCommands).toBeGreaterThan(before.gitCommands);
+  });
+
+  it('waits for both asynchronous Git probes before falling back from a non-repository', async () => {
+    vi.stubEnv('GIT_CONFIG_GLOBAL', path.join(primary, 'empty-config'));
+    let release!: () => void;
+    const pending = new Promise<string>((resolve) => {
+      release = () => resolve('');
+    });
+    const probe = vi
+      .spyOn(commands, 'runExternalCommandAsync')
+      .mockImplementation(async (_command, args) => {
+        if (args.includes('rev-parse'))
+          throw new commands.ExternalCommandError('git', args, 'not a git repository');
+        return pending;
+      });
+    let read = false;
+    const query = createGitWorktreeReadCache().run(primary, async () => {
+      read = true;
+      return 'read';
+    });
+    try {
+      await vi.waitFor(() => expect(probe).toHaveBeenCalledTimes(2));
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(read).toBe(false);
+    } finally {
+      release();
+      await query;
+    }
+    expect(read).toBe(true);
   });
 
   it('refreshes worktree registrations and falls back for indirect configuration', async () => {

@@ -6,6 +6,8 @@ import path from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { stringify } from 'yaml';
+import { ensureCometProjectGitignore } from '../../../domains/workflow-contract/project-gitignore.js';
+import { isWorkspaceRuntimeMigrationFence } from '../../../domains/workflow-contract/workspace-runtime.js';
 
 import {
   defaultProjectConfig,
@@ -48,10 +50,10 @@ import {
 } from '../../../domains/comet-native/native-portable-state.js';
 import { inspectNativePortableStatus } from '../../../domains/comet-native/native-portable-status.js';
 import { runGitCommand } from '../../../platform/process/git.js';
+import { inspectProcessTreeLiveness } from '../../../platform/process/process-identity.js';
 import type { NativeProjectPaths } from '../../../domains/comet-native/native-types.js';
 import { ensureCliBuilt } from '../../helpers/ensure-cli-built.js';
 import {
-  processIsAlive,
   spawnNativePortableProcess,
   waitForCondition,
   waitForProcessExit,
@@ -76,11 +78,17 @@ describe('Native portable Doctor', () => {
     await createNativePortableChange({ paths, name, language: 'en' });
   }
 
+  async function refreshRuntimePaths(): Promise<void> {
+    paths = await nativeProjectPaths(projectRoot, 'docs');
+    await ensureNativeDirectories(paths);
+    await ensureCometProjectGitignore(projectRoot);
+  }
+
   async function createLegacySupervisorFixture(name: string) {
-    await fs.writeFile(path.join(projectRoot, '.gitignore'), '.comet/runtime/\n');
     runGitCommand(projectRoot, ['init', '-b', 'main']);
     runGitCommand(projectRoot, ['config', 'user.email', 'native@example.test']);
     runGitCommand(projectRoot, ['config', 'user.name', 'Native Test']);
+    await refreshRuntimePaths();
     runGitCommand(projectRoot, ['add', '.']);
     runGitCommand(projectRoot, ['commit', '--allow-empty', '-m', 'seed test repository']);
     const childrenSource = `schema: comet.native.children.v1
@@ -380,6 +388,7 @@ children:
   it('reports an orphaned Runtime check instead of claiming the change is healthy', async () => {
     const name = 'orphaned-check-doctor';
     await fs.mkdir(path.join(projectRoot, '.git'));
+    await refreshRuntimePaths();
     await createPortable(name);
     await fs.writeFile(
       path.join(nativePortableChangeDir(paths, name), 'brief.md'),
@@ -435,17 +444,16 @@ children:
       return reserved && mutationLockReleased;
     }, 'Runtime owner did not start the orphaned Doctor check');
     const running = await readNativeLocalExecution(file);
-    const activePid =
-      running?.checks[0]?.activeProcess?.status === 'running'
-        ? running.checks[0].activeProcess.pid
-        : undefined;
+    const activeProcess = running?.checks[0]?.activeProcess;
+    const activePid = activeProcess?.status === 'running' ? activeProcess.pid : undefined;
     expect(activePid).toEqual(expect.any(Number));
     owner.kill('SIGKILL');
     await waitForProcessExit(owner);
-    if (activePid !== undefined && processIsAlive(activePid)) process.kill(activePid, 'SIGKILL');
     await waitForCondition(
-      () => activePid !== undefined && !processIsAlive(activePid),
-      'Orphaned Doctor check process did not exit',
+      async () =>
+        activeProcess?.status === 'running' &&
+        (await inspectProcessTreeLiveness(activeProcess.pid, activeProcess.identity)) === 'dead',
+      'Doctor check process tree did not stop after its Runtime owner exited',
     );
 
     await expect(nativeDoctorCommand([name], projectRoot)).resolves.toMatchObject({
@@ -455,99 +463,135 @@ children:
         findings: [
           expect.objectContaining({
             code: 'portable-check-execution-stuck',
-            repair: 'recover',
+            ...(process.platform === 'win32' ? {} : { repair: 'recover' }),
           }),
         ],
       },
     });
     await expect(nativeDoctorCommand([name, '--repair'], projectRoot)).resolves.toMatchObject({
-      exitCode: 0,
-      data: { healthy: true, repaired: true },
-    });
-  });
-
-  it('does not let Doctor repair take over a live Runtime check', async () => {
-    const name = 'live-check-doctor';
-    await fs.mkdir(path.join(projectRoot, '.git'));
-    await createPortable(name);
-    await fs.writeFile(
-      path.join(nativePortableChangeDir(paths, name), 'brief.md'),
-      '# Acceptance examples\n- Doctor preserves a live Runtime check.\n',
-    );
-    await confirmNativePortableShape({ paths, name });
-    const runner = createNativeRunnerChannel();
-    const state = await submitNativePortableBuilderCandidate({
-      paths,
-      name,
-      input: {
-        identity: runner.captureExecutionIdentity({
-          identityProvider: 'test-host',
-          executionRef: 'live-doctor-builder',
-        }),
-        candidateId: 'live-doctor-candidate',
-        summary: 'Implemented.',
-        addressedAcceptanceIds: ['A1'],
-        acceptanceReview: fixtureAcceptanceReview(['A1']),
-        review: null,
+      exitCode: process.platform === 'win32' ? 65 : 0,
+      data: {
+        healthy: process.platform !== 'win32',
+        repaired: process.platform !== 'win32',
+        ...(process.platform === 'win32' ? { result: { reason: 'execution-active' } } : {}),
       },
     });
-    const marker = path.join(projectRoot, 'doctor-check-starts.txt');
-    const release = path.join(projectRoot, 'release-doctor-check');
-    const plan = {
-      id: 'live-doctor-check',
-      name: 'Live Doctor check',
-      executable: process.execPath,
-      argv: [
-        '-e',
-        "const fs=require('node:fs');fs.appendFileSync(process.argv[1],'start\\n');setInterval(()=>{if(fs.existsSync(process.argv[2]))process.exit(0)},25)",
-        marker,
-        release,
-      ],
-      cwdRef: '.',
-      timeoutMs: 60_000,
-      repeatable: true,
-    } as const;
-    const repositoryRoot = path.resolve(import.meta.dirname, '../../..');
-    await ensureCliBuilt(repositoryRoot);
-    const owner = spawnNativePortableProcess({
-      repositoryRoot,
-      payload: { action: 'execute-checks', paths, name: state.name, plans: [plan] },
-    });
-    const file = nativeLocalExecutionFile(paths, name);
-    await waitForCondition(async () => {
-      const local = await readNativeLocalExecution(file);
-      const reserved =
-        local?.execution?.ownerPid === owner.pid &&
-        local.checks[0]?.activeProcess?.status === 'running';
-      const mutationLockReleased = await fs
-        .access(path.join(paths.locksDir, 'root-move.lock'))
-        .then(() => false)
-        .catch(() => true);
-      return reserved && mutationLockReleased;
-    }, 'Runtime owner did not start the Doctor test check');
-
-    const repaired = await nativeDoctorCommand([name, '--repair'], projectRoot);
-    const duringRepair = await readNativeLocalExecution(file);
-    const startsDuringRepair = (await fs.readFile(marker, 'utf8')).trim().split(/\r?\n/);
-
-    await fs.writeFile(release, 'release\n');
-    await waitForProcessExit(owner);
-
-    expect(repaired).toMatchObject({
-      exitCode: 0,
-      data: { healthy: true, repaired: false },
-    });
-    expect(duringRepair).toMatchObject({
-      execution: { status: 'running', ownerPid: owner.pid },
-      checks: [{ status: 'running' }],
-    });
-    expect(startsDuringRepair).toHaveLength(1);
-    expect(owner.exitCode).toBe(0);
-    await expect(readNativeLocalExecution(file)).resolves.toMatchObject({
-      execution: { status: 'completed' },
-      checks: [{ status: 'passed' }],
-    });
+    if (process.platform === 'win32') {
+      expect(await readNativeLocalExecution(file)).toEqual(running);
+    }
   });
+
+  it.each([false, true])(
+    'preserves a migrated live Runtime check during Doctor repair (legacy projection: %s)',
+    async (legacyProjection) => {
+      const name = 'live-check-doctor';
+      await fs.mkdir(path.join(projectRoot, '.git'));
+      await refreshRuntimePaths();
+      await createPortable(name);
+      const localRuntime = path.dirname(nativeLocalExecutionFile(paths, name));
+      const legacyRuntime = path.join(nativePortableChangeDir(paths, name), 'runtime');
+      await fs.cp(localRuntime, legacyRuntime, { recursive: true });
+      await fs.rm(localRuntime, { recursive: true });
+      paths = await nativeProjectPaths(projectRoot, 'docs');
+      const fenceBefore = await fs.readFile(legacyRuntime);
+      const evidenceFile = path.join(localRuntime, 'retained-check.log');
+      const trajectoryFile = path.join(localRuntime, 'trajectory.jsonl');
+      await fs.writeFile(evidenceFile, 'retained check evidence\n');
+      await fs.writeFile(trajectoryFile, '{"type":"retained-trajectory"}\n');
+      await fs.writeFile(
+        path.join(nativePortableChangeDir(paths, name), 'brief.md'),
+        '# Acceptance examples\n- Doctor preserves a live Runtime check.\n',
+      );
+      await confirmNativePortableShape({ paths, name });
+      const runner = createNativeRunnerChannel();
+      const state = await submitNativePortableBuilderCandidate({
+        paths,
+        name,
+        input: {
+          identity: runner.captureExecutionIdentity({
+            identityProvider: 'test-host',
+            executionRef: 'live-doctor-builder',
+          }),
+          candidateId: 'live-doctor-candidate',
+          summary: 'Implemented.',
+          addressedAcceptanceIds: ['A1'],
+          acceptanceReview: fixtureAcceptanceReview(['A1']),
+          review: null,
+        },
+      });
+      const marker = path.join(projectRoot, 'doctor-check-starts.txt');
+      const release = path.join(projectRoot, 'release-doctor-check');
+      const plan = {
+        id: 'live-doctor-check',
+        name: 'Live Doctor check',
+        executable: process.execPath,
+        argv: [
+          '-e',
+          "const fs=require('node:fs');fs.appendFileSync(process.argv[1],'start\\n');setInterval(()=>{if(fs.existsSync(process.argv[2]))process.exit(0)},25)",
+          marker,
+          release,
+        ],
+        cwdRef: '.',
+        timeoutMs: 60_000,
+        repeatable: true,
+      } as const;
+      const repositoryRoot = path.resolve(import.meta.dirname, '../../..');
+      await ensureCliBuilt(repositoryRoot);
+      const owner = spawnNativePortableProcess({
+        repositoryRoot,
+        payload: { action: 'execute-checks', paths, name: state.name, plans: [plan] },
+      });
+      const file = nativeLocalExecutionFile(paths, name);
+      await waitForCondition(async () => {
+        const local = await readNativeLocalExecution(file);
+        const reserved =
+          local?.execution?.ownerPid === owner.pid &&
+          local.checks[0]?.activeProcess?.status === 'running';
+        const mutationLockReleased = await fs
+          .access(path.join(paths.locksDir, 'root-move.lock'))
+          .then(() => false)
+          .catch(() => true);
+        const commandStarted = await fs
+          .access(marker)
+          .then(() => true)
+          .catch(() => false);
+        return reserved && mutationLockReleased && commandStarted;
+      }, 'Runtime owner did not start the Doctor test check');
+
+      const beforeRepair = await fs.readFile(file);
+      if (legacyProjection) {
+        await fs.writeFile(
+          path.join(nativePortableChangeDir(paths, name), 'checkpoint.md'),
+          'old projection',
+        );
+      }
+      const repaired = await nativeDoctorCommand([name, '--repair'], projectRoot);
+      expect(await fs.readFile(file)).toEqual(beforeRepair);
+      expect(await fs.readFile(legacyRuntime)).toEqual(fenceBefore);
+      expect(await fs.readFile(evidenceFile, 'utf8')).toBe('retained check evidence\n');
+      expect(await fs.readFile(trajectoryFile, 'utf8')).toBe('{"type":"retained-trajectory"}\n');
+      const duringRepair = await readNativeLocalExecution(file);
+      const startsDuringRepair = (await fs.readFile(marker, 'utf8')).trim().split(/\r?\n/);
+
+      await fs.writeFile(release, 'release\n');
+      await waitForProcessExit(owner);
+
+      expect(repaired).toMatchObject({
+        exitCode: 0,
+        data: { healthy: true, repaired: legacyProjection },
+      });
+      expect(duringRepair).toMatchObject({
+        execution: { status: 'running', ownerPid: owner.pid },
+        checks: [{ status: 'running' }],
+      });
+      expect(startsDuringRepair).toHaveLength(1);
+      expect(owner.exitCode).toBe(0);
+      await expect(readNativeLocalExecution(file)).resolves.toMatchObject({
+        execution: { status: 'completed' },
+        checks: [{ status: 'passed' }],
+      });
+    },
+  );
 
   it('takes over a verifier dispatch that never confirmed startup', async () => {
     const name = 'stale-verifier-dispatch';
@@ -793,10 +837,10 @@ children:
     const name = 'current-v2-overlay';
     // A real Supervisor overlay only exists after a Git-bound confirmation;
     // seed the repository and the workspace binding the normal path produces.
-    await fs.writeFile(path.join(projectRoot, '.gitignore'), '.comet/runtime/\n');
     runGitCommand(projectRoot, ['init', '-b', 'main']);
     runGitCommand(projectRoot, ['config', 'user.email', 'native@example.test']);
     runGitCommand(projectRoot, ['config', 'user.name', 'Native Test']);
+    await refreshRuntimePaths();
     runGitCommand(projectRoot, ['add', '.']);
     runGitCommand(projectRoot, ['commit', '--allow-empty', '-m', 'seed test repository']);
     await createPortable(name);
@@ -913,7 +957,7 @@ children:
     const activeDir = path.join(paths.changesDir, name);
     const legacyRuntime = path.join(activeDir, 'runtime');
     await fs.mkdir(legacyRuntime, { recursive: true });
-    await fs.writeFile(path.join(legacyRuntime, 'trajectory.jsonl'), 'legacy');
+    await fs.writeFile(path.join(legacyRuntime, 'trajectory.jsonl'), '{"type":"legacy-history"}\n');
     await fs.writeFile(path.join(activeDir, 'evidence.md'), 'legacy projection');
     await fs.rm(path.join(paths.changesRuntimeDir, name), { recursive: true, force: true });
 
@@ -935,11 +979,22 @@ children:
         migration: { recovered: true, to: 'comet.native.v4', stateVersion: state.state_version },
       },
     });
-    await expect(fs.stat(legacyRuntime)).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(
+      await isWorkspaceRuntimeMigrationFence(
+        legacyRuntime,
+        path.join(paths.changesRuntimeDir, name),
+      ),
+    ).toBe(true);
     await expect(fs.stat(path.join(activeDir, 'evidence.md'))).rejects.toMatchObject({
       code: 'ENOENT',
     });
-    expect(await fs.readdir(path.join(paths.changesRuntimeDir, name))).toEqual(['state.json']);
+    expect((await fs.readdir(path.join(paths.changesRuntimeDir, name))).sort()).toEqual([
+      'state.json',
+      'trajectory.jsonl',
+    ]);
+    expect(
+      await fs.readFile(path.join(paths.changesRuntimeDir, name, 'trajectory.jsonl'), 'utf8'),
+    ).toBe('{"type":"legacy-history"}\n');
   });
 
   it('reports and resumes a persisted portable migration transaction', async () => {

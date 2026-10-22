@@ -1,10 +1,13 @@
 import { promises as fs } from 'fs';
 import path from 'path';
+import os from 'os';
 
 import { fileExists } from '../../platform/fs/file-system.js';
 import {
+  declaresWorkflowProjectConfig,
   parseWorkflowProjectConfigDocument,
   renderStructuredProjectConfig,
+  WORKFLOW_PROJECT_CONFIG_MAX_BYTES,
 } from '../workflow-contract/project-config.js';
 import {
   readWorkflowProjectConfigDocument,
@@ -12,7 +15,10 @@ import {
   type WorkflowProjectConfigIdentity,
 } from '../workflow-contract/project-config-reader.js';
 import { writeWorkflowProjectConfigSource } from '../workflow-contract/project-config-writer.js';
-import { inspectProtectedProjectPath } from '../workflow-contract/protected-project-path.js';
+import {
+  inspectProtectedProjectPath,
+  readProtectedProjectFile,
+} from '../workflow-contract/protected-project-path.js';
 import type { ClassicArtifactLayout } from '../workflow-contract/types.js';
 
 export type { ClassicArtifactLayout } from '../workflow-contract/types.js';
@@ -45,6 +51,14 @@ export class ClassicLayoutUnavailableError extends Error {
   constructor(message = 'Classic artifact layout is unavailable from .comet/config.yaml') {
     super(message);
     this.name = 'ClassicLayoutUnavailableError';
+  }
+}
+
+/** 项目发现阶段的配置校验失败，保留原诊断并与文件系统错误区分。 */
+export class ClassicProjectConfigError extends Error {
+  constructor(cause: unknown) {
+    super(cause instanceof Error ? cause.message : String(cause), { cause });
+    this.name = 'ClassicProjectConfigError';
   }
 }
 
@@ -280,16 +294,34 @@ export async function discoverClassicProject(startPath: string): Promise<string>
   } catch (error) {
     if (!isMissingPath(error)) throw error;
   }
+  const invocationRoot = cursor;
+  const home = path.resolve(os.homedir());
   for (;;) {
     if (path.basename(cursor) === 'openspec') {
       openSpecFallback = path.dirname(cursor);
     }
-    const configFile = path.join(cursor, '.comet', 'config.yaml');
     let projectConfig = false;
-    if (await fileExists(configFile)) {
+    const isHomeBoundary = cursor === home && cursor !== invocationRoot;
+    let source: string | null = null;
+    if (!isHomeBoundary) {
       try {
-        await assertClassicConfigPhysical(cursor);
-        const value = (await readWorkflowProjectConfigDocument(cursor))?.value;
+        const { bytes } = await readProtectedProjectFile(
+          cursor,
+          PROJECT_CONFIG_RELATIVE_PATH,
+          WORKFLOW_PROJECT_CONFIG_MAX_BYTES,
+          { label: PROJECT_CONFIG_RELATIVE_PATH },
+        );
+        source = bytes.toString('utf8');
+      } catch (error) {
+        if (!isMissingPath(error)) throw error;
+      }
+    }
+    if (source !== null) {
+      try {
+        const value = parseWorkflowProjectConfigDocument(source, {
+          allowPartialProject: true,
+          allowMissingNativeFields: true,
+        }).value;
         projectConfig =
           Boolean(value) &&
           typeof value === 'object' &&
@@ -297,10 +329,13 @@ export async function discoverClassicProject(startPath: string): Promise<string>
           ((value as Record<string, unknown>).schema === 'comet.project.v1' ||
             (value as Record<string, unknown>).default_workflow !== undefined ||
             (value as Record<string, unknown>).native !== undefined);
-      } catch {
-        // A malformed config next to a repository marker is still handled by
-        // the caller. It is not enough by itself to turn a global ~/.comet
-        // directory into a project root.
+      } catch (error) {
+        // 起点配置与明确声明的项目不能因配置损坏而归到父项目。
+        // 其他祖先的全局配置仍不足以声明项目边界。
+        if (cursor === invocationRoot) throw new ClassicProjectConfigError(error);
+        if (declaresWorkflowProjectConfig(source)) {
+          throw new ClassicProjectConfigError(error);
+        }
       }
     }
     if (projectConfig || (await fileExists(path.join(cursor, '.git')))) {

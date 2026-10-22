@@ -1,3 +1,5 @@
+import { isClassicSdkCancellationComplete } from './classic-sdk-run-lifecycle.js';
+import { isClassicStateFileName } from './classic-state-file.js';
 import { promises as fs } from 'fs';
 import path from 'path';
 import { stripUtf8Bom } from '../../platform/fs/strip-bom.js';
@@ -10,9 +12,18 @@ import {
   type ClassicLayoutPaths,
 } from './classic-layout.js';
 import { inspectClassicActiveChangeDirectory, openSpecChangeNameError } from './classic-paths.js';
-import { inspectClassicProjectTarget } from './classic-protected-path.js';
+import { inspectClassicProjectTarget, readClassicProjectFile } from './classic-protected-path.js';
 import type { CometHookRequest } from '../../platform/process/hook-adapter.js';
+import {
+  proposedCometHookFileContent,
+  parseCometHookRequest,
+} from '../../platform/process/hook-adapter.js';
+import { classifyEditImpact } from '../workflow-contract/edit-impact.js';
+import { isAgentInstructionPath } from '../workflow-contract/neutral-document-path.js';
+import { prepareEditReview, isReviewedEditProposal } from '../workflow-contract/edit-review.js';
+import { classicEditReviewScope } from './classic-edit-review.js';
 import type { CometHookDecision } from '../workflow-contract/hook.js';
+import { readSdkChangeOwner } from '../workflow-contract/change-runtime-owner.js';
 import { scopeCometHookTargets } from '../workflow-contract/hook-target-scope.js';
 import { configuredHookWritePath } from '../workflow-contract/hook-write-policy.js';
 import type { ClassicCommandHandler, ClassicCommandResult } from './classic-cli.js';
@@ -25,12 +36,23 @@ import { resolveCurrentChange } from './classic-current-change.js';
 import { classicGuardUserMessage, classicLocale } from './classic-output-language.js';
 import { readClassicState, readLegacyState } from './classic-store.js';
 import type { ClassicPhase, ClassicState } from './classic-state.js';
+import { inspectClassicSdkRun } from './classic-sdk-status.js';
 import {
   inspectClassicPlanReadiness,
   inspectClassicAutonomousBuildProblems,
   type ClassicPlanReadiness,
 } from './classic-plan-readiness.js';
 import { isClassicNeutralDocumentWrite } from './classic-neutral-documents.js';
+
+// Share the SDK read with current-selection branch checks within this Hook request only.
+const inspectHookSdkRun = memoizedHookRead(
+  'classicHookSdkRun',
+  (projectRoot: string, name: string) =>
+    inspectClassicSdkRun(projectRoot, name, { readOnly: true }),
+);
+const hookWritableLayout = memoizedHookRead('classicHookWritableLayout', (projectRoot: string) =>
+  assertClassicLayoutWritable(projectRoot),
+);
 
 function result(exitCode: number, message: string): ClassicCommandResult {
   return { exitCode, stderr: message + '\n' };
@@ -40,9 +62,10 @@ function allowed(message: string): ClassicCommandResult {
   return result(0, `[COMET-HOOK] allowed: ${message}`);
 }
 
-async function inputTarget(): Promise<string> {
-  if (process.env.FILE_PATH) return process.env.FILE_PATH;
-  if (process.stdin.isTTY) return '';
+async function inputRequest(): Promise<CometHookRequest> {
+  if (process.env.FILE_PATH)
+    return { intent: 'write', toolName: null, targets: [process.env.FILE_PATH] };
+  if (process.stdin.isTTY) return { intent: 'unknown', toolName: null, targets: [] };
   const stdin = await readStdinTextWithTimeoutAsync();
   if (stdin.text === null) {
     process.stderr.write(
@@ -51,13 +74,7 @@ async function inputTarget(): Promise<string> {
     process.exit(1);
   }
   const input = stripUtf8Bom(stdin.text);
-  if (!input) return '';
-  try {
-    const parsed = JSON.parse(input) as { tool_input?: { file_path?: unknown } };
-    return typeof parsed.tool_input?.file_path === 'string' ? parsed.tool_input.file_path : '';
-  } catch {
-    return '';
-  }
+  return parseCometHookRequest(input);
 }
 
 function normalized(value: string): string {
@@ -133,6 +150,9 @@ interface GoverningChange {
   phase: ClassicPhase;
   classic: ClassicState | null;
   archived: boolean;
+  cancelled?: boolean;
+  cancellationPending?: boolean;
+  executionUnresolved?: boolean;
   invalidState?: boolean;
   superpowersArtifact?: 'matched' | 'unmatched';
   superpowersSlot?: SuperpowersArtifactSlot;
@@ -159,6 +179,14 @@ async function loadGoverningChange(changeDir: string): Promise<GoverningChange |
       archived: projection.classic.archived,
     };
   } catch (error) {
+    // Only incomplete legacy projections may fall back; identity, path and write conflicts block.
+    if (
+      !(error instanceof Error) ||
+      (!error.message.startsWith('Invalid Classic state:') &&
+        error.message !== 'Classic state projection is unavailable') ||
+      error.message.startsWith('Invalid Classic state: change_id')
+    )
+      throw error;
     // Legacy/partial state without the required Classic fields: fall back to a
     // direct yaml read so the guard still respects the recorded phase rather
     // than crashing the way master's lenient shell scripts did not.
@@ -172,6 +200,23 @@ async function loadGoverningChange(changeDir: string): Promise<GoverningChange |
       invalidState: error instanceof Error && error.message.includes('unknown field'),
     };
   }
+}
+
+async function loadSdkGoverningChange(
+  projectRoot: string,
+  changeName: string,
+  changeDir: string,
+): Promise<GoverningChange> {
+  const { run, state } = await inspectHookSdkRun(projectRoot, changeName);
+  return {
+    changeDir,
+    phase: state.phase,
+    classic: state,
+    archived: state.archived,
+    cancelled: isClassicSdkCancellationComplete(run),
+    cancellationPending: run.status === 'cancelled' && !isClassicSdkCancellationComplete(run),
+    executionUnresolved: run.actions.some((action) => action.status === 'unknown'),
+  };
 }
 
 async function activeChangesImpl(projectRoot: string): Promise<GoverningChange[]> {
@@ -188,9 +233,15 @@ async function activeChangesImpl(projectRoot: string): Promise<GoverningChange[]
     if (entry.name === 'archive') continue;
     if (openSpecChangeNameError(entry.name)) continue;
     const active = await inspectClassicActiveChangeDirectory(entry.name, projectRoot);
-    if (!active.exists || !active.stateExists) continue;
-    const governing = await loadGoverningChange(active.directory);
-    if (!governing || governing.archived) continue;
+    if (!active.exists) continue;
+    const governing = (await readSdkChangeOwner(projectRoot, 'classic', entry.name, {
+      readOnly: true,
+    }))
+      ? await loadSdkGoverningChange(projectRoot, entry.name, active.directory)
+      : active.stateExists
+        ? await loadGoverningChange(active.directory)
+        : null;
+    if (!governing || governing.archived || governing.cancelled) continue;
     governingChanges.push(governing);
   }
   return governingChanges;
@@ -206,9 +257,13 @@ const activeGoverningChange = memoizedHookRead(
   'classicActiveChange',
   async (projectRoot: string, changeName: string): Promise<GoverningChange | null> => {
     const active = await inspectClassicActiveChangeDirectory(changeName, projectRoot);
+    if (await readSdkChangeOwner(projectRoot, 'classic', changeName, { readOnly: true })) {
+      const governing = await loadSdkGoverningChange(projectRoot, changeName, active.directory);
+      return governing.archived || governing.cancelled ? null : governing;
+    }
     if (!active.exists || !active.stateExists) return null;
     const governing = await loadGoverningChange(active.directory);
-    return !governing || governing.archived ? null : governing;
+    return !governing || governing.archived || governing.cancelled ? null : governing;
   },
 );
 const hookPlanReadiness = memoizedHookRead('classicPlanReadiness', inspectClassicPlanReadiness);
@@ -547,6 +602,17 @@ async function governingChange(
   if (target?.kind === 'active') {
     const name = target.changeName;
     const active = await inspectClassicActiveChangeDirectory(name, projectRoot);
+    if (await readSdkChangeOwner(projectRoot, 'classic', name, { readOnly: true })) {
+      const sdk = await loadSdkGoverningChange(projectRoot, name, active.directory);
+      return sdk.archived
+        ? {
+            blockedResult: blockedStaleSelection(
+              relativePath,
+              `Classic SDK change '${name}' is already archived`,
+            ),
+          }
+        : sdk;
+    }
     if (active.stateExists) {
       const governing = await loadGoverningChange(active.directory);
       if (governing) return governing;
@@ -626,7 +692,8 @@ function openSpecAllowed(
 ): string | null {
   const key = comparisonKey(relativePath);
   if (!key.startsWith(comparisonKey(openSpecPrefix))) return null;
-  const stateFile = key.endsWith('/.comet.yaml') || key.endsWith('/.openspec.yaml');
+  const stateFile =
+    isClassicStateFileName(path.posix.basename(key)) || key.endsWith('/.openspec.yaml');
   const proposal =
     key.endsWith('/proposal.md') || key.endsWith('/design.md') || key.endsWith('/tasks.md');
   const handoff = key.includes('/.comet/');
@@ -955,6 +1022,7 @@ async function inspectClassicHookTarget(
   target: string,
   selectedChangeName?: string,
   scopeTargets: typeof scopeCometHookTargets = scopeCometHookTargets,
+  request?: CometHookRequest,
 ): Promise<ClassicCommandResult> {
   try {
     const scoped = await scopeTargets(projectRoot, [target]);
@@ -974,7 +1042,7 @@ async function inspectClassicHookTarget(
   const relativePath = await projectRelative(target, projectRoot);
   let layout: ClassicLayoutPaths;
   try {
-    layout = await assertClassicLayoutWritable(projectRoot);
+    layout = await hookWritableLayout(projectRoot);
   } catch (error) {
     return result(
       2,
@@ -1008,10 +1076,9 @@ async function inspectClassicHookTarget(
     return allowed(`${relativePath} (whitelist: neutral document)`);
   }
   if (
-    relativePath === 'CLAUDE.md' ||
     relativePath === 'CHANGELOG.md' ||
     relativePath === 'README.md' ||
-    isRootMarkdown(relativePath)
+    (isRootMarkdown(relativePath) && !isAgentInstructionPath(relativePath))
   ) {
     return allowed(`${relativePath} (whitelist: root markdown)`);
   }
@@ -1034,6 +1101,16 @@ async function inspectClassicHookTarget(
   }
   if (!governing) return allowed('no active comet change');
   if ('blockedResult' in governing) return governing.blockedResult;
+  if (governing.cancellationPending)
+    return result(
+      2,
+      'Classic Run cancellation is incomplete: the original host must confirm that its execution and child tasks have stopped before writing.',
+    );
+  if (governing.executionUnresolved)
+    return result(
+      2,
+      'Classic execution is unresolved: reconcile the original claim before writing, or confirm the entire process tree has stopped and cancel with stoppedActions.',
+    );
   if (governing.archived) return allowed(`${relativePath} (own change archived)`);
 
   const phase = governing.phase;
@@ -1120,6 +1197,77 @@ async function inspectClassicHookTarget(
     }
     return allowed(`${relativePath} (phase: ${phase})`);
   }
+  if (phase === 'verify' && request?.writes) {
+    const proposals = request.writes.filter(
+      (proposal) =>
+        path.resolve(projectRoot, proposal.path) === path.resolve(projectRoot, relativePath),
+    );
+    if (proposals.length === 1) {
+      try {
+        const scope = governing.classic
+          ? await classicEditReviewScope(projectRoot, changeName, governing.classic)
+          : null;
+        if (
+          scope?.formalPrefixes.some(
+            (prefix) => relativePath === prefix || relativePath.startsWith(prefix + '/'),
+          )
+        )
+          return blocked(
+            relativePath,
+            phase,
+            changeName,
+            classicLocale(governing.classic?.language),
+          );
+        const before = await readClassicProjectFile(projectRoot, relativePath, {
+          label: 'Classic content before edit',
+          maxBytes: 1024 * 1024,
+        });
+        const after = proposedCometHookFileContent(proposals[0], before);
+        if (after !== null) {
+          const impact = classifyEditImpact(relativePath, before, after);
+          if (
+            impact.kind === 'non-behavioral' ||
+            impact.kind === 'unchanged' ||
+            (impact.kind === 'review-required' &&
+              scope &&
+              (await isReviewedEditProposal(scope, relativePath, before, after)))
+          )
+            return allowed(
+              `${relativePath} (phase: verify, non-behavioral edit; refresh affected check evidence)`,
+            );
+          if (impact.kind === 'review-required' && scope) {
+            await prepareEditReview(
+              await classicEditReviewScope(projectRoot, changeName, governing.classic!, true),
+              {
+                ...request,
+                targets: [relativePath],
+                cwd: projectRoot,
+              },
+            );
+            return result(
+              2,
+              `Classic remains in Verify: the concrete edit requires review. Run comet edit-review show classic ${changeName} for the proposal and continuation; an independent session must claim and record the returned task, or obtain user confirmation in Compat. Acceptance and archive remain blocked until review.`,
+            );
+          }
+        }
+      } catch (error) {
+        if (
+          (error as NodeJS.ErrnoException).code === 'ENOENT' ||
+          (error instanceof Error && error.message.includes('does not exist'))
+        )
+          return blocked(
+            relativePath,
+            phase,
+            changeName,
+            classicLocale(governing.classic?.language),
+          );
+        return result(
+          2,
+          `Classic remains in Verify: edit impact could not be determined; ${error instanceof Error ? error.message : String(error)}. Supply the complete edit for review before acceptance or archive.`,
+        );
+      }
+    }
+  }
   return blocked(relativePath, phase, changeName, classicLocale(governing.classic?.language));
 }
 
@@ -1131,7 +1279,7 @@ export async function inspectClassicHookGuard(
 ): Promise<CometHookDecision> {
   if (request.intent !== 'non-write') {
     try {
-      await assertClassicLayoutWritable(projectRoot);
+      await hookWritableLayout(projectRoot);
     } catch (error) {
       return {
         allowed: false,
@@ -1180,6 +1328,7 @@ export async function inspectClassicHookGuard(
       target,
       changeName,
       dependencies.scopeTargets,
+      request,
     );
     if (inspected.exitCode !== 0) {
       return {
@@ -1205,7 +1354,21 @@ export async function inspectClassicHookGuard(
 
 export const classicHookGuardCommand: ClassicCommandHandler = async (args) => {
   const projectRoot = parseProjectRoot(args);
-  const target = await inputTarget();
-  if (!target) return allowed('no file path in tool input');
-  return inspectClassicHookTarget(projectRoot, target);
+  const request = await inputRequest();
+  if (!request.targets.length) return allowed('no file path in tool input');
+  let last: ClassicCommandResult | undefined;
+  for (const target of request.targets) {
+    const decision = await inspectClassicHookTarget(
+      projectRoot,
+      target,
+      undefined,
+      undefined,
+      request,
+    );
+    if (decision.exitCode !== 0) return decision;
+    last = decision;
+  }
+  return request.targets.length === 1 && last
+    ? last
+    : allowed('all write targets passed the Classic guard');
 };

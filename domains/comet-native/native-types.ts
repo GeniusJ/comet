@@ -47,6 +47,7 @@ export interface NativeProjectPaths {
   specsDir: string;
   changesDir: string;
   archiveDir: string;
+  workspaceRuntimeRoot: string;
   runtimeDir: string;
   changesRuntimeDir: string;
   locksDir: string;
@@ -569,7 +570,7 @@ export interface NativeStatusProjection {
   workspace: NativeWorkspaceProjection;
   runtime: {
     status: 'available' | 'missing' | 'invalid';
-    layout: 'project-local' | 'legacy' | 'missing';
+    layout: 'user-local' | 'legacy' | 'missing';
     path: string;
     message?: string;
   };

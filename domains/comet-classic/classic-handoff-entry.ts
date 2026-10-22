@@ -1,4 +1,4 @@
-import { classicHandoffCommand } from './classic-handoff.js';
+import { classicHandoffCommand } from './classic-handoff-command.js';
 import {
   createClassicCommandRunner,
   isClassicScriptEntry,

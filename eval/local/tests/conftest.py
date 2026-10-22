@@ -21,6 +21,7 @@ import tempfile
 import time
 from contextlib import contextmanager
 from datetime import datetime
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -69,6 +70,12 @@ from scaffold.python.langfuse_adapter import (
 )
 from scaffold.python.sample_quality import infer_sample_quality
 from scaffold.python.skill_parser import SCRIPT_EXTENSIONS
+from scaffold.python.workspace_artifacts import (
+    WorkspaceArtifactError,
+    iter_workspace_paths,
+    read_workspace_text,
+    require_workspace_artifact_support,
+)
 from scaffold.python.utils import (
     check_docker_available,
     run_agent_loop_in_docker,
@@ -362,9 +369,7 @@ def _require_agent_credentials(agent: str, source_env: dict[str, str] | None = N
         return
     adapter = get_agent_adapter(agent)
     separator = ", " if adapter.custom else " or "
-    raise pytest.UsageError(
-        f"Credentials for {agent} not set: {separator.join(missing)}"
-    )
+    raise pytest.UsageError(f"Credentials for {agent} not set: {separator.join(missing)}")
 
 
 def _normal_run_preflight(config) -> None:
@@ -372,13 +377,21 @@ def _normal_run_preflight(config) -> None:
 
     if _is_unit_tests_only(config) or getattr(config.option, "collectonly", False):
         return
+    try:
+        require_workspace_artifact_support()
+    except WorkspaceArtifactError as exc:
+        raise pytest.UsageError(f"Eval harness 环境错误: {exc}") from exc
     from scaffold.python.utils import load_eval_environment
 
     load_eval_environment()
     main = _resolve_eval_execution(config)
     judge = _resolve_eval_judge(config)
     suite = next(
-        (name for name in ("local", "langsmith", "langfuse") if f"{name}/tests/" in " ".join(config.args)),
+        (
+            name
+            for name in ("local", "langsmith", "langfuse")
+            if f"{name}/tests/" in " ".join(config.args)
+        ),
         "local",
     )
     required_harness = (
@@ -388,7 +401,9 @@ def _normal_run_preflight(config) -> None:
     )
     missing_harness = [str(path) for path in required_harness if not path.is_file()]
     if missing_harness:
-        raise pytest.UsageError(f"Packaged eval harness is incomplete: {', '.join(missing_harness)}")
+        raise pytest.UsageError(
+            f"Packaged eval harness is incomplete: {', '.join(missing_harness)}"
+        )
     manifest = _manifest_for_config(config)
     if manifest is not None and manifest.reporting is not None:
         selected_report_suite = manifest.reporting.suite
@@ -562,6 +577,13 @@ def _ensure_auto_generated_manifest(config, task_filter: str | None = None) -> N
     from scaffold.python.task_resolution import ResolvedTask, ResolvedTaskSet
 
     generated_manifest = load_eval_manifest(generated.manifest_path)
+    if manifest is not None:
+        generated_manifest = replace(
+            generated_manifest,
+            interaction=manifest.interaction,
+            execution=manifest.execution,
+            judge=manifest.judge,
+        )
     generated_tasks = tuple(
         ResolvedTask(task.name, "generated", task)
         for task in load_manifest_tasks(generated_manifest)
@@ -733,6 +755,9 @@ def _copy_current_comet_cli_snapshot(environment_dir: Path, test_dir: Path) -> N
         if path.is_file()
     )
     asset_files = _regular_tree_files(assets_dir) if assets_dir.is_dir() else []
+    published = not any(root.is_dir() for root in source_roots)
+    if published:
+        source_files.extend(_regular_tree_files(source_root / "dist"))
     source_files.extend(asset_files)
     if (
         not package_file.is_file()
@@ -743,10 +768,14 @@ def _copy_current_comet_cli_snapshot(environment_dir: Path, test_dir: Path) -> N
     ):
         raise FileNotFoundError("Current Comet source snapshot is incomplete")
     source_hash, source_count = _tree_digest(source_root, sorted(set(source_files)))
-    with tempfile.TemporaryDirectory(prefix="comet-eval-source-build-") as temporary:
-        built_dist = Path(temporary) / "dist"
-        compiler_version = _build_current_comet_dist(source_root, built_dist)
-        shutil.copytree(built_dist, target / "dist")
+    if published:
+        compiler_version = "published-dist"
+        shutil.copytree(source_root / "dist", target / "dist")
+    else:
+        with tempfile.TemporaryDirectory(prefix="comet-eval-source-build-") as temporary:
+            built_dist = Path(temporary) / "dist"
+            compiler_version = _build_current_comet_dist(source_root, built_dist)
+            shutil.copytree(built_dist, target / "dist")
     shutil.copytree(bin_dir, target / "bin")
     shutil.copytree(assets_dir, target / "assets")
     shutil.copy2(package_file, target / "package.json")
@@ -932,6 +961,13 @@ def pytest_addoption(parser):
         help="Override max interaction turns for auto_user loops",
     )
     parser.addoption(
+        "--agent-timeout",
+        action="store",
+        type=int,
+        default=None,
+        help="Override the per-case Agent execution timeout in seconds",
+    )
+    parser.addoption(
         "--simulator-prompt",
         action="store",
         default=None,
@@ -953,7 +989,9 @@ def pytest_configure(config):
     )
     try:
         context = context_from_environment()
-        if context is None and (config.getoption("--eval-manifest") or config.getoption("--skill-path")):
+        if context is None and (
+            config.getoption("--eval-manifest") or config.getoption("--skill-path")
+        ):
             context = resolve_eval_context(
                 skill_path=config.getoption("--skill-path"),
                 manifest_path=config.getoption("--eval-manifest"),
@@ -1036,6 +1074,59 @@ class ExperimentPlugin:
             "case_count": len(payload["cases"]),
             "path": EXPECTED_CASE_MATRIX_FILENAME,
         }
+        from scaffold.python.application_eval import application_eval_context
+
+        application = application_eval_context()
+        if application is not None:
+            generated = getattr(self.config, "_comet_generated_manifest", None)
+            if generated is not None:
+                self.logger.metadata["application_task_set"] = {
+                    "manifestPath": str(generated.manifest_path),
+                    "manifestHash": "sha256:"
+                    + hashlib.sha256(generated.manifest_path.read_bytes()).hexdigest(),
+                    "generationHash": generated.generation_hash,
+                    "sourceRoot": application["skillRoot"],
+                    "sourceSnapshotHash": application["snapshotHash"],
+                }
+            elif application["preview"].get("taskSet"):
+                self.logger.metadata["application_task_set"] = application["preview"]["taskSet"]
+            task_set = self.logger.metadata.get("application_task_set")
+            if task_set:
+                if (
+                    self.logger.base_dir.resolve()
+                    != Path(application["resultFile"]).resolve().parent
+                ):
+                    raise RuntimeError("TaskSet receipt is outside the selected experiment")
+                generation_metadata = Path(task_set["manifestPath"]).parent / "generation.json"
+                receipt = {
+                    "schema": "comet.workflow.application.eval.task-set.v1",
+                    "experimentId": application["experimentId"],
+                    "confirmationHash": application["preview"]["confirmationHash"],
+                    "snapshotHash": application["snapshotHash"],
+                    "taskSet": task_set,
+                    "matrixHash": payload["matrix_hash"],
+                    "generationMetadataHash": (
+                        "sha256:" + hashlib.sha256(generation_metadata.read_bytes()).hexdigest()
+                        if generation_metadata.is_file()
+                        else None
+                    ),
+                }
+                from scaffold.python.logging import _atomic_write_json
+
+                receipt_path = self.logger.base_dir / "application-task-set.json"
+                with file_lock(self.logger.base_dir / ".application-task-set.lock"):
+                    if receipt_path.is_symlink():
+                        raise RuntimeError("TaskSet receipt cannot be a linked file")
+                    if receipt_path.exists():
+                        if json.loads(receipt_path.read_text(encoding="utf-8")) != receipt:
+                            raise RuntimeError("TaskSet receipt changed after collection")
+                    else:
+                        _atomic_write_json(receipt_path, receipt)
+
+    def pytest_runtest_logreport(self, report):
+        """Keep setup/teardown failures distinct from scored case failures."""
+        if self.logger and report.failed and report.when != "call":
+            self.logger.metadata["pytest_errors"] = self.logger.metadata.get("pytest_errors", 0) + 1
 
     def pytest_sessionfinish(self, session, exitstatus):
         """Generate and save summary at session end."""
@@ -1050,6 +1141,7 @@ class ExperimentPlugin:
 
         self._reload_expected_case_matrix_metadata()
         self._reload_results_from_reports()
+        self.logger.metadata["pytest_exitstatus"] = int(exitstatus)
 
         if self.logger.results:
             self.logger.finalize()
@@ -1324,6 +1416,15 @@ def _resolve_interaction_config(task, profile_name: str, config):
         continue_prompt=continue_prompt,
         fresh_resume_marker=fresh_resume_marker,
     )
+
+
+def _resolve_agent_timeout(config, *, task_timeout: int, floor: int) -> int:
+    override = config.getoption("--agent-timeout")
+    if override is None:
+        return max(floor, task_timeout)
+    if override <= 0:
+        raise pytest.UsageError("--agent-timeout must be a positive number of seconds")
+    return override
 
 
 def _read_required_text(path: Path) -> str:
@@ -1658,7 +1759,12 @@ def prebuild_docker_image(request):
 @pytest.fixture
 def test_dir(tmp_path):
     """Create isolated test directory (pytest manages cleanup)."""
-    return tmp_path
+    yield tmp_path
+    if (tmp_path / ".eval-runtime-volume").is_file():
+        from scaffold.python.utils import run_shell
+        result = run_shell("docker.sh", "cleanup-runtime-data", str(tmp_path), timeout=30, check=False)
+        if result.returncode != 0:
+            raise RuntimeError("Eval Runtime data cleanup failed: " + (result.stderr or result.stdout))
 
 
 @pytest.fixture
@@ -1678,6 +1784,16 @@ def setup_test_context(test_dir):
         source_dir: Path | None = None,
     ) -> None:
         agent = _resolve_eval_agent(_plugin.config).agent if _plugin else "claude-code"
+        from scaffold.python.application_eval import application_eval_context
+
+        application = application_eval_context()
+        if (
+            application is not None
+            and source_dir
+            and source_dir.resolve() == Path(application["skillRoot"]).resolve()
+        ):
+            # The production installer will publish this entry and the fixed dependency Skills.
+            return
         skill_dir = test_dir / _agent_project_root(agent) / "skills" / skill_name
         skill_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1912,7 +2028,7 @@ def run_claude(test_dir, experiment_logger, request):
 
         if experiment_logger and hasattr(request, "node"):
             treatment_name = _get_treatment_name(request.node)
-            rep = _plugin.get_rep_number(treatment_name) if _plugin else 1
+            rep = _get_repetition(request.node, advance=True)
             save_raw(
                 experiment_logger.base_dir,
                 treatment_name,
@@ -1946,7 +2062,7 @@ def record_result(test_dir, experiment_logger, request):
             _plugin.last_test_dir = test_dir
 
         treatment_name = _get_treatment_name(request.node)
-        rep = _plugin.run_counter.get(treatment_name, 1) if _plugin else 1
+        rep = _get_repetition(request.node)
         events["sample"] = rep
         base_dir = experiment_logger.base_dir
 
@@ -2017,6 +2133,11 @@ def record_result(test_dir, experiment_logger, request):
                     "telemetry_status": events.get("telemetry_status", "N/A"),
                     "role_sessions": events.get("role_sessions", {}),
                     "task": events.get("task"),
+                    "application_coverage": events.get("application_coverage", []),
+                    "application_executed_steps": events.get("application_executed_steps", []),
+                    "application_choices": events.get("application_choices", []),
+                    "application_recovery": events.get("application_recovery", []),
+                    "sample_quality": report["sample_quality"],
                     "treatment": events.get("treatment", treatment_name),
                     "sample": events.get("sample", rep),
                     "prompt": events.get("prompt"),
@@ -2093,6 +2214,11 @@ def _build_report_payload(
             "telemetry_status": events.get("telemetry_status", "N/A"),
             "role_sessions": events.get("role_sessions", {}),
             "task": events.get("task"),
+            "application_coverage": events.get("application_coverage", []),
+            "application_executed_steps": events.get("application_executed_steps", []),
+            "application_choices": events.get("application_choices", []),
+            "application_recovery": events.get("application_recovery", []),
+            "sample_quality": sample_quality,
             "treatment": events.get("treatment", treatment_name),
             "sample": events.get("sample", rep),
             "prompt": events.get("prompt"),
@@ -2133,6 +2259,11 @@ def fixtures(
         run_claude=run_claude,
         record_result=record_result,
         request_config=request.config,
+        repetition=(
+            _get_repetition(request.node)
+            if request.node.get_closest_marker("eval_case")
+            else 1
+        ),
     )
     yield _current_fixtures
     _current_fixtures = None
@@ -2141,6 +2272,23 @@ def fixtures(
 # =============================================================================
 # FIXTURE HELPERS
 # =============================================================================
+
+
+def _get_repetition(node, *, advance: bool = False) -> int:
+    """Use the collected case identity regardless of worker order or rerun mode."""
+    marker = node.get_closest_marker("eval_case")
+    if marker is not None:
+        repetition = marker.kwargs.get("repetition")
+        if isinstance(repetition, bool) or not isinstance(repetition, int) or repetition < 1:
+            raise pytest.UsageError("eval_case repetition must be a positive integer")
+        return repetition
+    # Unmarked legacy fixtures retain their sequential counter contract.
+    if _plugin is None:
+        return 1
+    treatment_name = _get_treatment_name(node)
+    if advance:
+        return _plugin.get_rep_number(treatment_name)
+    return _plugin.run_counter.get(treatment_name, 1)
 
 
 def _get_treatment_name(node) -> str:
@@ -2287,6 +2435,7 @@ def _save_artifacts(
     agent: str = "claude-code",
 ):
     """Save the selected Agent's generated files as artifacts."""
+    require_workspace_artifact_support()
     artifacts_dir = base_dir / "artifacts" / f"{treatment_name.lower()}_rep{rep}"
     agent_dir_name = {
         "claude-code": "claude",
@@ -2326,10 +2475,10 @@ def _save_artifacts(
     }
 
     claude_files = []
-    for item in test_dir.rglob("*"):
-        if not item.is_file():
-            continue
-        if item.name.startswith("."):
+    for item in iter_workspace_paths(test_dir):
+        # Classic's public checkpoint is a dotfile, not private Agent config.
+        # Keep this one state file while excluding all other hidden filenames.
+        if item.name.startswith(".") and item.name != ".comet.yaml":
             continue
         if item.name in exclude_files:
             continue
@@ -2338,9 +2487,10 @@ def _save_artifacts(
         try:
             rel_path = item.relative_to(test_dir)
             dest = agent_dir / rel_path
-            dest.parent.mkdir(parents=True, exist_ok=True)
             try:
-                content = item.read_text(encoding="utf-8")
+                content = read_workspace_text(test_dir, item)
+                if content is None:
+                    continue
             except UnicodeDecodeError:
                 import sys
 
@@ -2350,8 +2500,11 @@ def _save_artifacts(
                 )
                 continue
             else:
+                dest.parent.mkdir(parents=True, exist_ok=True)
                 dest.write_text(redact_sensitive(content), encoding="utf-8")
             claude_files.append(item)
+        except WorkspaceArtifactError:
+            raise
         except Exception as e:
             import sys
 

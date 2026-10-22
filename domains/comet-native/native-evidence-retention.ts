@@ -169,7 +169,8 @@ function compareText(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
 }
 
-function portableProjectRef(paths: NativeProjectPaths, target: string): string {
+function evidenceFindingPath(paths: NativeProjectPaths, target: string): string {
+  if (isInsidePath(paths.workspaceRuntimeRoot, target)) return path.resolve(target);
   const relative = path.relative(paths.projectRoot, target);
   if (
     relative.length === 0 ||
@@ -187,7 +188,7 @@ function evidenceRootPath(paths: NativeProjectPaths, name: string): string {
 }
 
 function evidenceRootRef(paths: NativeProjectPaths, name: string): string {
-  return portableProjectRef(paths, evidenceRootPath(paths, name));
+  return evidenceFindingPath(paths, evidenceRootPath(paths, name));
 }
 
 async function captureDirectoryChain(

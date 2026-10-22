@@ -1,5 +1,7 @@
 import { promises as fs } from 'node:fs';
+import { fingerprintDashboardFiles } from './source-version.js';
 import path from 'node:path';
+import os from 'node:os';
 
 import { readNativeTextFilePrefix } from '../comet-native/native-bounded-file.js';
 import {
@@ -45,8 +47,14 @@ import {
 import type { DashboardChangeTab, NativeDashboardChangePage } from './types.js';
 import { DashboardIndexStore, resolveDashboardIndexPath } from './index-store.js';
 import { DashboardIndexReconciler } from './index-reconciler.js';
+import { nativeSupervisorStateFile } from '../comet-native/native-supervisor-state.js';
+import {
+  readNativeDashboardSdkProjection,
+  type NativeDashboardSdkProjection,
+} from './native-sdk-projection.js';
 import {
   collectDashboardWorkspaceSources,
+  withDashboardReadScope,
   dashboardWorkspaceIdentity,
   encodeDashboardChangeLocator,
   isDashboardWorkspaceSourceEligible,
@@ -184,9 +192,12 @@ async function collectArtifacts(
   changeDir: string,
   state: NativePortableState | NativeChangeState,
 ): Promise<NativeDashboardArtifactPreview[]> {
-  return Promise.all(
-    artifactDescriptors(state).map((descriptor) => readArtifactPreview(changeDir, descriptor)),
-  );
+  const descriptors = artifactDescriptors(state);
+  if (state.archived && state.spec_changes.length === 0) {
+    descriptors.push(['parent-spec', 'Parent Spec 快照', 'spec.md']);
+    descriptors.push(['archive-source', '归档材料来源', 'archive-source.md']);
+  }
+  return Promise.all(descriptors.map((descriptor) => readArtifactPreview(changeDir, descriptor)));
 }
 
 async function readMatchingLocalExecution(
@@ -203,7 +214,7 @@ async function readMatchingLocalExecution(
   let file: string;
   try {
     file = path.join(nativePreferredChangeRuntimeDir(paths, state.name), 'state.json');
-    await resolveContainedNativePath(paths.projectRoot, file);
+    await resolveContainedNativePath(paths.runtimeDir, file);
   } catch {
     return { state: null, reason: 'invalid' };
   }
@@ -271,6 +282,9 @@ function nativeDashboardCandidateLocator(
 }
 
 interface NativeDashboardIndex {
+  runtimeDataRoot?: string;
+  refreshPaths?: string[];
+  fingerprint?: string | null;
   active: NativeDashboardRootCandidate[];
   archived: NativeDashboardRootCandidate[];
   all: NativeDashboardCandidate[];
@@ -278,17 +292,24 @@ interface NativeDashboardIndex {
   archivedChangeCount: number;
 }
 
+function nativeDashboardRuntimeDataRoot(): string {
+  return process.env.COMET_DATA_DIR ?? path.join(os.homedir(), '.comet');
+}
+
 async function discoverNativeDashboardSources(
   projectRoot: string,
+  workspaces = collectDashboardWorkspaceSources(projectRoot),
 ): Promise<NativeDashboardSource[]> {
   const sources: NativeDashboardSource[] = [];
-  for (const workspace of collectDashboardWorkspaceSources(projectRoot)) {
+  for (const workspace of workspaces) {
     try {
       const config = await readWorkflowProjectConfig(workspace.projectRoot);
       if (!config?.native) continue;
       sources.push({
         workspace,
-        paths: await nativeProjectPaths(workspace.projectRoot, config.native.artifact_root),
+        paths: await nativeProjectPaths(workspace.projectRoot, config.native.artifact_root, {
+          readOnly: true,
+        }),
       });
     } catch (error) {
       console.warn(
@@ -466,7 +487,8 @@ async function activeParentChildren(
 ): Promise<NativeDashboardChildSummary[]> {
   try {
     if (!(await hasNativeChildrenContract(candidate))) return [];
-    const { changeDir, read } = await readEntryState(candidate.source.paths, candidate.entry);
+    const { changeDir, read, sdk } = await readEntryState(candidate.source.paths, candidate.entry);
+    if (sdk) return sdk.children.map((child) => childSummary(child, candidates));
     if (read.kind !== 'portable') return [];
     const document = await readNativeChildrenContract({
       changeDir,
@@ -603,8 +625,24 @@ function isNativeDashboardIndex(value: unknown): value is NativeDashboardIndex {
 }
 
 function hasInvalidCachedNativeSource(index: NativeDashboardIndex, projectRoot: string): boolean {
-  return [...index.active, ...index.archived, ...index.all].some(
-    (candidate) => !isDashboardWorkspaceSourceEligible(projectRoot, candidate.source.workspace),
+  const workspaces = new Map(
+    [...index.active, ...index.archived, ...index.all].map(({ source }) => [
+      `${source.workspace.projectRoot}\0${source.workspace.branch}\0${source.workspace.current}`,
+      source.workspace,
+    ]),
+  );
+  return [...workspaces.values()].some(
+    (workspace) => !isDashboardWorkspaceSourceEligible(projectRoot, workspace),
+  );
+}
+
+function nativeDashboardIndexFingerprint(
+  files: readonly string[],
+  workspaces: readonly DashboardWorkspaceSource[],
+): Promise<string | null> {
+  return fingerprintDashboardFiles(
+    files,
+    JSON.stringify(workspaces.map(({ id, branch, current }) => [id, branch, current])),
   );
 }
 
@@ -627,16 +665,20 @@ async function readCachedNativeDashboardEntries(
   projectRoot: string,
   status: DashboardChangeTab,
   query: string | undefined,
-): Promise<{ entries: NativeDashboardRootCandidate[]; query: string } | null> {
+  limit: number,
+  offset: number,
+): Promise<{ entries: NativeDashboardRootCandidate[]; query: string; total: number } | null> {
   const store = new DashboardIndexStore({ projectRoot });
   try {
     await store.open();
     const result = await store.queryNativeIndex<NativeDashboardRootCandidate>({
       status,
       query,
+      limit,
+      offset,
     });
     if (!result.indexed) return null;
-    return { entries: result.rows, query: query?.trim().toLowerCase() ?? '' };
+    return { entries: result.rows, query: query?.trim().toLowerCase() ?? '', total: result.total };
   } catch {
     return null;
   } finally {
@@ -647,9 +689,37 @@ async function readCachedNativeDashboardEntries(
 async function rebuildNativeDashboardIndex(
   projectRoot: string,
 ): Promise<NativeDashboardIndex | null> {
-  const sources = await discoverNativeDashboardSources(projectRoot);
+  const workspaces = collectDashboardWorkspaceSources(projectRoot);
+  const sources = await discoverNativeDashboardSources(projectRoot, workspaces);
   if (sources.length === 0) return null;
+  const discoveryPaths = [
+    ...new Set([
+      nativeDashboardRuntimeDataRoot(),
+      ...workspaces.map(({ projectRoot: root }) => path.join(root, '.comet', 'config.yaml')),
+      ...sources.flatMap(({ paths }) => [
+        paths.projectRoot,
+        paths.artifactRoot,
+        paths.nativeRoot,
+        paths.changesDir,
+        paths.archiveDir,
+      ]),
+    ]),
+  ].sort();
+  const discoveryBefore = await nativeDashboardIndexFingerprint(discoveryPaths, workspaces);
   const raw = await rawNativeDashboardCandidates(sources);
+  // Archived entries are immutable history. Their container detects additions,
+  // removals and renames; only active candidates need per-file change tracking.
+  const refreshPaths = [
+    ...new Set([
+      ...discoveryPaths,
+      ...raw.active.flatMap(({ source, entry }) => [
+        path.join(entryDirectory(source.paths, entry), NATIVE_CHANGE_STATE_FILE),
+        path.join(entryDirectory(source.paths, entry), NATIVE_CHILDREN_FILE),
+        nativeSupervisorStateFile(source.paths, entry.name),
+      ]),
+    ]),
+  ].sort();
+  const before = await nativeDashboardIndexFingerprint(refreshPaths, workspaces);
   const [active, archived] = await Promise.all([
     selectActiveNativeCandidates(raw.active),
     Promise.resolve(selectArchivedNativeCandidates(raw.archived)),
@@ -674,7 +744,12 @@ async function rebuildNativeDashboardIndex(
       .filter(({ locator }) => !suppressed.has(locator));
   const rootActive = rootCandidates(active, activeChildren);
   const rootArchived = rootCandidates(archived, archivedChildren);
+  const after = await nativeDashboardIndexFingerprint(refreshPaths, workspaces);
+  const discoveryAfter = await nativeDashboardIndexFingerprint(discoveryPaths, workspaces);
   return {
+    runtimeDataRoot: nativeDashboardRuntimeDataRoot(),
+    refreshPaths,
+    fingerprint: before === after && discoveryBefore === discoveryAfter ? after : null,
     active: rootActive,
     archived: rootArchived,
     all,
@@ -723,12 +798,25 @@ export function markNativeDashboardIndexDirty(projectRoot: string): void {
 
 async function buildNativeDashboardIndex(
   projectRoot: string,
+  options: { refreshIfChanged?: boolean } = {},
 ): Promise<NativeDashboardIndex | null> {
   const root = path.resolve(projectRoot);
   const cached = await readCachedNativeDashboardIndex(root);
   if (cached) {
+    if (cached.runtimeDataRoot !== nativeDashboardRuntimeDataRoot())
+      return refreshNativeDashboardIndex(root);
     if (hasInvalidCachedNativeSource(cached, root)) return refreshNativeDashboardIndex(root);
-    scheduleNativeDashboardRefresh(root);
+    if (
+      !cached.refreshPaths ||
+      !cached.fingerprint ||
+      (await nativeDashboardIndexFingerprint(
+        cached.refreshPaths,
+        collectDashboardWorkspaceSources(root),
+      )) !== cached.fingerprint
+    ) {
+      if (options.refreshIfChanged) return refreshNativeDashboardIndex(root);
+      scheduleNativeDashboardRefresh(root);
+    }
     return cached;
   }
   return refreshNativeDashboardIndex(root);
@@ -815,16 +903,20 @@ function nativeDashboardOffset(options: {
   status: DashboardChangeTab;
   query: string;
   entries: readonly NativeDashboardRootCandidate[];
+  total: number;
+  entriesOffset: number;
 }): number {
   if (!options.cursor) return 0;
   const cursor = parseNativeDashboardCursor(options.cursor);
   if (
     cursor.status !== options.status ||
     cursor.query !== options.query ||
-    cursor.total !== options.entries.length ||
+    cursor.total !== options.total ||
     cursor.offset <= 0 ||
-    cursor.offset >= options.entries.length ||
-    nativeDashboardCandidateKey(options.entries[cursor.offset]) !== cursor.nextKey
+    cursor.offset >= options.total ||
+    !options.entries[cursor.offset - options.entriesOffset] ||
+    nativeDashboardCandidateKey(options.entries[cursor.offset - options.entriesOffset]) !==
+      cursor.nextKey
   ) {
     throw new NativeDashboardQueryError('Stale Native Dashboard change cursor');
   }
@@ -834,9 +926,19 @@ function nativeDashboardOffset(options: {
 async function readEntryState(
   paths: NativeProjectPaths,
   entry: NativeDashboardEntry,
-): Promise<{ changeDir: string; read: NativeDashboardStateRead }> {
+): Promise<{
+  changeDir: string;
+  read: NativeDashboardStateRead;
+  sdk?: NativeDashboardSdkProjection;
+}> {
   const changeDir = entryDirectory(paths, entry);
   await resolveContainedNativePath(paths.nativeRoot, changeDir);
+  // 归档有独立的最终快照，同名活跃 Run 和本机 Runtime 不能覆盖历史记录。
+  const sdk =
+    entry.status === 'active'
+      ? await readNativeDashboardSdkProjection(paths.projectRoot, entry.name)
+      : null;
+  if (sdk) return { changeDir, read: { kind: 'portable', state: sdk.state }, sdk };
   return {
     changeDir,
     read: await readDashboardState(path.join(changeDir, NATIVE_CHANGE_STATE_FILE)),
@@ -850,6 +952,7 @@ function invalidEntryMessage(entry: NativeDashboardEntry): string {
 async function collectNativeChangeListItem(
   candidate: NativeDashboardCandidate,
   children: NativeDashboardChildSummary[] = [],
+  candidates: readonly NativeDashboardCandidate[] = [],
 ): Promise<NativeDashboardChangeListItem> {
   const { paths } = candidate.source;
   const { entry } = candidate;
@@ -862,7 +965,8 @@ async function collectNativeChangeListItem(
     children,
   };
   try {
-    const { read } = await readEntryState(paths, entry);
+    const { read, sdk } = await readEntryState(paths, entry);
+    if (sdk) common.children = sdk.children.map((child) => childSummary(child, candidates));
     if (read.kind === 'invalid') {
       return invalidNativeDashboardListItem({ name: entry.name, ...common, message: read.message });
     }
@@ -876,6 +980,12 @@ async function collectNativeChangeListItem(
     if (read.kind === 'legacy') {
       return adaptLegacyNativeDashboardListItem({ state: read.state, ...common });
     }
+    if (sdk)
+      return adaptNativeDashboardListItem({
+        state: read.state,
+        ...common,
+        localExecutionSummary: sdk.localExecution,
+      });
     const local = await readMatchingLocalExecution(paths, read.state, entry.status);
     return adaptNativeDashboardListItem({
       state: read.state,
@@ -887,6 +997,7 @@ async function collectNativeChangeListItem(
     return invalidNativeDashboardListItem({
       name: entry.name,
       ...common,
+      children: [],
       message: error instanceof Error ? error.message : 'Native state is unreadable.',
     });
   }
@@ -895,6 +1006,7 @@ async function collectNativeChangeListItem(
 async function collectNativeChange(
   candidate: NativeDashboardCandidate,
   children: NativeDashboardChildSummary[] = [],
+  candidates: readonly NativeDashboardCandidate[] = [],
 ): Promise<NativeDashboardChangeProjection> {
   const { paths } = candidate.source;
   const { entry } = candidate;
@@ -907,7 +1019,8 @@ async function collectNativeChange(
     children,
   };
   try {
-    const { changeDir, read } = await readEntryState(paths, entry);
+    const { changeDir, read, sdk } = await readEntryState(paths, entry);
+    if (sdk) common.children = sdk.children.map((child) => childSummary(child, candidates));
     if (read.kind === 'invalid') {
       return invalidNativeDashboardChange({ name: entry.name, ...common, message: read.message });
     }
@@ -922,6 +1035,13 @@ async function collectNativeChange(
     if (read.kind === 'legacy') {
       return adaptLegacyNativeDashboardChange({ state: read.state, ...common, artifacts });
     }
+    if (sdk)
+      return adaptNativeDashboardChange({
+        state: read.state,
+        ...common,
+        artifacts,
+        localExecutionSummary: sdk.localExecution,
+      });
     const local = await readMatchingLocalExecution(paths, read.state, entry.status);
     return adaptNativeDashboardChange({
       state: read.state,
@@ -934,6 +1054,7 @@ async function collectNativeChange(
     return invalidNativeDashboardChange({
       name: entry.name,
       ...common,
+      children: [],
       message: error instanceof Error ? error.message : 'Native state is unreadable.',
     });
   }
@@ -952,6 +1073,15 @@ export async function collectNativeDashboardChangePage(
   projectRoot: string,
   options: NativeDashboardChangePageOptions,
 ): Promise<NativeDashboardChangePage> {
+  return withDashboardReadScope(projectRoot, () =>
+    collectNativeDashboardChangePageUncached(projectRoot, options),
+  );
+}
+
+async function collectNativeDashboardChangePageUncached(
+  projectRoot: string,
+  options: NativeDashboardChangePageOptions,
+): Promise<NativeDashboardChangePage> {
   const emptyPage: NativeDashboardChangePage = {
     status: options.status,
     items: [],
@@ -959,36 +1089,48 @@ export async function collectNativeDashboardChangePage(
     nextCursor: null,
   };
   const root = path.resolve(projectRoot);
-  const index = options.cursor
-    ? await refreshNativeDashboardIndex(root)
-    : await buildNativeDashboardIndex(root);
+  const limit = nativeDashboardPageLimit(options.limit);
+  const requestedOffset = options.cursor ? parseNativeDashboardCursor(options.cursor).offset : 0;
+  const index = await buildNativeDashboardIndex(root, {
+    refreshIfChanged: Boolean(options.cursor),
+  });
   if (!index) return emptyPage;
-  const listed =
-    (await readCachedNativeDashboardEntries(root, options.status, options.query)) ??
-    listNativeDashboardEntries(index, options.status, options.query);
+  const cached = await readCachedNativeDashboardEntries(
+    root,
+    options.status,
+    options.query,
+    limit + 1,
+    requestedOffset,
+  );
+  const listed = cached ?? listNativeDashboardEntries(index, options.status, options.query);
+  const total = cached?.total ?? listed.entries.length;
+  const entriesOffset = cached ? requestedOffset : 0;
   const offset = nativeDashboardOffset({
     cursor: options.cursor,
     status: options.status,
     query: listed.query,
     entries: listed.entries,
+    total,
+    entriesOffset,
   });
-  const limit = nativeDashboardPageLimit(options.limit);
-  const pageEntries = listed.entries.slice(offset, offset + limit);
+  const pageEntries = listed.entries.slice(offset - entriesOffset, offset - entriesOffset + limit);
   const nextOffset = offset + pageEntries.length;
   return {
     status: options.status,
     items: await Promise.all(
-      pageEntries.map((candidate) => collectNativeChangeListItem(candidate, candidate.children)),
+      pageEntries.map((candidate) =>
+        collectNativeChangeListItem(candidate, candidate.children, index.all),
+      ),
     ),
-    total: listed.entries.length,
+    total,
     nextCursor:
-      nextOffset < listed.entries.length
+      nextOffset < total
         ? encodeNativeDashboardCursor({
             status: options.status,
             query: listed.query,
             offset: nextOffset,
-            total: listed.entries.length,
-            nextKey: nativeDashboardCandidateKey(listed.entries[nextOffset]),
+            total,
+            nextKey: nativeDashboardCandidateKey(listed.entries[nextOffset - entriesOffset]),
           })
         : null,
   };
@@ -1004,6 +1146,15 @@ export interface NativeDashboardChangeDetailOptions {
 
 /** Read one selected YAML document, its formal Markdown, and a version-matched local overlay. */
 export async function collectNativeDashboardChangeDetail(
+  projectRoot: string,
+  options: NativeDashboardChangeDetailOptions,
+): Promise<NativeDashboardChangeProjection | null> {
+  return withDashboardReadScope(projectRoot, () =>
+    collectNativeDashboardChangeDetailUncached(projectRoot, options),
+  );
+}
+
+async function collectNativeDashboardChangeDetailUncached(
   projectRoot: string,
   options: NativeDashboardChangeDetailOptions,
 ): Promise<NativeDashboardChangeProjection | null> {
@@ -1034,7 +1185,7 @@ export async function collectNativeDashboardChangeDetail(
   const parent = [...index.active, ...index.archived].find(
     ({ locator }) => locator === candidate!.locator,
   );
-  return collectNativeChange(candidate, parent?.children ?? []);
+  return collectNativeChange(candidate, parent?.children ?? [], index.all);
 }
 
 /** Return directory counts only; change YAML is loaded by the paged endpoint. */
@@ -1073,7 +1224,7 @@ export async function collectNativeDashboardProjection(
     changes: await Promise.all(
       entries
         .slice(0, NATIVE_DASHBOARD_LIMITS.maxChanges)
-        .map((candidate) => collectNativeChange(candidate, candidate.children)),
+        .map((candidate) => collectNativeChange(candidate, candidate.children, index.all)),
     ),
     totalChangeCount: index.activeChangeCount + index.archivedChangeCount,
     activeChangeCount: index.activeChangeCount,

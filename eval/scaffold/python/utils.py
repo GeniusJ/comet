@@ -1,13 +1,16 @@
 """Python utilities - thin wrappers around shell scripts."""
 
 import json
+import hashlib
 import ntpath
 import os
 import random
 import re
 import shutil
 import subprocess
+import tempfile
 import time
+from uuid import uuid4
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -15,11 +18,23 @@ from dotenv import load_dotenv
 from scaffold.python.agents import validate_agent_id
 from scaffold.python.execution import ResolvedExecution, build_agent_environment
 from scaffold.python.paths import EVAL_ROOT, get_suite_root
+from scaffold.python.progress import observe_eval_container
 
 TEST_CONTEXT_FILE = os.environ.get("BENCH_TEST_CONTEXT", "_test_context.json")
 TEST_RESULTS_FILE = os.environ.get("BENCH_TEST_RESULTS", "_test_results.json")
 SHELL_DIR = Path(__file__).parent.parent / "shell"
 SCAFFOLD_PYTHON_DIR = Path(__file__).parent
+
+
+class AgentContainerCleanupError(RuntimeError):
+    """The owned container could not be proven stopped; callers must not retry a model turn."""
+
+    def __init__(self, message, *, container_name, stdout="", stderr="", returncode=None):
+        super().__init__(message)
+        self.container_name = container_name
+        self.stdout = stdout
+        self.stderr = stderr
+        self.returncode = returncode
 
 
 def load_eval_environment() -> None:
@@ -138,6 +153,9 @@ WSL_ENV_KEYS = (
     "BENCH_CODEBUDDY_VERSION",
     "BENCH_CODEBUDDY_MODEL",
     "COMET_EVAL_CUSTOM_AGENT_ID",
+    "COMET_APPLICATION_EVAL_CONTEXT",
+    "COMET_EVAL_EXPERIMENT_ID",
+    "COMET_EVAL_PROJECT_ID",
     "COMET_EVAL_CUSTOM_EXECUTABLE",
     "COMET_EVAL_CUSTOM_CREDENTIALS",
     "COMET_EVAL_CUSTOM_MODEL",
@@ -195,8 +213,58 @@ def _bash_env(source_env: dict[str, str] | None = None) -> dict[str, str]:
     return env
 
 
-def run_shell(script, *args, timeout=None, check=True, env=None):
+def run_shell(script, *args, timeout=None, check=True, env=None, capture_to_file=False):
     cmd = [BASH_EXEC, _to_bash_path(SHELL_DIR / script)] + [_to_bash_path(a) for a in args]
+    if capture_to_file:
+        # On Windows, a Docker child can inherit Bash's stdout pipe. Python's
+        # subprocess.run waits for that pipe to close even after killing Bash,
+        # delaying the timeout handler that removes the named container.
+        container_name = None
+        if script == "docker.sh" and args:
+            if args[0] == "run-agent" and "--container-name" in args:
+                position = args.index("--container-name") + 1
+                container_name = args[position] if position < len(args) else None
+            elif args[0] in {"run-claude-loop", "run-agent-loop"} and len(args) > 1:
+                prefix = (
+                    "comet-eval-loop-" if args[0] == "run-claude-loop" else "comet-eval-agent-loop-"
+                )
+                container_name = (
+                    prefix + hashlib.sha256(_to_bash_path(args[1]).encode()).hexdigest()[:24]
+                )
+        with (
+            observe_eval_container(container_name),
+            tempfile.TemporaryFile() as stdout_file,
+            tempfile.TemporaryFile() as stderr_file,
+        ):
+            try:
+                result = subprocess.run(
+                    cmd,
+                    stdout=stdout_file,
+                    stderr=stderr_file,
+                    timeout=timeout,
+                    check=False,
+                    env=_bash_env(env),
+                )
+            except subprocess.TimeoutExpired as error:
+                stdout_file.seek(0)
+                stderr_file.seek(0)
+                raise subprocess.TimeoutExpired(
+                    cmd,
+                    error.timeout,
+                    output=stdout_file.read().decode("utf-8", errors="replace"),
+                    stderr=stderr_file.read().decode("utf-8", errors="replace"),
+                ) from error
+            stdout_file.seek(0)
+            stderr_file.seek(0)
+            completed = subprocess.CompletedProcess(
+                cmd,
+                result.returncode,
+                stdout_file.read().decode("utf-8", errors="replace"),
+                stderr_file.read().decode("utf-8", errors="replace"),
+            )
+            if check:
+                completed.check_returncode()
+            return completed
     return subprocess.run(
         cmd,
         capture_output=True,
@@ -271,22 +339,16 @@ def run_claude_in_docker(
     base_url=None,
     environment=None,
 ):
-    if not check_docker_available():
-        raise RuntimeError("Docker not available")
-    cmd = ["run-claude", str(test_dir), prompt, "--timeout", str(timeout)]
-    if model:
-        cmd.extend(["--model", model])
-    if image_id:
-        cmd.extend(["--image-id", image_id])
-    child_env = environment
-    if child_env is None and (model or base_url):
-        child_env = build_agent_environment(
-            ResolvedExecution("claude-code", model, base_url, {}),
-        )
-    try:
-        return run_shell("docker.sh", *cmd, timeout=timeout + 30, check=False, env=child_env)
-    except subprocess.TimeoutExpired:
-        return subprocess.CompletedProcess(cmd, 124, "", f"Timeout after {timeout}s")
+    return run_agent_in_docker(
+        test_dir,
+        prompt,
+        agent="claude-code",
+        timeout=timeout,
+        model=model,
+        image_id=image_id,
+        base_url=base_url,
+        environment=environment,
+    )
 
 
 def run_agent_in_docker(
@@ -304,28 +366,107 @@ def run_agent_in_docker(
     agent_id = validate_agent_id(agent)
     if not check_docker_available():
         raise RuntimeError("Docker not available")
-    cmd = ["run-agent", str(test_dir), prompt, "--agent", agent_id]
-    if model:
-        cmd.extend(["--model", model])
-    cmd.extend(["--timeout", str(timeout)])
-    if image_id:
-        cmd.extend(["--image-id", image_id])
+    cmd = ["run-agent", str(test_dir)]
+    container_name = "comet-eval-turn-" + uuid4().hex
+    original_error = None
+    result = None
+    prompt_file = None
     child_env = environment
     if child_env is None and (model or base_url):
         child_env = build_agent_environment(
             ResolvedExecution(agent_id, model, base_url, {}),
         )
     try:
-        return run_shell("docker.sh", *cmd, timeout=timeout + 30, check=False, env=child_env)
-    except subprocess.TimeoutExpired:
-        return subprocess.CompletedProcess(cmd, 124, "", f"Timeout after {timeout}s")
+        if agent_id in {"claude-code", "codex"}:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                newline="",
+                prefix="comet-eval-prompt-",
+                suffix=".txt",
+                delete=False,
+            ) as handle:
+                prompt_file = Path(handle.name)
+                handle.write(prompt)
+            cmd.extend(["--prompt-file", str(prompt_file)])
+        else:
+            cmd.append(prompt)
+        cmd.extend(["--agent", agent_id])
+        if model:
+            cmd.extend(["--model", model])
+        cmd.extend(["--timeout", str(timeout)])
+        if image_id:
+            cmd.extend(["--image-id", image_id])
+        cmd.extend(["--container-name", container_name])
+        result = run_shell(
+            "docker.sh",
+            *cmd,
+            timeout=timeout + 30,
+            check=False,
+            env=child_env,
+            capture_to_file=True,
+        )
+        return result
+    except subprocess.TimeoutExpired as error:
+        original_error = error
+        stdout = (
+            error.stdout.decode("utf-8", errors="replace")
+            if isinstance(error.stdout, bytes)
+            else (error.stdout or "")
+        )
+        stderr = (
+            error.stderr.decode("utf-8", errors="replace")
+            if isinstance(error.stderr, bytes)
+            else (error.stderr or "")
+        )
+        result = subprocess.CompletedProcess(
+            cmd, 124, stdout, "\n".join(filter(None, (stderr, f"Timeout after {timeout}s")))
+        )
+        return result
+    except BaseException as error:
+        original_error = error
+        raise
+    finally:
+        cleanup_error = None
+        try:
+            cleanup = run_shell(
+                "docker.sh", "cleanup-agent-turn", container_name, timeout=30, check=False
+            )
+            if cleanup.returncode != 0:
+                cleanup_error = (
+                    cleanup.stderr or cleanup.stdout or f"cleanup exited {cleanup.returncode}"
+                )
+        except Exception as error:
+            cleanup_error = str(error)
+        if prompt_file is not None:
+            try:
+                prompt_file.unlink(missing_ok=True)
+            except OSError as error:
+                cleanup_error = "; ".join(
+                    filter(None, (cleanup_error, f"prompt cleanup failed: {error}"))
+                )
+        if cleanup_error:
+            original = (
+                str(original_error)
+                if original_error
+                else (result.stderr if result else "Agent turn did not complete")
+            )
+            raise AgentContainerCleanupError(
+                f"Agent container cleanup is incomplete for {container_name}: {cleanup_error}; original result: {original}",
+                container_name=container_name,
+                stdout=result.stdout if result else "",
+                stderr=result.stderr if result else str(original_error or ""),
+                returncode=result.returncode if result else None,
+            ) from original_error
 
 
 def run_claude_loop_in_docker(test_dir, loop_args, timeout=600, environment=None):
     """Run the interactive driver and remove its container after host-side timeout."""
     cmd = ["run-claude-loop", str(test_dir), *loop_args]
     try:
-        return run_shell("docker.sh", *cmd, timeout=timeout, check=False, env=environment)
+        return run_shell(
+            "docker.sh", *cmd, timeout=timeout, check=False, env=environment, capture_to_file=True
+        )
     except subprocess.TimeoutExpired as error:
         cleanup_error = ""
         try:
@@ -360,7 +501,9 @@ def run_agent_loop_in_docker(test_dir, loop_args, timeout=600, environment=None)
     """Run the shared interactive driver for a non-default evaluation agent."""
     cmd = ["run-agent-loop", str(test_dir), *loop_args]
     try:
-        return run_shell("docker.sh", *cmd, timeout=timeout, check=False, env=environment)
+        return run_shell(
+            "docker.sh", *cmd, timeout=timeout, check=False, env=environment, capture_to_file=True
+        )
     except subprocess.TimeoutExpired as error:
         cleanup_error = ""
         try:

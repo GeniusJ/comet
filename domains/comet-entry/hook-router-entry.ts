@@ -1,25 +1,17 @@
 import path from 'path';
-import { realpathSync } from 'fs';
+import os from 'os';
+import { promises as fs, realpathSync } from 'fs';
 import { fileURLToPath, pathToFileURL } from 'url';
 
-import { discoverNativeProject } from '../comet-native/native-paths.js';
 import {
   COMET_HOOK_PLATFORM_IDS,
   readCometHookRequest,
   renderCometHookDecision,
 } from '../../platform/process/hook-adapter.js';
-import { runWithHookReadCache } from '../../platform/process/hook-read-cache.js';
-import { inspectCometHook } from './hook-router.js';
 import type { CometHookDecision } from '../workflow-contract/hook.js';
-import { resolveCometHookProjectRoot } from './hook-project-root.js';
-import { readWorkflowProjectConfig } from '../workflow-contract/project-config-reader.js';
+import type { ParsedArgs } from './hook-router-guard-entry.js';
 
 const USAGE = 'Usage: comet-hook-router --platform <platform-id> [--project-root <project-root>]';
-
-interface ParsedArgs {
-  platformId: string;
-  projectRoot?: string;
-}
 
 function parseArgs(args: readonly string[]): ParsedArgs {
   let platformId: string | undefined;
@@ -44,31 +36,64 @@ function parseArgs(args: readonly string[]): ParsedArgs {
   return { platformId, ...(projectRoot ? { projectRoot: path.resolve(projectRoot) } : {}) };
 }
 
-export async function projectRootFrom(
-  parsed: ParsedArgs,
-  request?: Awaited<ReturnType<typeof readCometHookRequest>>,
-): Promise<string | null> {
-  if (parsed.projectRoot) {
-    const candidate = request
-      ? await resolveCometHookProjectRoot(parsed.projectRoot, request)
-      : parsed.projectRoot;
-    return configuredProjectFrom(candidate);
+/**
+ * Cheap filesystem probe mirroring the heavy discovery boundaries: walk up
+ * from the start directory; a `.comet` entry marks a possible project, a
+ * `.git` entry is where discovery stops and reports that directory, whose
+ * `.comet` absence was already checked this round. The home directory gets
+ * the same pass the heavy discovery gives it, so a user-level `.comet` state
+ * directory above the real project chain does not force the heavy path.
+ */
+async function hasCometTrace(startDirectory: string): Promise<boolean> {
+  let cursor = path.resolve(startDirectory);
+  try {
+    if (!(await fs.stat(cursor)).isDirectory()) cursor = path.dirname(cursor);
+  } catch {
+    cursor = path.dirname(cursor);
   }
-  // A Router without --project-root is a legacy/global installation. It must
-  // use the host-provided working directory when one is available; the
-  // process cwd is often the directory where the global Hook was installed,
-  // not the project that owns the current tool request. Without a trusted
-  // request cwd there is no safe project to inspect, so leave the legacy Hook
-  // neutral instead of applying another project's phase guard.
-  if (!request?.cwd) return null;
-
-  const discoveryStart = request.cwd;
-  return configuredProjectFrom(discoveryStart);
+  const fallback = cursor;
+  const home = path.resolve(os.homedir());
+  while (true) {
+    const isHomeBoundary = cursor === home && fallback !== home;
+    if (!isHomeBoundary) {
+      try {
+        await fs.lstat(path.join(cursor, '.comet'));
+        return true;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      }
+    }
+    try {
+      await fs.lstat(path.join(cursor, '.git'));
+      return false;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+    const parent = path.dirname(cursor);
+    if (parent === cursor) return false;
+    cursor = parent;
+  }
 }
 
-async function configuredProjectFrom(projectRoot: string): Promise<string | null> {
-  const discovered = await discoverNativeProject(projectRoot);
-  return (await readWorkflowProjectConfig(discovered)) === null ? null : discovered;
+type CometHookGuardModule = typeof import('./hook-router-guard-entry.js');
+let guardModule: Promise<CometHookGuardModule> | undefined;
+
+// In source form this resolves to the sibling TS module. The runtime build
+// rewrites the specifier to the sibling bundle `comet-hook-router-guard.mjs`,
+// so the guard graph is only parsed when a decision actually needs it.
+function loadCometHookGuard(): Promise<CometHookGuardModule> {
+  guardModule ??= (async () => {
+    try {
+      // Match the CLI startup optimization for standalone Hook processes.
+      // Missing support or an unwritable cache never changes the decision.
+      const { enableCompileCache } = await import('node:module');
+      enableCompileCache?.();
+    } catch {
+      // Continue with the same fresh Runtime reads when caching is unavailable.
+    }
+    return import('./hook-router-guard-entry.js');
+  })();
+  return guardModule;
 }
 
 export async function runCometHookRouter(args: readonly string[]): Promise<number> {
@@ -83,10 +108,24 @@ export async function runCometHookRouter(args: readonly string[]): Promise<numbe
   let decision: CometHookDecision;
   try {
     const request = await readCometHookRequest();
-    const projectRoot = await projectRootFrom(parsed, request);
-    decision = projectRoot
-      ? await runWithHookReadCache(() => inspectCometHook(projectRoot, request))
-      : { allowed: true, reason: 'No Comet project discovered' };
+    // 确定不写文件的事件不依赖项目配置或 Git worktree 归属。
+    // context 事件仍进入项目发现，以便加载当前任务上下文。
+    if (request.intent === 'non-write') {
+      decision = { allowed: true, reason: 'Hook event is not a write' };
+    } else if (!parsed.projectRoot && !request.cwd) {
+      decision = { allowed: true, reason: 'No Comet project discovered' };
+    } else if (
+      request.intent !== 'write' &&
+      !parsed.projectRoot &&
+      request.cwd &&
+      !(await hasCometTrace(request.cwd))
+    ) {
+      decision = { allowed: true, reason: 'No Comet project discovered' };
+    } else {
+      // 项目记录丢失时，写入事件仍须检查用户级 Runtime，不能按无项目记录直接放行。
+      const guard = await loadCometHookGuard();
+      decision = await guard.runCometHookRouterGuard(parsed, request);
+    }
   } catch (error) {
     decision = {
       allowed: false,

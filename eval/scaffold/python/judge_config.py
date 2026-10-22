@@ -18,6 +18,7 @@ from scaffold.python.execution import (
     redact_sensitive,
     resolve_judge,
 )
+from scaffold.python.progress import publish_eval_progress
 
 
 _ANTHROPIC_PROVIDER_KEYS = (
@@ -66,8 +67,7 @@ def build_judge_invocation(
         and agent is None
         and model is None
         and base_url is None
-        and str(source.get("BENCH_LLM_JUDGE", "")).strip().lower()
-        not in {"1", "true", "yes", "on"}
+        and str(source.get("BENCH_LLM_JUDGE", "")).strip().lower() not in {"1", "true", "yes", "on"}
     ):
         manifest = {}
     main = ResolvedExecution(main_agent, None, None, {})
@@ -135,14 +135,17 @@ def run_judge_prompt(
     except ValueError as e:
         return f"[RUBRIC-JUDGE] status: skipped - {e}"
 
-    if (
-        invocation.agent == "claude-code"
-        and invocation.base_url
-        and (invocation.auth_token or invocation.api_key)
-    ):
-        return _run_judge_http(prompt, invocation, timeout=timeout)
-
-    return _run_judge_agent_cli(prompt, invocation, timeout=timeout, evidence=evidence)
+    publish_eval_progress("judging")
+    try:
+        if (
+            invocation.agent == "claude-code"
+            and invocation.base_url
+            and (invocation.auth_token or invocation.api_key)
+        ):
+            return _run_judge_http(prompt, invocation, timeout=timeout)
+        return _run_judge_agent_cli(prompt, invocation, timeout=timeout, evidence=evidence)
+    finally:
+        publish_eval_progress("running")
 
 
 def _messages_url(base_url: str) -> str:

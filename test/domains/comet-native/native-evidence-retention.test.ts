@@ -298,7 +298,7 @@ describe('Native evidence retention', () => {
       expect.objectContaining({
         code: 'evidence-retention-recovery-required',
         severity: 'warning',
-        path: expect.not.stringMatching(/^[A-Za-z]:|^\//u),
+        path: path.join(nativeChangeRuntimeDir(paths, CHANGE), 'evidence'),
       }),
     );
     await expect(fs.access(original)).rejects.toMatchObject({ code: 'ENOENT' });

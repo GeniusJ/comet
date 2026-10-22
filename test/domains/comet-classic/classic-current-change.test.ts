@@ -1,3 +1,4 @@
+import { isWorkspaceRuntimeMigrationFence } from '../../../domains/workflow-contract/workspace-runtime.js';
 import { execFileSync } from 'child_process';
 import { promises as fs } from 'fs';
 import os from 'os';
@@ -96,7 +97,9 @@ describe('Classic current change selection', () => {
     expect((await fs.readdir(path.join(root, '.comet'))).sort()).toEqual([
       'config.yaml',
       'current-change.json',
+      'runtime',
     ]);
+    expect(await isWorkspaceRuntimeMigrationFence(path.join(root, '.comet', 'runtime'))).toBe(true);
   });
 
   it('refuses to select a change whose bound branch drifted', async () => {
@@ -314,7 +317,9 @@ describe('Classic current change selection', () => {
     expect((await fs.readdir(path.join(root, '.comet'))).sort()).toEqual([
       'config.yaml',
       'current-change.json',
+      'runtime',
     ]);
+    expect(await isWorkspaceRuntimeMigrationFence(path.join(root, '.comet', 'runtime'))).toBe(true);
   });
 
   it('clears the selection idempotently', async () => {

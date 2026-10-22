@@ -9,7 +9,8 @@ import {
   type FileObjectIdentity,
 } from '../../platform/fs/file-identity.js';
 import { classicLayoutPaths } from '../comet-classic/classic-layout.js';
-import { nativeProjectPaths } from '../comet-native/native-paths.js';
+import { resolveArtifactRoot } from '../comet-native/native-paths.js';
+import { isWorkspaceRuntimeMigrationFence } from '../workflow-contract/workspace-runtime.js';
 import {
   readWorkflowProjectConfigIdentity,
   readWorkflowProjectConfigSnapshot,
@@ -607,7 +608,7 @@ async function removeManagedWorkingTree(
   return { removed, failed: 0 };
 }
 
-async function removeManagedProjectConfigAfterFailedCleanup(
+async function removeManagedProjectConfig(
   projectRoot: string,
   expectedIdentity: WorkflowProjectConfigIdentity,
 ): Promise<RemovalResult> {
@@ -1584,6 +1585,7 @@ async function removeWorkingDirs(
   const docsOpenSpecRoot = path.join(docsDir, 'openspec');
 
   let plans: ManagedWorkingTreePlan[];
+  let preservedCometPlan: ManagedWorkingTreePlan | null = null;
   let configIdentity: WorkflowProjectConfigIdentity | undefined;
   let removeProjectConfigOnFailure = false;
   try {
@@ -1637,12 +1639,26 @@ async function removeWorkingDirs(
       }
     }
 
+    const runtimeFencePath = path.join(cometDir, 'runtime');
+    let preserveRuntimeFence = false;
+    if (await assertWorkingTreeAbsentOrRealDirectory(projectRoot, cometDir)) {
+      try {
+        if ((await lstat(runtimeFencePath)).isFile()) {
+          preserveRuntimeFence = await isWorkspaceRuntimeMigrationFence(runtimeFencePath);
+        }
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      }
+    }
     const cometTree = cloneManagedWorkingTree(
       workflowsToRemove === undefined || workflowsToRemove.length === configuredWorkflows.length
         ? COMET_WORKING_TREE
         : EMPTY_MANAGED_WORKING_TREE,
     );
-    if (nativeEnabled && !selectiveWorkflowRemoval) {
+    if (preserveRuntimeFence && Object.keys(cometTree).length > 0) {
+      setManagedWorkingTreeEntry(cometTree, 'runtime', 'file');
+    }
+    if (nativeEnabled && !selectiveWorkflowRemoval && !preserveRuntimeFence) {
       mergeManagedWorkingTree(cometTree, ['runtime', 'native'], NATIVE_RUNTIME_WORKING_TREE);
     }
     const docsTree: ManagedWorkingTree = removingClassicWorkingDirs
@@ -1658,38 +1674,39 @@ async function removeWorkingDirs(
     let separateNativeRoot: string | null = null;
     if (nativeEnabled) {
       if (!document?.native) throw new Error('Native project config is incomplete');
-      const nativePaths = await nativeProjectPaths(projectRoot, document.native.artifact_root);
-      if (isInsideDirectory(docsDir, nativePaths.nativeRoot)) {
+      // 卸载只定位便携文档，不能因查询路径而初始化或迁移本机 Runtime。
+      const nativeRoot = path.join(
+        await resolveArtifactRoot(projectRoot, document.native.artifact_root),
+        'comet',
+      );
+      if (isInsideDirectory(docsDir, nativeRoot)) {
         if (splitDocsWorkingTrees || selectiveWorkflowRemoval) {
-          separateNativeRoot = nativePaths.nativeRoot;
+          separateNativeRoot = nativeRoot;
         } else {
           mergeManagedWorkingTree(
             docsTree,
-            path.relative(docsDir, nativePaths.nativeRoot).split(path.sep).filter(Boolean),
+            path.relative(docsDir, nativeRoot).split(path.sep).filter(Boolean),
             NATIVE_WORKING_TREE,
           );
         }
-      } else if (isInsideDirectory(cometDir, nativePaths.nativeRoot)) {
+      } else if (isInsideDirectory(cometDir, nativeRoot)) {
         if (selectiveWorkflowRemoval) {
-          separateNativeRoot = nativePaths.nativeRoot;
+          separateNativeRoot = nativeRoot;
         } else {
           mergeManagedWorkingTree(
             cometTree,
-            path.relative(cometDir, nativePaths.nativeRoot).split(path.sep).filter(Boolean),
+            path.relative(cometDir, nativeRoot).split(path.sep).filter(Boolean),
             NATIVE_WORKING_TREE,
           );
         }
-      } else if (
-        artifactLayout === 'legacy' &&
-        isInsideDirectory(legacyOpenSpecRoot, nativePaths.nativeRoot)
-      ) {
+      } else if (artifactLayout === 'legacy' && isInsideDirectory(legacyOpenSpecRoot, nativeRoot)) {
         mergeManagedWorkingTree(
           legacyTree,
-          path.relative(legacyOpenSpecRoot, nativePaths.nativeRoot).split(path.sep).filter(Boolean),
+          path.relative(legacyOpenSpecRoot, nativeRoot).split(path.sep).filter(Boolean),
           NATIVE_WORKING_TREE,
         );
       } else {
-        separateNativeRoot = nativePaths.nativeRoot;
+        separateNativeRoot = nativeRoot;
       }
     }
 
@@ -1710,7 +1727,7 @@ async function removeWorkingDirs(
     if (separateNativeRoot) {
       candidates.push([separateNativeRoot, NATIVE_WORKING_TREE, false]);
     }
-    if (nativeEnabled && selectiveWorkflowRemoval) {
+    if (nativeEnabled && selectiveWorkflowRemoval && !preserveRuntimeFence) {
       candidates.push([
         path.join(cometDir, 'runtime', 'native'),
         NATIVE_RUNTIME_WORKING_TREE,
@@ -1727,7 +1744,22 @@ async function removeWorkingDirs(
         managedTree,
         countRemoval,
       );
-      if (inspected) plans.push(inspected);
+      if (!inspected) continue;
+      if (directory === cometDir && preserveRuntimeFence) {
+        // 保留旧版写入屏障，也不移动它的父目录。用户级执行历史不属于卸载清理范围。
+        preservedCometPlan = inspected;
+        for (const [entry, tree] of Object.entries(managedTree)) {
+          if (tree === 'file') continue;
+          const childPlan = await inspectManagedWorkingTree(
+            projectRoot,
+            path.join(cometDir, entry),
+            tree,
+          );
+          if (childPlan) plans.push(childPlan);
+        }
+      } else {
+        plans.push(inspected);
+      }
     }
     await options.testHooks?.afterPlanInspection?.();
     if (
@@ -1738,6 +1770,7 @@ async function removeWorkingDirs(
     ) {
       throw new Error('Project config changed during uninstall planning');
     }
+    if (preservedCometPlan) await validateManagedWorkingTree(projectRoot, preservedCometPlan);
     for (const plan of plans) {
       await validateManagedWorkingTree(projectRoot, plan);
     }
@@ -1745,7 +1778,7 @@ async function removeWorkingDirs(
     const preservedContent = retainedWorkingDirectoryContent(error, cometDir);
     const configResult =
       removeProjectConfigOnFailure && configIdentity && preservedContent
-        ? await removeManagedProjectConfigAfterFailedCleanup(projectRoot, configIdentity)
+        ? await removeManagedProjectConfig(projectRoot, configIdentity)
         : { removed: 0, failed: 0 };
     if (preservedContent) {
       return {
@@ -1762,7 +1795,14 @@ async function removeWorkingDirs(
   }
 
   try {
-    return await removeManagedWorkingTree(projectRoot, plans);
+    const result = await removeManagedWorkingTree(projectRoot, plans);
+    if (!preservedCometPlan || result.failed > 0) return result;
+    const configResult = await removeManagedProjectConfig(projectRoot, configIdentity!);
+    return {
+      ...configResult,
+      removed: result.removed + configResult.removed,
+      preserved: [path.join(cometDir, 'runtime')],
+    };
   } catch (error) {
     return {
       removed: 0,

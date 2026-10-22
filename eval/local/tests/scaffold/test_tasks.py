@@ -2,6 +2,7 @@
 
 import importlib.util
 import json
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -135,15 +136,47 @@ def test_classic_layout_lifecycle_uses_current_cli_and_compatible_openspec():
 
     assert (environment / ".include-current-comet-cli").is_file()
     assert "FROM node:22" in dockerfile
-    assert "@fission-ai/openspec@1.5.0" in dockerfile
+    assert "COPY current-comet-package.json /opt/comet-cli/package.json" in dockerfile
+    assert "ln -s /opt/comet-cli/node_modules/.bin/openspec /usr/local/bin/openspec" in dockerfile
     assert "mkdir -p openspec/changes" not in dockerfile
-    assert "/workspace/_eval_current_comet" in wrapper
-    assert 'runtime="$(mktemp -d)"' in wrapper
-    assert dependency_snapshot["dependencies"] == package["dependencies"]
+    assert "/opt/comet-current" in wrapper
+    assert dependency_snapshot["dependencies"] == package["dependencies"] | {
+        "@fission-ai/openspec": "^1.11.0"
+    }
     assert task.default_treatments == [
         "COMET_CLASSIC_DOCS_LAYOUT",
         "COMET_CLASSIC_LEGACY_LAYOUT",
     ]
+
+
+@pytest.mark.parametrize(
+    ("environment_ref", "extra_dependencies"),
+    [
+        ("scaffold/environments/workflow-application", {}),
+        (
+            "local/tasks/comet-classic-layout-lifecycle/environment",
+            {"@fission-ai/openspec": "^1.11.0"},
+        ),
+        (
+            "local/tasks/comet-native-workflow/environment",
+            {"@fission-ai/openspec": "^1.11.0"},
+        ),
+        ("local/tasks/comet-native-wave-f-dashboard-readonly/environment", {}),
+    ],
+)
+def test_current_cli_environments_keep_runtime_dependencies_and_overrides(
+    environment_ref, extra_dependencies
+):
+    source = Path(__file__).resolve().parents[4]
+    package = json.loads((source / "package.json").read_text(encoding="utf-8"))
+    snapshot = json.loads(
+        (source / "eval" / environment_ref / "current-comet-package.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    assert snapshot["dependencies"] == package["dependencies"] | extra_dependencies
+    assert snapshot.get("overrides", {}) == package.get("overrides", {})
 
 
 def test_comet_task_prompt_requires_real_comet_invocation():
@@ -220,10 +253,14 @@ def test_comet_task_index_lists_real_tasks():
     }
 
 
-def test_native_task_uses_its_own_skill_contract():
+def test_native_workflow_task_uses_current_sdk_cli_and_skill_contract():
     task = load_task("comet-native-workflow")
+    environment = get_tasks_dir() / "comet-native-workflow/environment"
 
     assert task.config.evaluation.profile == "generic"
+    assert task.default_treatments == ["COMET_NATIVE_SDK_CURRENT"]
+    assert (environment / ".include-current-comet-cli").is_file()
+    assert (environment / "current-comet.sh").is_file()
     assert task.config.evaluation.required_skills == ["comet-native"]
     assert task.config.evaluation.require_skill_invocation is True
     assert task.config.interaction.mode == "auto_user"
@@ -234,7 +271,9 @@ def test_native_task_uses_its_own_skill_contract():
     assert prompt.startswith("You are working on a Python project")
     assert "Begin by invoking the `/comet-native` Skill" in prompt
     assert "/comet` Skill/slash command" not in prompt
-    assert "portable `comet.native.v4` state" in prompt
+    assert "SDK Run" in prompt
+    assert "comet runtime dispatch" in prompt
+    assert "beta17" not in prompt
     assert "required final shared-understanding confirmation" in prompt
 
 
@@ -935,6 +974,7 @@ def test_native_interrupted_transition_fixture_is_recovered_by_current_runtime(t
         get_tasks_dir().parents[2] / "assets/skills/comet-native/scripts/comet-native-runtime.mjs"
     )
     change = workspace / "docs/comet/changes/add-character-counting"
+    data_root = tmp_path / "comet-data"
 
     def run_native(*args: str, expected_exit: int = 0) -> dict:
         result = subprocess.run(
@@ -950,6 +990,7 @@ def test_native_interrupted_transition_fixture_is_recovered_by_current_runtime(t
             capture_output=True,
             text=True,
             timeout=30,
+            env={**os.environ, "COMET_DATA_DIR": str(data_root)},
         )
         assert result.returncode == expected_exit, result.stdout or result.stderr
         return json.loads(result.stdout)
@@ -984,13 +1025,10 @@ def test_native_interrupted_transition_fixture_is_recovered_by_current_runtime(t
     repeated = run_native("doctor", "add-character-counting", "--repair")
     assert repeated["data"]["healthy"] is True
 
-    local_runtime = (
-        workspace
-        / ".comet"
-        / "runtime"
-        / "native"
-        / "changes"
-        / "add-character-counting"
+    local_runtimes = list(
+        data_root.glob("workspaces/*/runtime/native/changes/add-character-counting")
     )
+    assert len(local_runtimes) == 1
+    local_runtime = local_runtimes[0]
     assert (local_runtime / "state.json").exists()
     assert not (local_runtime / "trajectory.jsonl").exists()

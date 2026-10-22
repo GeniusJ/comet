@@ -1,5 +1,6 @@
 import { spawnSync } from 'child_process';
-import { readFileSync } from 'fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
+import { tmpdir } from 'os';
 import path from 'path';
 import { beforeAll, describe, expect, it } from 'vitest';
 import { ensureCliBuilt } from '../helpers/ensure-cli-built.js';
@@ -85,16 +86,16 @@ describe('CLI help text', () => {
     expect(publishHelp.status, publishHelp.stderr).toBe(0);
     expect(bundleHelp.status, bundleHelp.stderr).toBe(0);
     expect(skillHelp.status, skillHelp.stderr).toBe(0);
-    expect(creatorHelp.stdout).toContain('Create or resume Skill Creator candidates');
+    expect(creatorHelp.stdout).toContain('start [options] <name>');
+    expect(creatorHelp.stdout).toContain('dispatch [options] <name>');
     expect(creatorHelp.stdout).toContain('next [options] <name>');
-    expect(creatorHelp.stdout).toContain('generate [options] <name>');
     expect(publishHelp.stdout).toContain('Review, approve, publish, and distribute');
     expect(bundleHelp.stdout).toContain('Manage advanced /comet-any Bundle state and audits');
     expect(bundleHelp.stdout).not.toContain('factory-');
     expect(bundleHelp.stdout).not.toContain('authoring-plan');
     expect(bundleHelp.stdout).not.toContain('authoring-record');
-    expect(bundleHelp.stdout).not.toContain('list [options]');
-    expect(bundleHelp.stdout).not.toContain('status [options] <name>');
+    expect(bundleHelp.stdout).toContain('list [options]');
+    expect(bundleHelp.stdout).toContain('status [options] <name>');
     expect(skillHelp.stdout).toContain('Install, inspect, and debug local Skill packages');
     expect(skillHelp.stdout).toContain('add [options] <path>');
     expect(skillHelp.stdout).toContain('show [options] <skill>');
@@ -185,7 +186,10 @@ describe('CLI help text', () => {
 
     expect(evalHelp.status, evalHelp.stderr).toBe(0);
     expect(skillCheckHelp.status, skillCheckHelp.stderr).toBe(0);
-    expect(evalHelp.stdout).toContain('Evaluate a Skill or eval manifest and generate results');
+    expect(evalHelp.stdout).toContain(
+      'Evaluate a Skill, SDK application or eval manifest and generate results',
+    );
+    expect(evalHelp.stdout).toContain('SDK application.json');
     expect(evalHelp.stdout).toContain('Usage: comet eval [options] [target]');
     expect(evalHelp.stdout).toContain('--suite <suite>');
     expect(evalHelp.stdout).toContain('--model <model>');
@@ -228,7 +232,7 @@ describe('CLI help text', () => {
     expect(help.stdout).toContain('--platform <platform>');
   });
 
-  it('keeps Skill Creator resume commands out of the publish surface', () => {
+  it('keeps SDK Creator start, resume and action requests out of the publish surface', () => {
     const creatorHelp = runCli('creator', '--help');
     const publishHelp = runCli('publish', '--help');
 
@@ -236,11 +240,85 @@ describe('CLI help text', () => {
     expect(publishHelp.status, publishHelp.stderr).toBe(0);
     expect(creatorHelp.stdout).toContain('status [options] <name>');
     expect(creatorHelp.stdout).toContain('next [options] <name>');
+    expect(creatorHelp.stdout).toContain('start [options] <name>');
+    expect(creatorHelp.stdout).toContain('dispatch [options] <name>');
+    expect(creatorHelp.stdout).toContain('guide [options]');
     expect(publishHelp.stdout).not.toContain('list [options]');
     expect(publishHelp.stdout).not.toContain('status [options] <name>');
     expect(publishHelp.stdout).not.toContain('next [options] <name>');
+    expect(publishHelp.stdout).not.toContain('start [options] <name>');
+    expect(publishHelp.stdout).not.toContain('dispatch [options] <name>');
     expect(publishHelp.stdout).toContain('review [options] <name>');
     expect(publishHelp.stdout).toContain('distribute [options] <name>');
+  });
+
+  it('documents required goal, installation target, host and current SDK request inputs', () => {
+    const startHelp = runCli('creator', 'start', '--help');
+    const dispatchHelp = runCli('creator', 'dispatch', '--help');
+    expect(startHelp.status, startHelp.stderr).toBe(0);
+    expect(dispatchHelp.status, dispatchHelp.stderr).toBe(0);
+    for (const input of ['--goal <text>', '--install-target <directory>', '--host <host>'])
+      expect(startHelp.stdout).toContain(input);
+    expect(startHelp.stdout).toContain('codex');
+    expect(startHelp.stdout).toContain('claude-code');
+    expect(dispatchHelp.stdout).toContain('--request <path>');
+  });
+
+  it('distinguishes read-only Creator inspection from advancing local steps', () => {
+    const statusHelp = runCli('creator', 'status', '--help');
+    const nextHelp = runCli('creator', 'next', '--help');
+    expect(statusHelp.status, statusHelp.stderr).toBe(0);
+    expect(nextHelp.status, nextHelp.stderr).toBe(0);
+    expect(statusHelp.stdout).toContain('Read the current Creator Run');
+    expect(nextHelp.stdout).toContain('Advance local Creator steps');
+    expect(nextHelp.stdout).not.toContain('Print the single recommended');
+  });
+
+  it('documents Runtime request shape and complete application or portable workflow calls', () => {
+    const help = runCli('runtime', 'dispatch', '--help');
+    expect(help.status, help.stderr).toBe(0);
+    expect(help.stdout).toContain('--application native --request request.json --project-root .');
+    expect(help.stdout).toContain('--application-file ./application.json --request request.json');
+    expect(help.stdout).toContain('--workflow workflow.json --root-dir .comet/runs');
+    expect(help.stdout).toContain('{"operation":"inspect","runId":"change-name"}');
+    expect(help.stdout).toContain('classic-full, classic-hotfix, classic-tweak');
+  });
+
+  it('returns all missing Creator inputs in one machine-readable response', () => {
+    const result = runCli('creator', 'start', '--json');
+    expect(result.status).toBe(1);
+    expect(JSON.parse(result.stdout)).toMatchObject({
+      status: 'failed',
+      usage: {
+        command: 'comet creator start [options] <name>',
+        requiredArguments: ['<name>'],
+        missingOptions: ['--goal <text>', '--install-target <directory>'],
+        helpCommand: 'comet creator start --help',
+      },
+    });
+  });
+
+  it.each([
+    ['propose', ['--file', 'plan.json']],
+    ['init', ['--file', 'plan.json']],
+    ['resolve', ['--candidate', 'original']],
+    ['authoring-plan', []],
+    ['authoring-record', ['--lane', 'original', '--file', 'plan.json']],
+    ['generate', []],
+  ])('rejects legacy Creator %s without changing user files or creating a Run', (command, args) => {
+    const project = mkdtempSync(path.join(tmpdir(), 'comet-creator-legacy-cli-'));
+    const marker = path.join(project, 'plan.json');
+    const original = '{"userFile":"preserved"}\n';
+    writeFileSync(marker, original);
+    try {
+      const result = runCli('creator', command, 'original', '--project', project, ...args);
+      expect(result.status).toBe(1);
+      expect(result.stderr + result.stdout).toContain('error:');
+      expect(readFileSync(marker, 'utf8')).toBe(original);
+      expect(existsSync(path.join(project, '.comet'))).toBe(false);
+    } finally {
+      rmSync(project, { recursive: true, force: true });
+    }
   });
 
   it('uses eval wording for advanced Bundle evidence commands', () => {

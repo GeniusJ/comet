@@ -2,6 +2,7 @@ import { spawnSync } from 'child_process';
 import { promises as fs } from 'fs';
 import os from 'os';
 import path from 'path';
+import { createHash } from 'node:crypto';
 import { afterEach, describe, expect, it } from 'vitest';
 
 interface DependencyTestLayout {
@@ -128,6 +129,39 @@ async function makeMinimalRepository(): Promise<string> {
 }
 
 describe('architecture lint', () => {
+  it('accepts only registered archive modules whose bytes match the frozen manifest', async () => {
+    const root = await makeMinimalRepository();
+    await writeFile(root, '.gitignore', '');
+    const file = 'eval/archives/example/application/application.mjs';
+    const content = 'throw new Error("READ_ONLY_ARCHIVE");\n';
+    const layoutFile = path.join(root, 'config/repository-layout.json');
+    const layout = JSON.parse(await fs.readFile(layoutFile, 'utf8'));
+    layout.allowedCodeFiles = [file];
+    await fs.writeFile(layoutFile, JSON.stringify(layout));
+    await writeFile(root, file, content);
+    await writeFile(
+      root,
+      'eval/archives/example/archive.json',
+      JSON.stringify({
+        schema: 'comet.eval.archive.v1',
+        files: {
+          'application/application.mjs': createHash('sha256').update(content).digest('hex'),
+        },
+      }),
+    );
+    const check = () =>
+      spawnSync(process.execPath, [path.resolve('scripts/lint/architecture.mjs')], {
+        cwd: root,
+        encoding: 'utf8',
+      });
+    const accepted = check();
+    expect(accepted.stderr).toBe('');
+    expect(accepted.status).toBe(0);
+    await writeFile(root, file, 'export {};\n');
+    expect(check().stderr).toContain('not a verified frozen Eval artifact');
+    await writeFile(root, 'eval/archives/example/application/extra.mjs', 'export {};\n');
+    expect(check().stderr).toContain('code outside an approved code root');
+  });
   it('ignores Git-ignored ZCode runtime files', async () => {
     const root = await makeMinimalRepository();
     await writeFile(root, '.gitignore', '.zcode\n');
@@ -731,6 +765,46 @@ describe('architecture lint', () => {
     expect(result.status).toBe(1);
     expect(result.stderr).toContain(
       'domains/comet-classic/unreviewed.ts must not depend on restricted module domains/comet-classic/lock.ts',
+    );
+  });
+
+  it('registers the Native stop-evidence transaction without allowing unreviewed lock callers', async () => {
+    const repositoryLayout = JSON.parse(
+      await fs.readFile(path.resolve('config/repository-layout.json'), 'utf8'),
+    ) as DependencyTestLayout;
+    const target = 'domains/comet-native/native-mutation-lock.ts';
+    const importer = 'domains/comet-native/native-check-stop-evidence.ts';
+    const rule = repositoryLayout.dependencyRules.restrictedDependencies.find(
+      (entry) => entry.target === target,
+    );
+    expect(rule?.importers).toContain(importer);
+
+    const root = await makeMinimalRepository();
+    await writeFile(root, '.gitignore', '\n');
+    await writeFile(root, target, 'export const lock = true;\n');
+    const content = "import { lock } from './native-mutation-lock.js';\nexport { lock };\n";
+    await writeFile(root, importer, content);
+    const layoutPath = path.join(root, 'config/repository-layout.json');
+    const layout = JSON.parse(await fs.readFile(layoutPath, 'utf8')) as DependencyTestLayout;
+    layout.domainModules.push('comet-native');
+    layout.dependencyRules.restrictedDependencies = [
+      { ...rule!, importers: rule!.importers.filter((entry) => entry === importer) },
+    ];
+    await fs.writeFile(layoutPath, JSON.stringify(layout, null, 2));
+    const lint = () =>
+      spawnSync(process.execPath, [path.resolve('scripts/lint/architecture.mjs')], {
+        cwd: root,
+        encoding: 'utf8',
+      });
+    const approved = lint();
+    expect(approved.status, approved.stderr).toBe(0);
+
+    const unreviewed = 'domains/comet-native/native-unreviewed-stop.ts';
+    await writeFile(root, unreviewed, content);
+    const rejected = lint();
+    expect(rejected.status).toBe(1);
+    expect(rejected.stderr).toContain(
+      `${unreviewed} must not depend on restricted module ${target}`,
     );
   });
 });

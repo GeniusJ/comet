@@ -271,7 +271,7 @@ function inferredMetadata(code: string): FindingMetadata {
   };
 }
 
-function projectRelativePath(
+function findingPath(
   paths: NativeProjectPaths,
   state: NativeChangeState,
   finding: NativeFinding,
@@ -285,6 +285,7 @@ function projectRelativePath(
   } else {
     target = path.resolve(paths.projectRoot, ...finding.path.split(/[\\/]/u));
   }
+  if (isInsidePath(paths.workspaceRuntimeRoot, target)) return target;
   if (!isInsidePath(paths.projectRoot, target)) return null;
   const relative = path.relative(paths.projectRoot, target).replaceAll('\\', '/');
   return relative === '' ? '.' : relative;
@@ -320,7 +321,7 @@ export function structureNativeFindings(options: {
         code: finding.code,
         message: finding.message,
         severity: metadata.severity,
-        path: projectRelativePath(options.paths, options.state, finding),
+        path: findingPath(options.paths, options.state, finding),
         requiredAction: metadata.requiredAction,
         retryCommand: retryCommand(metadata.retry, options.state, finding.code),
         repairCommand:

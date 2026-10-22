@@ -206,10 +206,7 @@ def check_current_cli_init_smoke():
                     f"Current Comet init did not create a valid project config: {config_error}",
                 )
             classic = config.get("classic") if isinstance(config, dict) else None
-            if (
-                not isinstance(classic, dict)
-                or classic.get("artifact_layout") != expected_layout
-            ):
+            if not isinstance(classic, dict) or classic.get("artifact_layout") != expected_layout:
                 return failed(
                     "current_cli_init_smoke",
                     f"Current Comet init did not preserve the {expected_layout} Classic layout",
@@ -241,11 +238,35 @@ def _archived_candidates(changes_dir: Path):
 
 
 def _read_state(change_dir: Path):
-    state_path = change_dir / ".comet.yaml"
+    try:
+        state_path = _state_path(change_dir)
+    except (OSError, ValueError) as error:
+        return None, str(error)
     state, error = _read_yaml(state_path)
     if error:
         return None, f"Cannot validate {state_path.name}: {error}"
     return state, None
+
+
+def _state_path(change_dir: Path):
+    # 与 Classic 的 resolveClassicStateFile 契约一致：保留旧名，双来源拒绝读取。
+    relative = change_dir.absolute().relative_to(WORKSPACE.absolute())
+    cursor = WORKSPACE.absolute()
+    for part in relative.parts:
+        cursor = cursor / part
+        if cursor.is_symlink() or (hasattr(cursor, "is_junction") and cursor.is_junction()):
+            raise ValueError("Classic change path must not contain links")
+    found = []
+    for name in ("comet-state.yaml", ".comet.yaml"):
+        candidate = change_dir / name
+        if candidate.exists() or candidate.is_symlink():
+            found.append(candidate)
+    if len(found) > 1:
+        raise ValueError("Classic state files are ambiguous: comet-state.yaml and .comet.yaml both exist")
+    selected = found[0] if found else change_dir / "comet-state.yaml"
+    if selected.is_symlink() or not selected.is_file():
+        raise ValueError(f"Classic state must be a regular file: {selected.name}")
+    return selected
 
 
 def _terminal_state_error(change_dir: Path):
@@ -260,8 +281,154 @@ def _terminal_state_error(change_dir: Path):
     }
     for field, value in expected.items():
         if state.get(field) != value:
-            return f".comet.yaml {field} must be {value!r}"
+            return f"Classic state {field} must be {value!r}"
     return None
+
+
+def check_sdk_run():
+    """Require the current layout's archive to be backed by the same SDK Run."""
+    selected = CURRENT_LAYOUTS.get(current_treatment())
+    if selected is None:
+        return passed("sdk_run")
+    _layout, relative_changes, _forbidden = selected
+    candidates = _archived_candidates(WORKSPACE / relative_changes)
+    if not candidates:
+        return failed("sdk_run", "No archived Classic change identifies an SDK Run")
+    run, error = _inspect_classic_sdk_archive(candidates[-1])
+    if error:
+        return failed("sdk_run", error)
+    succeeded = {
+        action.get("stepId")
+        for action in run["actions"]
+        if isinstance(action, dict) and action.get("status") == "succeeded"
+    }
+    required = {"full.build.check", "full.verify.run", "full.archive.execute"}
+    if not required.issubset(succeeded):
+        return failed(
+            "sdk_run", f"Classic SDK Run lacks successful steps: {sorted(required - succeeded)}"
+        )
+    return passed("sdk_run")
+
+
+def _read_sdk_owner(name: str):
+    # 由当前 Runtime 校验工作区身份和 active/history 分区，不读取旧的固定路径。
+    inspection = subprocess.run(
+            [
+                "node", "--input-type=module", "-e",
+                "import { readSdkChangeOwner } from '/opt/comet-current/dist/domains/workflow-contract/change-runtime-owner.js';"
+                "process.stdout.write(JSON.stringify(await readSdkChangeOwner(process.argv[1], process.argv[2], process.argv[3], { readOnly: true })));",
+                str(WORKSPACE), "classic", name,
+            ],
+            cwd=WORKSPACE, capture_output=True, text=True, encoding="utf-8", timeout=30, check=False,
+    )
+    if inspection.returncode != 0:
+        raise ValueError(f"Read-only SDK owner inspection failed: {inspection.stderr}")
+    return json.loads(inspection.stdout)
+
+
+def _checkpoint_matches(source, run):
+    result = subprocess.run(
+        ["node", "--input-type=module", "-e",
+         "import { readFileSync } from 'node:fs';"
+         "import { portableRunCheckpointProjectionMatches } from '/opt/comet-current/dist/domains/engine/portable-run-checkpoint.js';"
+         "import YAML from '/opt/comet-current/node_modules/yaml/dist/index.js';"
+         "const {source,run}=JSON.parse(readFileSync(0,'utf8'));const checkpoint=YAML.parse(source).run_checkpoint;"
+         "process.stdout.write(JSON.stringify(portableRunCheckpointProjectionMatches(checkpoint,run)));"],
+        input=json.dumps({"source": source, "run": run}), capture_output=True,
+        text=True, encoding="utf-8", timeout=30, check=False,
+    )
+    if result.returncode != 0:
+        raise ValueError(f"Portable checkpoint validation failed: {result.stderr}")
+    return json.loads(result.stdout) is True
+
+
+def _inspect_classic_sdk_archive(archived: Path):
+    """Inspect the owning Run through Runtime, rather than trusting copied JSON."""
+    if len(archived.name) <= 11:
+        return None, "Classic archive name does not identify a change"
+    name = archived.name[11:]
+    try:
+        owner = _read_sdk_owner(name)
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        return None, f"Classic SDK owner is unavailable or invalid: {error}"
+    expected_owner = {
+        "schema": "comet.change-owner.v1",
+        "workflow": "classic",
+        "change": name,
+        "format": "sdk",
+        "application": "classic-full",
+        "runId": name,
+    }
+    if owner != expected_owner:
+        return None, "Classic change is not owned by the full SDK application"
+
+    try:
+        state_path = _state_path(archived)
+        source = state_path.read_text(encoding="utf-8")
+    except (OSError, ValueError) as error:
+        return None, f"Classic archive state is unavailable: {error}"
+    state, _error = _read_yaml(state_path)
+    checkpoint = state.get("run_checkpoint") if isinstance(state, dict) else None
+    if (
+        not source.startswith("# comet-execution: managed-run\n")
+        or not isinstance(checkpoint, dict)
+        or checkpoint.get("schema") not in {"comet.workflow-run-checkpoint.v1", "comet.workflow-run-checkpoint.v2"}
+        or not isinstance(checkpoint.get("hash"), str)
+        or not isinstance(checkpoint.get("run"), dict)
+        or checkpoint["run"].get("runId") != name
+    ):
+        return None, "Classic archive lacks a managed SDK Run checkpoint"
+
+    try:
+        with tempfile.TemporaryDirectory(prefix=".eval-sdk-", dir=WORKSPACE) as request_dir:
+            request = Path(request_dir) / "inspect.json"
+            request.write_text(
+                json.dumps({"operation": "inspect", "runId": name}), encoding="utf-8"
+            )
+            result = subprocess.run(
+                [
+                    "comet",
+                    "runtime",
+                    "dispatch",
+                    "--application",
+                    "classic-full",
+                    "--project-root",
+                    str(WORKSPACE),
+                    "--request",
+                    str(request),
+                ],
+                cwd=WORKSPACE,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                timeout=60,
+                check=False,
+            )
+        response = json.loads(result.stdout)
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as error:
+        return None, f"Cannot inspect Classic SDK Run: {error}"
+    if not isinstance(response, dict):
+        return None, "Classic SDK Run inspect returned an invalid response"
+    if result.returncode != 0 or response.get("status") != "succeeded":
+        return None, f"Classic SDK Run inspect failed: {response.get('error', result.stderr)}"
+    run = response.get("data")
+    actions = run.get("actions") if isinstance(run, dict) else None
+    workflow = run.get("workflow") if isinstance(run, dict) else None
+    if (
+        not isinstance(run, dict)
+        or run.get("runId") != name
+        or not isinstance(workflow, dict)
+        or workflow.get("id") != "comet-classic-full"
+        or run.get("status") != "completed"
+        or not isinstance(actions, list)
+    ):
+        return None, "Classic SDK Run is not the completed workflow for this archive"
+    try:
+        if not _checkpoint_matches(source, run):
+            return None, "Classic archive checkpoint does not match its current SDK Run"
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        return None, f"Classic archive checkpoint is invalid: {error}"
+    return run, None
 
 
 def _nonempty_file(path: Path):
@@ -351,6 +518,54 @@ def _read_json_lines(path: Path):
 
 
 def _transition_error(change_dir: Path):
+    state, state_error = _read_state(change_dir)
+    if state_error:
+        return state_error
+    owner = None
+    if _uses_current_layout():
+        try:
+            owner = _read_sdk_owner(change_dir.name[11:])
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            return f"Classic owner is unavailable or invalid: {error}"
+        if owner is not None and not isinstance(owner, dict):
+            return "Classic owner is invalid"
+    managed = (
+        _state_path(change_dir)
+        .read_text(encoding="utf-8")
+        .startswith("# comet-execution: managed-run\n")
+    )
+    if managed or "run_checkpoint" in state or (owner and owner.get("format") == "sdk"):
+        run, error = _inspect_classic_sdk_archive(change_dir)
+        if error:
+            return error
+        # Successful Actions are appended in execution order. Retries may add
+        # failed/cancelled attempts, but cannot substitute for a successful step.
+        required = (
+            "full.open",
+            "full.open.revalidate",
+            "full.design.handoff",
+            "full.design.document",
+            "full.build.configure",
+            "full.build.plan",
+            "full.build.execute",
+            "full.build.check",
+            "full.verify.run",
+            "full.verify.check",
+            "full.archive.prepare",
+            "full.archive.preflight",
+            "full.archive.execute",
+            "full.archive.deliver",
+        )
+        successful = iter(
+            action.get("stepId")
+            for action in run["actions"]
+            if isinstance(action, dict) and action.get("status") == "succeeded"
+        )
+        for step in required:
+            if not any(observed == step for observed in successful):
+                return f"Classic SDK trajectory lacks ordered successful step: {step}"
+        return None
+
     events_path = change_dir / ".comet/state-events.jsonl"
     events, error = _read_json_lines(events_path)
     if error:
@@ -550,8 +765,8 @@ def check_workflow_phases():
         )
 
     # Frozen legacy treatments retain their existing artifact-based compatibility
-    # signal; current docs and legacy treatments require current state events and
-    # trajectory files.
+    # signal. Current layouts require verified SDK Actions or, for compat-owned
+    # changes, the original state events and trajectory files.
     # Look for evidence of multiple phases in any markdown files
     md_files = list(WORKSPACE.rglob("*.md"))
     all_content = " ".join(f.read_text() for f in md_files if f.exists())
@@ -582,6 +797,8 @@ def main():
     results.append(check_sentence_feature())
     results.append(check_tests_exist())
     results.append(check_comet_state())
+    if _uses_current_layout():
+        results.append(check_sdk_run())
     results.append(check_workflow_phases())
 
     passed_list = [r["check"] for r in results if r["status"] == "passed"]

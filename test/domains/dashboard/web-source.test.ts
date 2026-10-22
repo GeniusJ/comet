@@ -66,6 +66,19 @@ async function readWorkspaceLayoutSource(): Promise<string> {
 }
 
 describe('dashboard web source contracts', () => {
+  it.runIf(websiteCheckoutAvailable)(
+    'passes the homepage language through to the embedded Dashboard',
+    async () => {
+      const snippet = await readWebsiteDemoSnippet();
+      expect(snippet).toContain('window.location.href, language');
+      expect(snippet).toContain('}, [language]);');
+      for (const language of ['zh', 'en']) {
+        const home = await fs.readFile(path.resolve('website', language, 'home.mdx'), 'utf8');
+        expect(home).toContain(`<DashboardWebsiteDemo language="${language}" />`);
+      }
+    },
+  );
+
   it('builds the JSON-wrapped assets consumed by the website demo', async () => {
     const source = await readWebsiteDemoBuildScript();
 
@@ -94,7 +107,9 @@ describe('dashboard web source contracts', () => {
     expect(source).toContain("useState(() => (useDemo ? 'classic' : null))");
     expect(source).toContain('pluginSelection || !workflow ? [] : [workflow]');
     expect(source).toContain("workflow === 'classic' ? (");
-    expect(source).toContain('setWorkflow(initialWorkflow.workflow)');
+    expect(source).toContain(
+      'setWorkflow(readDashboardNavigation().workflow ?? initialWorkflow.workflow)',
+    );
   });
 
   it('keeps cached plugin and settings data visible during fresh synchronization', async () => {
@@ -104,7 +119,7 @@ describe('dashboard web source contracts', () => {
     expect(source).toContain('if (!cachedPage) setPluginPage(null)');
     expect(source).toMatch(/else if \(!cached\) \{\s+setSettingsPage\(null\)/u);
     expect(source).not.toContain('message="正在同步最新数据…"');
-    expect(source).toContain('message="最新数据同步失败，当前显示缓存"');
+    expect(source).toContain("message={t('最新数据同步失败，当前显示缓存')}");
     expect(source).toContain('pluginPageCoordinatorRef.current.release');
     expect(source).toContain('projectConfigCoordinatorRef.current.release');
     expect(source).not.toContain('pluginPageCoordinatorRef.current.cancel');
@@ -136,7 +151,7 @@ describe('dashboard web source contracts', () => {
   it('centers the header search within the main workspace without rail compensation', async () => {
     const styles = await readDashboardStyles();
     const desktopHeaderLayout = styles.match(
-      /@media \(min-width: 1024px\)\s*\{[\s\S]*?\.comet-workbench-header\s*\{[\s\S]*?grid-template-columns:\s*minmax\(0,\s*1fr\)\s+minmax\(260px,\s*420px\)\s+minmax\(0,\s*1fr\);[\s\S]*?}\s*[\s\S]*?\.comet-header-search\s*\{[\s\S]*?grid-column:\s*2;[\s\S]*?position:\s*static;[\s\S]*?max-width:\s*420px;[\s\S]*?}\s*[\s\S]*?\.comet-header-actions\s*\{[\s\S]*?grid-column:\s*3;[\s\S]*?margin-left:\s*0;[\s\S]*?}\s*}/,
+      /@media \(min-width: 1024px\)\s*\{[\s\S]*?\.comet-workbench-header\s*\{[\s\S]*?grid-template-columns:\s*minmax\(180px,\s*1fr\)\s+minmax\(220px,\s*420px\)\s+minmax\(max-content,\s*1fr\);[\s\S]*?}\s*[\s\S]*?\.comet-header-search\s*\{[\s\S]*?grid-column:\s*2;[\s\S]*?position:\s*static;[\s\S]*?max-width:\s*420px;[\s\S]*?}\s*[\s\S]*?\.comet-header-actions\s*\{[\s\S]*?grid-column:\s*3;[\s\S]*?margin-left:\s*0;[\s\S]*?}\s*}/,
     );
 
     expect(desktopHeaderLayout).toBeTruthy();
@@ -167,7 +182,7 @@ describe('dashboard web source contracts', () => {
     expect(page?.[0]).toContain('dashboard-memory-registry');
     expect(page?.[0]).toContain('dashboard-memory-inspector');
     expect(page?.[0]).toContain('适用条件');
-    expect(page?.[0]).toContain("selectedRecord.category || selectedRecord.title || '个人记忆'");
+    expect(page?.[0]).toContain("selectedRecord.category || selectedRecord.title || t('个人记忆')");
     expect(page?.[0]).toContain('为什么应用：');
     expect(page?.[0]).toContain('items={data?.manifestPreview}');
     expect(page?.[0]).toContain('selectedRecord.applicationHistory');
@@ -205,13 +220,33 @@ describe('dashboard web source contracts', () => {
     );
   });
 
+  it('uses server-side memory search and bounded pagination with stale-response protection', async () => {
+    const source = await readDashboardSource();
+    const page =
+      source.match(/function PersonalMemoryCenter\([\s\S]*?\n}\n\nfunction AntSummaryCards/)?.[0] ??
+      '';
+    expect(page).toContain("invokeRef.current('manage'");
+    expect(page).toContain('managementFilter: memoryFilter');
+    expect(page).toContain('offset: memoryOffset');
+    expect(page).toContain('if (!current) return');
+    expect(page).toContain('memoryPage?.requestKey === requestKey');
+    expect(page).toContain('management.nextOffset');
+    expect(page).toContain('management.requiredBytes');
+    expect(page).toContain('management.total');
+    expect(page).toContain("invokeMemoryMutation('remove'");
+    expect(page).toContain('resetMemoryPage();');
+    expect(source).toContain(
+      "requestedPluginId === 'comet.personal-memory' && capability === 'manage'",
+    );
+  });
+
   it('explains personal memory budgets in plain language', async () => {
     const source = await readDashboardSource();
 
     expect(source).toContain('稳定偏好最多带入');
     expect(source).toContain('当前任务相关记忆最多带入');
     expect(source).toContain('不是记忆条数或存储容量');
-    expect(source).toContain('addonAfter="字符"');
+    expect(source).toContain("addonAfter={t('字符')}");
   });
 
   it('exposes the Project Knowledge registry and bounded management controls', async () => {
@@ -246,9 +281,9 @@ describe('dashboard web source contracts', () => {
     expect(settings?.[0]).toContain('tokenEnv');
     expect(settings?.[0]).toContain('tokenConfigured');
     expect(settings?.[0]).toContain('configure-provider');
-    expect(settings?.[0]).toContain('Provider 与检索');
+    expect(settings?.[0]).toContain('知识服务与检索');
     expect(settings?.[0]).toContain('本地索引');
-    expect(settings?.[0]).toContain('aria-label="切换当前项目知识检索"');
+    expect(settings?.[0]).toContain("aria-label={t('切换当前项目知识检索')}");
     expect(settings?.[0]).toContain("action: enabled ? 'enable' : 'disable'");
     expect(settings?.[0]).toContain('保存配置');
     expect(settings?.[0]).toContain("onInvoke('lifecycle', { action: 'uninstall' })");
@@ -265,12 +300,11 @@ describe('dashboard web source contracts', () => {
     expect(source).toContain('项目验证命令约束');
     expect(page?.[0]).toContain('标记已替代');
     expect(page?.[0]).toContain('仍会保留在历史记录中');
-    expect(page?.[0]).toContain("const [stateFilter, setStateFilter] = useState('active')");
-    expect(page?.[0]).toContain("['history', '历史版本']");
+    expect(page?.[0]).toContain("['history', t('历史版本')]");
     expect(page?.[0]).toContain('纠正并恢复');
     expect(page?.[0]).toContain('重新检查来源');
     expect(page?.[0]).toContain('建议补充证据，方便后续维护');
-    expect(source).toContain("capability === 'lifecycle' ? '插件状态已更新' : '操作已完成'");
+    expect(source).toContain("capability === 'lifecycle' ? t('插件状态已更新') : t('操作已完成')");
     expect(styles).toContain('.dashboard-knowledge-registry');
     expect(styles).toMatch(/\.dashboard-knowledge-registry\s*\{[\s\S]*?border: 0;/);
     expect(styles).toContain('.dashboard-knowledge-ledger-row');
@@ -327,7 +361,7 @@ describe('dashboard web source contracts', () => {
     expect(inspector?.[0]).toContain('同时参与文档检索');
   });
 
-  it('opens centralized plugin settings from the bottom of the sidebar', async () => {
+  it('opens centralized project and Eval settings from the bottom of the sidebar', async () => {
     const [source, modal, styles] = await Promise.all([
       readDashboardSource(),
       readDashboardModalSource(),
@@ -356,9 +390,7 @@ describe('dashboard web source contracts', () => {
     expect(source).toContain('DashboardPortalProvider,');
     expect(source).toContain('useDashboardModalState,');
     expect(source).toContain('<DashboardModal');
-    expect(source).toContain("aria-label={fullscreen ? '退出全屏' : '全屏展示'}");
-    expect(source).toContain('m0 4.5L15 15');
-    expect(source).not.toContain('m4.5 4.5L15 15');
+    expect(source).toContain("aria-label={t('关闭产物预览')}");
     expect(modal).toContain('mask={{ closable: true }}');
     expect(modal).toContain('dashboard-settings-modal-title-row');
     expect(modal).toContain('const fullscreenRef = useRef(false)');
@@ -367,12 +399,13 @@ describe('dashboard web source contracts', () => {
     expect(source).toContain('function PersonalMemorySettings');
     expect(source).toContain('function ProjectKnowledgeSettings');
     expect(source).toContain('function CometConfigSettings');
-    expect(source).toContain('aria-label="设置分类"');
+    expect(source).toContain("aria-label={t('设置分类')}");
     expect(source).toContain("label: '项目知识'");
-    expect(source).toContain("label: 'Comet 配置'");
-    expect(source).toContain('统一管理个人记忆、项目知识与工作流配置');
+    expect(source).toContain("label: t('Comet 配置')");
+    expect(source).toContain("{ key: 'comet.eval'");
+    expect(source).toContain('<EvalSettings readOnly={evalReadOnly} onSaved={onEvalSaved} />');
     expect(source).not.toContain('dashboard-settings-modal-icon');
-    expect(source).toContain('个人记忆存储方式');
+    expect(source).toContain('个人记忆服务');
     expect(source).toContain('tokenConfigured');
     expect(source).toContain('Comet 默认工作流');
     expect(source).toContain('Hook 允许写入路径');
@@ -417,7 +450,7 @@ describe('dashboard web source contracts', () => {
     expect(source).toContain('collapsedWidth={64}');
     expect(source).toContain('inlineCollapsed={collapsed}');
     expect(source).not.toContain('aria-hidden={collapsed}\n        inert={collapsed}');
-    expect(source).toContain("aria-label={collapsed ? '展开侧边栏' : '收起侧边栏'}");
+    expect(source).toContain("aria-label={collapsed ? t('展开侧边栏') : t('收起侧边栏')}");
     expect(source).toContain('className="dashboard-sidebar-group"');
     expect(source).toContain('inlineIndent={12}');
     expect(styles).toContain('.dashboard-sidebar-group + .dashboard-sidebar-group');
@@ -447,10 +480,10 @@ describe('dashboard web source contracts', () => {
 
     expect(source).toContain('className="dashboard-plugin-context-bar"');
     expect(source).not.toContain('title="个人记忆"');
-    expect(source).toContain('aria-label="项目规则状态与操作"');
+    expect(source).toContain("aria-label={t('项目规则状态与操作')}");
     expect(source).not.toContain('<h2>{page.label}</h2>');
     expect(styles).toContain('.dashboard-plugin-context-bar');
-    expect(styles).toContain('--dashboard-plugin-body-size: 13px');
+    expect(styles).toContain('--dashboard-plugin-body-size: 14px');
   });
 
   it('keeps personal memory and project knowledge mutations read-only in the website embed', async () => {
@@ -481,8 +514,12 @@ describe('dashboard web source contracts', () => {
     );
 
     expect(source).toContain('readOnly={embedded}');
-    expect(source).toContain('themeToggleDisabled={embedded}');
-    expect(source).toContain('disabled={themeToggleDisabled}');
+    const appearanceSource = await fs.readFile(
+      path.resolve('domains/dashboard/web/src/dashboard-appearance.jsx'),
+      'utf8',
+    );
+    expect(appearanceSource).toContain('disabled={embedded}');
+    expect(appearanceSource).toContain('dashboard-theme-options');
     expect(source).toContain("embedded ? ' is-embedded' : ''");
     expect(pluginPage?.[0]).toContain('readOnly = false');
     expect(pluginPage?.[0]).toContain('readOnly={readOnly}');
@@ -559,7 +596,7 @@ describe('dashboard web source contracts', () => {
     );
     expect(demoPluginEffect?.[0]).not.toContain('setPluginLoading(');
     expect(websiteEntry).toContain("import { DEMO_PLUGIN_PAGES } from '../demo.js'");
-    expect(websiteEntry).toContain('demoPluginPages={DEMO_PLUGIN_PAGES}');
+    expect(websiteEntry).toContain('demoPluginPages={localizedDemo(DEMO_PLUGIN_PAGES)}');
   });
 
   it.skipIf(!websiteCheckoutAvailable)(
@@ -600,7 +637,7 @@ describe('dashboard web source contracts', () => {
   it('uses the change-detail width to switch between stacked and two-column panels', async () => {
     const [source, styles] = await Promise.all([readDashboardSource(), readDashboardStyles()]);
 
-    expect(source).toContain('className="change-detail min-w-0"');
+    expect(source).toContain('className="change-detail classic-change-detail min-w-0"');
     expect(source).toContain('className="change-detail-panels grid min-w-0 gap-4"');
     expect(source).not.toContain('md:grid-cols-[minmax(0,1fr)_minmax(0,340px)]');
     expect(source).toMatch(
@@ -649,9 +686,9 @@ describe('dashboard web source contracts', () => {
   it('keeps the artifact table of contents behind fullscreen preview only', async () => {
     const source = await readDashboardSource();
 
-    expect(source).toContain('useDashboardModalState(Boolean(artifact))');
-    expect(source).toContain('dashboard-artifact-preview-expand');
-    expect(source).toContain("aria-label={fullscreen ? '退出全屏' : '全屏展示'}");
+    expect(source).toMatch(/useDashboardModalState\(\s*Boolean\(artifact\),?\s*\)/u);
+    expect(source).not.toContain('dashboard-artifact-preview-expand');
+    expect(source).toContain("aria-label={t('关闭产物预览')}");
     expect(source).toContain('{fullscreen && toc.length > 0 && (');
     expect(source).not.toContain('{toc.length > 0 && (');
   });
@@ -662,7 +699,11 @@ describe('dashboard web source contracts', () => {
     expect(styles).toContain('.md-github {');
     expect(styles).toContain('overflow-x: auto;');
     expect(styles).toContain('width: 100%;');
-    expect(styles).not.toContain('width: max-content;');
+    postcss.parse(styles).walkRules((rule) => {
+      if (rule.selector.includes('.md-github')) {
+        rule.walkDecls('width', (declaration) => expect(declaration.value).not.toBe('max-content'));
+      }
+    });
     expect(styles).toContain('.md-github th {');
     expect(styles).toContain('white-space: nowrap;');
   });
@@ -696,12 +737,32 @@ describe('dashboard web source contracts', () => {
     expect(styles).toContain('margin: 0;');
   });
 
+  it('keeps unknown Git status distinct from clean and labels bounded file previews', async () => {
+    const source = await readDashboardSource();
+    const summary = await fs.readFile('domains/dashboard/web/src/workflow-summary.jsx', 'utf8');
+    expect(source).toContain("git.dirtyFiles === null ? t('Git 状态未知')");
+    expect(source).toMatch(/snapshot.summary.dirtyFiles === null\s*\? t\('Git 状态未知'\)/u);
+    expect(summary).toContain('git?.dirtyFiles === null');
+    expect(summary).toContain('git?.dirtyEntriesTruncated');
+    expect(summary).toContain(
+      "t('仅显示前 {0} 项，共 {1} 个未提交文件', [files.length, git.dirtyFiles])",
+    );
+  });
+
   it('wraps artifact paths and exposes a copy control beside them', async () => {
     const source = await readDashboardSource();
 
     expect(source).toContain('break-all font-mono text-xs text-meta');
-    expect(source).toContain('aria-label="复制文件路径"');
-    expect(source).toContain("toast('路径已复制')");
+    expect(source).toContain("aria-label={t('复制文件路径')}");
+    const drawer = source.slice(
+      source.indexOf('function ArtifactDrawer('),
+      source.indexOf('function ProjectKnowledgePreviewModal('),
+    );
+    expect(drawer).toContain('const { message: messageApi } = AntApp.useApp();');
+    expect(drawer).toContain('await navigator.clipboard.writeText(preview.path);');
+    expect(drawer).toContain("messageApi.success(t('路径已复制'))");
+    expect(drawer).toContain("messageApi.error(t('复制失败'))");
+    expect(drawer).not.toMatch(/\btoast\(/u);
     expect(source).not.toContain('truncate font-mono text-xs text-meta');
   });
 

@@ -9,7 +9,18 @@ export const PROJECT_KNOWLEDGE_QUERY_BUDGETS = {
 const EN_STOP_WORDS = new Set(
   'a an and are as at be by for from in is it of on or that the this to with you your'.split(' '),
 );
-const ZH_STOP_WORDS = new Set(['请', '帮我', '一下', '这个', '进行', '实现', '需要', '如何']);
+const ZH_STOP_WORDS = new Set([
+  '请',
+  '帮我',
+  '一下',
+  '这个',
+  '进行',
+  '实现',
+  '需要',
+  '如何',
+  '流程',
+  '移动',
+]);
 
 function normalizedText(value: string, max = MAX_TASK_CHARS): string {
   return [...value]
@@ -59,6 +70,20 @@ function addChineseTerms(phrases: string[], weak: string[], text: string): void 
     const value = match[0];
     if (ZH_STOP_WORDS.has(value)) continue;
     addTerm(phrases, value);
+    const segments = [...segmenter.segment(value)];
+    // Keep adjacent meaningful words together; substrings alone overvalue generic words.
+    for (let index = 0; index < segments.length - 1; index += 1) {
+      const left = segments[index].segment;
+      const right = segments[index + 1].segment;
+      if (
+        left.length >= 2 &&
+        right.length >= 2 &&
+        !ZH_STOP_WORDS.has(left) &&
+        !ZH_STOP_WORDS.has(right)
+      ) {
+        addTerm(phrases, left + right);
+      }
+    }
     let previousSingle = '';
     for (const { segment, isWordLike } of segmenter.segment(value)) {
       if (isWordLike && !ZH_STOP_WORDS.has(segment)) addTerm(weak, segment);
@@ -87,8 +112,11 @@ function addLatinTerms(strong: string[], weak: string[], text: string): void {
     const lower = value.toLowerCase();
     if (EN_STOP_WORDS.has(lower)) continue;
     addTerm(looksExplicit(value) ? strong : weak, value);
-    if (value.includes('/')) {
-      for (const segment of value.split(/[/:.]/u)) addTerm(weak, segment);
+    if (/[/_:.-]|[a-z][A-Z]/u.test(value)) {
+      const words = value.replace(/([a-z0-9])([A-Z])/gu, '$1 $2').split(/[\s/_.:-]+/u);
+      for (const segment of words) {
+        if (!EN_STOP_WORDS.has(segment.toLocaleLowerCase())) addTerm(weak, segment);
+      }
     }
   }
   for (const match of text.matchAll(/\b\d+(?:\.\d+)?\b/gu)) addTerm(strong, match[0]);
@@ -156,7 +184,10 @@ export function createProjectKnowledgeQuery(input: {
   const strongTerms = strong.slice(0, PROJECT_KNOWLEDGE_QUERY_BUDGETS.strong);
   const phraseTerms = phrases.slice(0, PROJECT_KNOWLEDGE_QUERY_BUDGETS.phrase);
   const weakTerms = weak
-    .filter((term) => !strongTerms.includes(term) && !phraseTerms.includes(term))
+    .filter(
+      (term) =>
+        !ZH_STOP_WORDS.has(term) && !strongTerms.includes(term) && !phraseTerms.includes(term),
+    )
     .slice(0, PROJECT_KNOWLEDGE_QUERY_BUDGETS.weak);
   const terms = [...strongTerms, ...phraseTerms, ...weakTerms];
   const remoteQuery = [
@@ -182,6 +213,19 @@ export function queryContainsTerm(text: string, term: string): boolean {
   return text.toLocaleLowerCase().includes(term.toLocaleLowerCase());
 }
 
+export function projectKnowledgeHistoryRequested(query: ProjectKnowledgeQuery): boolean {
+  return (
+    /历史|旧版|以前|当时|\bhistor(?:y|ical)\b|\barchived\b/iu.test(query.task) ||
+    /(?:^|\/)archive(?:\/|$)/u.test(query.path ?? '')
+  );
+}
+
 export function queryHasStrongMatch(query: ProjectKnowledgeQuery, text: string): boolean {
   return query.strongTerms.some((term) => queryContainsTerm(text, term));
+}
+
+export function independentQueryTermCount(values: readonly string[]): number {
+  const terms = [...new Set(values.map((value) => value.toLocaleLowerCase()))];
+  return terms.filter((term) => !terms.some((other) => other !== term && other.includes(term)))
+    .length;
 }

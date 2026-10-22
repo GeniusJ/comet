@@ -64,7 +64,10 @@ describe('Native runtime release asset', () => {
     ]) {
       expect(source).toContain(command);
     }
-    expect(source).not.toMatch(/domains\/comet-classic|openspec|superpowers|requiredSkillCalls/iu);
+    // Agent 目录可以作为受保护的输入路径出现；检查实际的外部工作流调用。
+    expect(source).not.toMatch(
+      /domains\/comet-classic|openspec|superpowers:[a-z][a-z-]*|requiredSkillCalls/iu,
+    );
     expect(source).not.toMatch(/CLASSIC_RUN_STORAGE/u);
     expect(source).toContain('.comet/config.yaml');
     expect(source).toContain('Hook write target was not attributed to the guarded project');
@@ -72,10 +75,10 @@ describe('Native runtime release asset', () => {
     expect(source).not.toContain('comet.native.creation-authorization.v1');
     expect(source).not.toContain('comet.native.review-trust-policy.v2');
     expect(source).not.toContain('implementation-attestation');
-    expect(source).not.toContain('independent-review');
+    // 定制应用加载器使用同名的 Skill 完成条件；旧 Native 信任协议按其 schema 检查。
     expect(source).not.toContain('waiver-receipt');
     expect(source).not.toContain('trust authorize');
-    expect(source).toContain('new <change-name> [--language en|zh-CN]');
+    expect(source).toContain('new <change-name> [--runtime compat|sdk] [--language en|zh-CN]');
     const help = execFileSync(process.execPath, [runtime, '--help'], { encoding: 'utf8' });
     expect(help).toContain('skill-coordinated steps');
     expect(help).not.toMatch(/checkpoint|receipt|evidence|preflight|sha256|--result|--report/iu);
@@ -97,9 +100,11 @@ describe('Native runtime release asset', () => {
       'comet-native-show.mjs',
       'comet-native-status.mjs',
       'comet-native-select.mjs',
+      'comet-native-cancel.mjs',
       'comet-native-next.mjs',
       'comet-native-archive.mjs',
       'comet-native-doctor.mjs',
+      'comet-native-transfer.mjs',
     ];
     for (const script of commandScripts) {
       const source = await fs.readFile(path.join(scriptsDir, script), 'utf8');
@@ -134,7 +139,7 @@ describe('Native runtime release asset', () => {
       'utf8',
     );
 
-    expect(help).toContain('comet native new <change-name> [--language en|zh-CN]');
+    expect(help).toContain('comet native new <change-name> [--runtime compat|sdk]');
     expect(help).toContain('defaults to docs');
     for (const reference of [english, chinese]) {
       expect(reference).toContain('comet native <command> --help');

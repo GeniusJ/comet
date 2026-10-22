@@ -3,14 +3,39 @@ import path from 'node:path';
 
 const WINDOWS_TASKKILL_ATTEMPT_MS = 1_000;
 const WINDOWS_TASKKILL_ATTEMPTS = 2;
+const POSIX_GROUP_EXIT_WAIT_MS = 1_000;
 
+async function waitForPosixGroupExit(pid: number): Promise<boolean> {
+  const deadline = Date.now() + POSIX_GROUP_EXIT_WAIT_MS;
+  for (;;) {
+    try {
+      process.kill(-pid, 0);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === 'ESRCH') return true;
+      if (code !== 'EPERM') return false;
+    }
+    if (Date.now() >= deadline) return false;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+}
+
+/** 保留既有 best-effort 调用契约；需要清理证明的调用方使用确认版。 */
 export async function terminateProcessTree(child: ChildProcess): Promise<void> {
+  await terminateProcessTreeConfirmed(child);
+}
+
+/** 返回整树终止是否已确认；只杀掉组长不能证明 Windows 后代已退出。 */
+export async function terminateProcessTreeConfirmed(child: ChildProcess): Promise<boolean> {
   const pid = child.pid;
   if (pid === undefined) {
     child.kill('SIGKILL');
-    return;
+    return false;
   }
   if (process.platform === 'win32') {
+    const exited = () => typeof child.exitCode === 'number' || child.signalCode != null;
+    // 已退出的 ChildProcess 句柄不能授权再次按裸 PID 杀树，PID 可能已复用。
+    if (exited()) return false;
     const configuredSystemRoot = process.env.SystemRoot ?? process.env.WINDIR;
     const systemRoot =
       configuredSystemRoot && path.win32.isAbsolute(configuredSystemRoot)
@@ -42,21 +67,30 @@ export async function terminateProcessTree(child: ChildProcess): Promise<void> {
         }
       });
     for (let attempt = 0; attempt < WINDOWS_TASKKILL_ATTEMPTS; attempt += 1) {
+      if (exited()) return false;
       if (await runTaskkillAttempt()) {
         child.kill('SIGKILL');
-        return;
+        return true;
       }
     }
     child.kill('SIGKILL');
     child.stdin?.destroy();
     child.stdout?.destroy();
     child.stderr?.destroy();
-    return;
+    return false;
   }
   try {
     process.kill(-pid, 'SIGKILL');
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error;
+    const code = (error as NodeJS.ErrnoException).code;
+    // Darwin 的自清理进程组只剩僵尸时也可能返回 EPERM。仅复核整组消失，
+    // 不按死亡组长推断成功，也不重发信号给可能复用的 PGID。
+    if (
+      code !== 'ESRCH' &&
+      !(process.platform === 'darwin' && code === 'EPERM' && (await waitForPosixGroupExit(pid)))
+    )
+      throw error;
   }
   child.kill('SIGKILL');
+  return true;
 }

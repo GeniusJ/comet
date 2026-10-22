@@ -4,6 +4,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { stringify } from 'yaml';
+import { isWorkspaceRuntimeMigrationFence } from '../../../domains/workflow-contract/workspace-runtime.js';
+import { nativeDoctorCommand } from '../../../domains/comet-native/native-doctor-command.js';
 
 import {
   defaultProjectConfig,
@@ -20,6 +22,7 @@ import {
 } from '../../../domains/comet-native/native-portable-migration-runtime.js';
 import { createNativePortableChange } from '../../../domains/comet-native/native-portable-runtime.js';
 import type { NativeProjectPaths } from '../../../domains/comet-native/native-types.js';
+import { requireFileSymlink } from '../../helpers/file-symlink.js';
 import { writeNativeWorkspaceIdentity } from '../../../domains/comet-native/native-workspace.js';
 
 describe('Native portable migration Runtime', () => {
@@ -83,6 +86,83 @@ describe('Native portable migration Runtime', () => {
     return paths;
   }
 
+  async function migratedPortableChange() {
+    const paths = await portableChange();
+    const localRuntime = path.join(paths.changesRuntimeDir, 'portable-change');
+    const legacyRuntime = path.join(paths.changesDir, 'portable-change', 'runtime');
+    await fs.cp(localRuntime, legacyRuntime, { recursive: true });
+    await fs.rm(localRuntime, { recursive: true });
+    await nativeProjectPaths(paths.projectRoot, 'docs');
+    return { paths, localRuntime, legacyRuntime };
+  }
+
+  it('does not treat a validated migration fence as incomplete portable migration', async () => {
+    const { paths, localRuntime, legacyRuntime } = await migratedPortableChange();
+    const stateFile = path.join(localRuntime, 'state.json');
+    const stateBefore = await fs.readFile(stateFile);
+    const fenceBefore = await fs.readFile(legacyRuntime);
+    await expect(hasIncompleteNativePortableMigration(paths, 'portable-change')).resolves.toBe(
+      false,
+    );
+    await migrateNativeLegacyChangeToPortable({ paths, name: 'portable-change' });
+    expect(await fs.readFile(stateFile)).toEqual(stateBefore);
+    expect(await fs.readFile(legacyRuntime)).toEqual(fenceBefore);
+  });
+
+  it.for(['invalid-json', 'unknown-schema', 'different-change', 'symlink'] as const)(
+    'refuses migration cleanup with %s local state and preserves all evidence',
+    async (caseName, context) => {
+      if (caseName === 'symlink') await requireFileSymlink(context);
+      const { paths, localRuntime, legacyRuntime } = await migratedPortableChange();
+      const stateFile = path.join(localRuntime, 'state.json');
+      const value = JSON.parse(await fs.readFile(stateFile, 'utf8'));
+      if (caseName === 'unknown-schema') value.schema = 'comet.native.local-execution.future';
+      if (caseName === 'different-change') value.change = 'another-change';
+      const bytes = caseName === 'invalid-json' ? '{broken' : JSON.stringify(value);
+      if (caseName === 'symlink') {
+        const outside = path.join(paths.projectRoot, 'outside-state.json');
+        await fs.writeFile(outside, bytes);
+        await fs.unlink(stateFile);
+        await fs.symlink(outside, stateFile);
+      } else {
+        await fs.writeFile(stateFile, bytes);
+      }
+      const projection = path.join(paths.changesDir, 'portable-change', 'checkpoint.md');
+      const evidence = path.join(localRuntime, 'check.log');
+      await fs.writeFile(projection, 'old projection');
+      await fs.writeFile(evidence, 'retained evidence');
+      const fenceBefore = await fs.readFile(legacyRuntime);
+
+      await expect(
+        migrateNativeLegacyChangeToPortable({ paths, name: 'portable-change' }),
+      ).rejects.toThrow();
+      await expect(
+        nativeDoctorCommand(['portable-change', '--repair'], paths.projectRoot),
+      ).rejects.toThrow();
+      expect(await fs.readFile(stateFile, 'utf8')).toBe(bytes);
+      expect(await fs.readFile(projection, 'utf8')).toBe('old projection');
+      expect(await fs.readFile(evidence, 'utf8')).toBe('retained evidence');
+      expect(await fs.readFile(legacyRuntime)).toEqual(fenceBefore);
+      if (caseName === 'symlink') expect((await fs.lstat(stateFile)).isSymbolicLink()).toBe(true);
+    },
+  );
+
+  it('rejects a changed fence target when repairing with captured project paths', async () => {
+    const { paths, localRuntime, legacyRuntime } = await migratedPortableChange();
+    const fence = JSON.parse(await fs.readFile(legacyRuntime, 'utf8'));
+    fence.target = path.join(paths.changesRuntimeDir, 'another-change');
+    const changedFence = JSON.stringify(fence);
+    await fs.writeFile(legacyRuntime, changedFence);
+    const stateBefore = await fs.readFile(path.join(localRuntime, 'state.json'));
+
+    await expect(hasIncompleteNativePortableMigration(paths, 'portable-change')).rejects.toThrow();
+    await expect(
+      migrateNativeLegacyChangeToPortable({ paths, name: 'portable-change' }),
+    ).rejects.toThrow();
+    expect(await fs.readFile(path.join(localRuntime, 'state.json'))).toEqual(stateBefore);
+    expect(await fs.readFile(legacyRuntime, 'utf8')).toBe(changedFence);
+  });
+
   it('does not treat a portable verification report as incomplete migration', async () => {
     const paths = await portableChange();
     await fs.writeFile(
@@ -106,7 +186,8 @@ describe('Native portable migration Runtime', () => {
       loop: { iteration: 1, attempt: 0 },
     });
     expect(JSON.stringify(migrated)).not.toContain('a'.repeat(64));
-    expect(await fs.readdir(path.join(paths.changesRuntimeDir, 'legacy-change'))).toEqual([
+    expect((await fs.readdir(path.join(paths.changesRuntimeDir, 'legacy-change'))).sort()).toEqual([
+      'evidence',
       'state.json',
     ]);
     await expect(
@@ -134,7 +215,7 @@ describe('Native portable migration Runtime', () => {
     const legacyRuntime = path.join(activeDir, 'runtime');
     const localRuntime = path.join(paths.changesRuntimeDir, 'legacy-change');
     await fs.mkdir(legacyRuntime, { recursive: true });
-    await fs.writeFile(path.join(legacyRuntime, 'trajectory.jsonl'), 'legacy');
+    await fs.writeFile(path.join(legacyRuntime, 'trajectory.jsonl'), '{"type":"legacy-history"}\n');
     await fs.writeFile(path.join(activeDir, 'checkpoint.md'), 'legacy projection');
     await fs.rm(localRuntime, { recursive: true, force: true });
 
@@ -144,11 +225,14 @@ describe('Native portable migration Runtime', () => {
     });
 
     expect(recovered).toEqual(migrated);
-    await expect(fs.stat(legacyRuntime)).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(await isWorkspaceRuntimeMigrationFence(legacyRuntime, localRuntime)).toBe(true);
     await expect(fs.stat(path.join(activeDir, 'checkpoint.md'))).rejects.toMatchObject({
       code: 'ENOENT',
     });
-    expect(await fs.readdir(localRuntime)).toEqual(['state.json']);
+    expect((await fs.readdir(localRuntime)).sort()).toEqual(['state.json', 'trajectory.jsonl']);
+    expect(await fs.readFile(path.join(localRuntime, 'trajectory.jsonl'), 'utf8')).toBe(
+      '{"type":"legacy-history"}\n',
+    );
     expect(
       JSON.parse(await fs.readFile(path.join(localRuntime, 'state.json'), 'utf8')),
     ).toMatchObject({

@@ -9,7 +9,7 @@
 
 ### 阶段感知（最高优先级）
 
-有活跃 comet change 时（Classic layout resolver 绑定的 `<classic-change-dir>/.comet.yaml` 存在），**每次开始执行操作前**必须读取 `phase` 字段确认当前阶段。
+有活跃 comet change 时（Classic layout resolver 绑定的 `<classic-change-dir>/comet-state.yaml` 或历史 `.comet.yaml` 存在；两者共存时必须停止并核对冲突），**每次开始执行操作前**必须读取 `phase` 字段确认当前阶段。
 
 当存在多个 active change 时，必须先明确当前 change，再运行：
 
@@ -21,13 +21,13 @@ comet state select <change-name>
 
 **阶段与允许操作：**
 
-| 阶段 | 允许 | 禁止 |
-|------|------|------|
-| `open` | 创建 proposal/design/tasks, 运行 guard | 写源代码 |
-| `design` | brainstorming, 创建 Design Doc, 运行 guard | 写源代码 |
-| `build` | 写源代码、测试、执行计划 | 跳过用户确认点 |
-| `verify` | 验证、记录验证报告 | 跳过失败处理、提前处理分支 |
-| `archive` | 确认归档、运行归档脚本、提交归档改动、分支处理 | 写源代码 |
+| 阶段      | 允许                                           | 禁止                       |
+| --------- | ---------------------------------------------- | -------------------------- |
+| `open`    | 创建 proposal/design/tasks, 运行 guard         | 写源代码                   |
+| `design`  | brainstorming, 创建 Design Doc, 运行 guard     | 写源代码                   |
+| `build`   | 写源代码、测试、执行计划                       | 跳过用户确认点             |
+| `verify`  | 验证、记录验证报告                             | 跳过失败处理、提前处理分支 |
+| `archive` | 确认归档、运行归档脚本、提交归档改动、分支处理 | 写源代码                   |
 
 Hook 硬拦截仅豁免 Classic layout resolver 返回的当前阶段合法产物，以及 Comet 自有的 `.comet/*`、`.superpowers/*` 控制工作区和根目录 Markdown。配置目录及其中的 worktree/source 文件不属于通用豁免范围，必须服从当前 change 的阶段约束。
 
@@ -35,12 +35,12 @@ Hook 硬拦截仅豁免 Classic layout resolver 返回的当前阶段合法产�
 
 仅看 `phase` 字段不够——还必须确认"是如何到达这个阶段的"。每次准备写源代码前，先用下表自检 `.comet.yaml` 是否处于**非法空跳**状态（绕过了前置阶段）。命中任一行，立即停止写源代码，按动作回到对应阶段补齐产物，不得信任 `phase` 字段直接续跑。
 
-| 检测到 | 判定 | 动作 |
-|--------|------|------|
-| `phase: build` + `workflow: full` + `design_doc` 为空/null | 绕过 design 空跳 | 停止写源代码，运行 `/comet-design` 补 Design Doc 并过 guard |
-| `phase: build` + `workflow: full` + `plan` 为空/null 或记录路径失效 | 绕过实施计划 | 停止写源代码，回 `/comet-build` Step 1 创建或恢复 plan，记录路径并用 `comet state check <name> build --recover` 验证 |
-| `phase: build` + proposal/design/tasks 任一缺失或为空 | 绕过 open 空跳 | 回 `/comet-open` 补齐三件套 |
-| `phase: archive` + `verify_result` ≠ `pass` | 绕过 verify 空跳 | 回 `/comet-verify` 完成验证 |
+| 检测到                                                              | 判定             | 动作                                                                                                                 |
+| ------------------------------------------------------------------- | ---------------- | -------------------------------------------------------------------------------------------------------------------- |
+| `phase: build` + `workflow: full` + `design_doc` 为空/null          | 绕过 design 空跳 | 停止写源代码，运行 `/comet-design` 补 Design Doc 并过 guard                                                          |
+| `phase: build` + `workflow: full` + `plan` 为空/null 或记录路径失效 | 绕过实施计划     | 停止写源代码，回 `/comet-build` Step 1 创建或恢复 plan，记录路径并用 `comet state check <name> build --recover` 验证 |
+| `phase: build` + proposal/design/tasks 任一缺失或为空               | 绕过 open 空跳   | 回 `/comet-open` 补齐三件套                                                                                          |
+| `phase: archive` + `verify_result` ≠ `pass`                         | 绕过 verify 空跳 | 回 `/comet-verify` 完成验证                                                                                          |
 
 > 说明：上表只覆盖 hook 硬性拦截实际检测的范围（build 阶段的 `design_doc` 与 `plan` 状态；proposal/design/tasks 三件套完整性在 open→build 的 guard 退出时校验）。Hook 提示中的 `RECOVERY`、`SUCCESS` 和 `RETRY` 共同定义恢复闭环；达到 `SUCCESS` 前不得重试被阻塞的源码写入。`verify` 阶段不在此写源码自洽检查内——若 verify 发现产物缺失，按下方「Verify 阶段专项」的 verify-fail 回退处理。
 
@@ -113,6 +113,7 @@ comet state check <name> <phase> --recover
 恢复后必须先用「阶段进入自洽性校验」表复查一遍：若发现 `phase` 与产物不自洽（design_doc/plan/三件套/verify_result 任一不匹配），按非法空跳处理，严格执行脚本或 Hook 输出的恢复步骤，并在达到 `SUCCESS` 后才重试原操作；不得信任 `phase` 字段直接续跑。
 
 **特别注意 `build_mode`**：若恢复脚本输出 `build_mode: subagent-driven-development`，你是协调者，不是执行者。必须：
+
 1. 使用 Skill 工具重新加载 Superpowers `subagent-driven-development` 技能 (Use the Skill tool to reload the Superpowers `subagent-driven-development` skill)
 2. 读取 `comet-classic/reference/subagent-dispatch.md` 获取 Comet 专属扩展 (re-read `comet-classic/reference/subagent-dispatch.md` for Comet-specific extensions)
 3. 读取 `<classic-change-dir>/.comet/subagent-progress.md` 恢复精确阶段、证据和审查-修复轮次 (Read `<classic-change-dir>/.comet/subagent-progress.md` to recover the exact stage, evidence, and review-fix round)

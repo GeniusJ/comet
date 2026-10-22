@@ -32,6 +32,10 @@ import { prepareNativeWorkspace } from './native-workspace-preparation.js';
 import { recordNativeWorkspaceConfig } from './native-workspace-config.js';
 import { type NativeWorkspaceIsolation } from './native-workspace.js';
 import { ensureCometProjectGitignore } from '../workflow-contract/project-gitignore.js';
+import { assertChangeNotSdkOwned } from '../workflow-contract/change-runtime-owner.js';
+import { createNativeSdkChange } from './native-sdk-create.js';
+import { parseNativePortableState } from './native-portable-state.js';
+import { projectNativeSdkStatus } from './native-sdk-status.js';
 import {
   assertNoArguments,
   languageOption,
@@ -167,7 +171,12 @@ export async function nativeNewCommand(
   const worktreePath = takeOption(args, '--worktree-path');
   const task = takeOption(args, '--task');
   const capability = takeOption(args, '--capability');
+  const runtimeFormat = takeOption(args, '--runtime') ?? 'sdk';
+  if (runtimeFormat !== 'compat' && runtimeFormat !== 'sdk') {
+    throw new NativeUsageError('--runtime must be compat or sdk');
+  }
   assertNoArguments(args);
+  if (runtimeFormat === 'compat') await assertChangeNotSdkOwned(projectRoot, 'native', name);
   const sourceConfig = config;
   if (config?.native.pending_root_move) {
     throw new Error(`Native root move ${config.native.pending_root_move.id} is incomplete`);
@@ -182,6 +191,7 @@ export async function nativeNewCommand(
     sourceConfig,
   });
   projectRoot = prepared.projectRoot;
+  if (runtimeFormat === 'compat') await assertChangeNotSdkOwned(projectRoot, 'native', name);
   config = await readProjectConfig(projectRoot);
   const initialProjectConfig = config === null ? defaultProjectConfig('docs', language) : undefined;
   if (!config) config = initialProjectConfig!;
@@ -190,9 +200,7 @@ export async function nativeNewCommand(
   }
   const paths = await nativeProjectPaths(projectRoot, config.native.artifact_root);
   await ensureNativeDirectories(paths);
-  // `new` is a complete Native entry point.  Runtime state is created under
-  // `.comet/runtime`; make that state non-input before the first candidate is
-  // checked, even when the project has never run `native init`.
+  // 保留旧 Runtime 路径及迁移 fence 的 Git 排除，避免兼容文件进入候选输入。
   await ensureCometProjectGitignore(projectRoot);
   const capabilityDiscovery = await discoverNativeCapability(
     projectRoot,
@@ -200,13 +208,25 @@ export async function nativeNewCommand(
     task,
     capability,
   );
-  const state = await createNativePortableChange({
-    paths,
-    name,
-    language,
-    workspaceBinding: prepared.binding,
-    ...(initialProjectConfig ? { initialProjectConfig } : {}),
-  });
+  const sdkRun =
+    runtimeFormat === 'sdk'
+      ? await createNativeSdkChange({
+          paths,
+          name,
+          language,
+          workspaceBinding: prepared.binding,
+          ...(initialProjectConfig ? { initialProjectConfig } : {}),
+        })
+      : null;
+  const state = sdkRun
+    ? parseNativePortableState(sdkRun.state)
+    : await createNativePortableChange({
+        paths,
+        name,
+        language,
+        workspaceBinding: prepared.binding,
+        ...(initialProjectConfig ? { initialProjectConfig } : {}),
+      });
   let associationPath: string | undefined;
   let deltaProposal: Awaited<ReturnType<typeof initializeNativeDeltaProposal>> | undefined;
   if (capabilityDiscovery?.associationDraft) {
@@ -242,7 +262,15 @@ export async function nativeNewCommand(
               ...(associationPath === undefined ? {} : { associationPath }),
               ...(deltaProposal === undefined ? {} : { deltaProposal }),
             }),
-        continuation: nativePortableContinuation(state),
+        ...(sdkRun
+          ? {
+              ...(await projectNativeSdkStatus(
+                { projectRoot, name },
+                { run: sdkRun, state, artifactRootRef: paths.artifactRootRef, application: null },
+              )),
+              ...state,
+            }
+          : { continuation: nativePortableContinuation(state) }),
       },
       `Created Native change ${state.name}\n`,
     ),

@@ -1,5 +1,7 @@
+import { promises as fs } from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => {
   class NativeUsageError extends Error {}
@@ -122,21 +124,25 @@ vi.mock('../../../domains/comet-native/native-archived-status.js', () => ({
 }));
 
 import { nativeArchiveCommand } from '../../../domains/comet-native/native-archive-command.js';
+import type { NativeWorkspaceFinishJournal } from '../../../domains/comet-native/native-workspace-finish.js';
 
 describe('Native Archive workspace finish recovery command', () => {
-  const root = path.resolve('native-archive-recovery-test');
-  const archiveDir = path.join(root, 'docs', 'comet', 'archive');
-  const journal = {
-    schema: 'comet.native.workspace-finish.v1' as const,
-    name: 'finish-change',
-    transactionId: 'transaction-1',
-    archiveDir: path.join(archiveDir, '2026-09-20-finish-change'),
-    status: 'pending' as const,
-    result: null,
-    updatedAt: new Date().toISOString(),
-  };
+  let root: string;
+  let archiveDir: string;
+  let journal: NativeWorkspaceFinishJournal;
 
-  beforeEach(() => {
+  beforeEach(async () => {
+    root = await fs.mkdtemp(path.join(os.tmpdir(), 'native-archive-recovery-test-'));
+    archiveDir = path.join(root, 'docs', 'comet', 'archive');
+    journal = {
+      schema: 'comet.native.workspace-finish.v1',
+      name: 'finish-change',
+      transactionId: 'transaction-1',
+      archiveDir: path.join(archiveDir, '2026-09-20-finish-change'),
+      status: 'pending',
+      result: null,
+      updatedAt: new Date().toISOString(),
+    };
     vi.clearAllMocks();
     mocks.configuredPaths.mockResolvedValue({
       paths: { archiveDir, projectRoot: root, transactionsDir: path.join(root, 'transactions') },
@@ -148,6 +154,21 @@ describe('Native Archive workspace finish recovery command', () => {
     mocks.readJournal.mockResolvedValue(journal);
     mocks.prepareFinish.mockResolvedValue(null);
     mocks.autoAdvanceParent.mockResolvedValue(null);
+  });
+
+  afterEach(async () => {
+    await fs.rm(root, { recursive: true, force: true });
+  });
+
+  it('rejects SDK-only legacy Spec backups for portable changes', async () => {
+    mocks.isNativePortableChange.mockResolvedValue(true);
+    await expect(
+      nativeArchiveCommand(
+        ['finish-change', '--legacy-spec-backup', '/outside/originals.json'],
+        root,
+      ),
+    ).rejects.toThrow('SDK');
+    expect(mocks.recoverPortableChange).not.toHaveBeenCalled();
   });
 
   it('reports a pending workspace finish during dry-run and validates retry flags', async () => {
@@ -213,6 +234,7 @@ describe('Native Archive workspace finish recovery command', () => {
       data: {
         archived: true,
         workspaceFinishResult: { status: 'blocked', message: 'workspace is dirty' },
+        continuation: { mode: 'reconcile', disposition: 'blocked' },
       },
       error: { code: 'conflict', message: 'workspace is dirty' },
     });

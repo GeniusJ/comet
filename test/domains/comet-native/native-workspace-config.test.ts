@@ -15,7 +15,7 @@ describe('Native Runtime-created workspace configuration', () => {
     root = await fs.mkdtemp(path.join(os.tmpdir(), 'native-config-copy-'));
     execFileSync('git', ['init'], { cwd: root, stdio: 'ignore' });
     await fs.mkdir(path.join(root, '.comet'));
-    await fs.appendFile(path.join(root, '.git/info/exclude'), '\n/.comet/runtime/\n');
+    await fs.appendFile(path.join(root, '.git/info/exclude'), '\n/.comet/runtime\n');
     await fs.writeFile(path.join(root, '.comet/config.yaml'), 'native: {}\n');
   });
   afterEach(async () => {

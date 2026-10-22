@@ -9,6 +9,7 @@
 - 使用自然、具体的表达，先说明结果或动作，再说明必要的原因和条件。Skill 指令写清何时执行、执行什么、完成条件是什么。
 - 用事实、行为和例子解释问题；删去空泛评价、宣传口吻、机械排比、重复总结，以及没有实际区别的“不是 X，而是 Y”句式。标题、加粗和列表只用于帮助阅读。
 - 用准确的常用词表达概念，避免堆砌抽象名词、自造口号或生硬直译。技术术语确有必要时保留，并在首次出现且读者可能不熟悉时简要解释。
+- 网站中文内容中，表示 Docker 容器所在机器时保留“宿主机”；其他语境禁用“宿主”一词，根据实际对象使用“Agent 平台”“Agent”“执行器”或“本机”等准确名称。
 - 精简重复表述，保留需求范围、触发条件、例外、失败处理、确认要求和验收标准。必要内容移到参考文件时，写明读取条件与位置；不能以减少字数代替完整说明。
 
 ## Skill 触发表述规范
@@ -101,7 +102,16 @@ pnpm test           # 高风险修改或最终交付前需要本地全量验证�
 - `platform/`：文件系统、进程、安装平台、版本、路径等平台适配能力。domain 不应直接散落平台差异逻辑。
 - `scripts/`：构建、发布、benchmark、lint 等仓库自动化脚本。可调用源码模块，但不要成为运行时业务入口。
 - `assets/`：发布资产和内置 Skill 内容。修改 runtime 源码后必须通过构建同步生成资产，不要把业务逻辑只写在生成物里。
+- `domains/workflow-application/`：完整 SDK 应用加载、Skill 适配审查、固定依赖、宿主执行契约和 Run 归属。基础流程种类与应用身份分别表达；Native/Classic 领域可通过 `wrapStore` 同步投影，SDK Run 保持推进权威。
+- `domains/workflow-generation/`：确认方案的确定性装配、本地样板入口与隔离阶段产物验收；可调用 Native 和 Classic 的公开应用工厂准备样板，通过 `workflow-contract` 的受保护路径检查仅在临时项目创建验收样例，不能接管真实领域审批、验收或 Archive。应用安装预览、不可变版本与本地导出位于 `workflow-application`；平台路径和 Runtime 依赖安装位于 `platform/`。
+- `domains/workflow-creation/`：Creator 的固定 SDK 创作流程，关联自然语言目标、具体方案、用户决定、固定依赖、编译验证与安装预览；复用 `workflow-generation` 组合器和 SDK Run，不保存第二套推进状态。
+- `domains/eval/`：Skill 与 SDK 应用评估的目标解析、完整应用快照、固定用例复用和报告绑定。Creator 可调用其公开入口编排可选 Eval；应用分发只读取内容匹配的评估证据，不依赖模型执行器。
+- `domains/dashboard/`：通过 Eval 的公开入口展示和操作项目评估；评估规则由 `domains/eval/` 维护。通过 `workflow-creation` 和 `workflow-application` 的公开只读入口观测 Creator 与固定应用 Run；存储发现和快照校验复用 SDK，观测不加载应用执行模块或推进流程。
+- `domains/workflow-generation/`：按已确认方案装配 Native、Classic 和独立应用，生成同一组合结果的入口、固定依赖和安装恢复身份；复用领域工厂，不实现另一套状态机。
+- `domains/comet-native/native-application.ts`：公开 Native 扩展工厂，复用原领域状态机并绑定候选审查；Native 可依赖 `workflow-application` 的加载及宿主契约，默认主流程仍不依赖外部 Skill。
+- `domains/comet-classic/classic-application.ts`：公开 Classic 组合工厂，替换执行 Skill 并在领域检查点追加有验收和恢复路径的步骤；沿用 Classic 状态机，SDK Run 保持推进权威。
 - `eval/scaffold/shell/` 中仅允许 `config/repository-layout.json` 明确列出的隔离评审 sidecar 入口；它们属于 Eval 容器边界，不是产品 Runtime 入口。
+- `eval/archives/` 保存可随 Git 克隆的历史实验。归档应用模块必须逐文件登记到 `config/repository-layout.json`，并匹配归档清单的内容摘要；它们只供只读观测，不属于产品 Runtime 或安装入口。冻结文件禁止格式化和换行转换。
 
 测试目录必须跟随被测对象归属：
 
@@ -280,3 +290,20 @@ Changelog写英文
 ## Comet Dashboard规范
 
 Comet Dashboard实现时尽量采用使用AntD React组件
+
+<claude-mem-context>
+# Memory Context
+
+# claude-mem status
+
+This project has no memory yet. The current session will seed it; subsequent sessions will receive auto-injected context for relevant past work.
+
+Memory injection starts on your second session in a project.
+
+`/learn-codebase` is available if the user wants to front-load the entire repo into memory in a single pass (~5 minutes on a typical repo, optional). Otherwise memory builds passively as work happens.
+
+Live activity: http://localhost:37777
+How it works: `/how-it-works`
+
+This message disappears once the first observation lands.
+</claude-mem-context>

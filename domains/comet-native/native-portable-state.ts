@@ -3,8 +3,15 @@ import {
   assertNativeBuilderAcceptanceComplete,
   parseNativeBuilderAcceptanceReview,
 } from './native-builder-acceptance-review.js';
+import { NATIVE_BUILDER_CHECK_RESULTS, NATIVE_VERIFIER_VERDICTS } from './native-input-enum.js';
 
-import { parseDocument, stringify } from 'yaml';
+import { stringify } from 'yaml';
+import { parseNativeStateDocument } from './native-state-document.js';
+import { parseRuntimeAction } from '../engine/runtime-action.js';
+import {
+  nativeVerifierActionInput,
+  nativeVerifierActionMatchesState,
+} from './native-verifier-action.js';
 
 import { atomicWriteText, type NativeAtomicWriteOptions } from './native-atomic-file.js';
 import {
@@ -49,6 +56,7 @@ const ROOT_KEYS = new Set([
   'loop',
   'acceptance',
   'builder_handoff',
+  'verifier_action',
   'blockers',
   'verification',
   'history',
@@ -57,6 +65,9 @@ const ROOT_KEYS = new Set([
   'verification_report',
   'archived',
   'created_at',
+  'run_checkpoint',
+  'archive_receipt',
+  'application_checkpoint',
 ]);
 
 export class NativePortableStateVersionConflictError extends Error {
@@ -348,7 +359,7 @@ function parseBuilderCheck(value: unknown, index: number): NativeBuilderCheckSum
   rejectUnknown(root, new Set(['name', 'result', 'note']), label);
   return {
     name: parsePortableText(root.name, `${label}.name`),
-    result: enumValue(root.result, ['passed', 'failed', 'not-run'] as const, `${label}.result`),
+    result: enumValue(root.result, NATIVE_BUILDER_CHECK_RESULTS, `${label}.result`),
     note: root.note === null ? null : parsePortableText(root.note, `${label}.note`),
   };
 }
@@ -538,7 +549,7 @@ function parseVerification(value: unknown): NativePortableVerificationState {
             ] as const,
             `${label}.assurance`,
           ),
-    verdict: enumValue(root.verdict, ['pass', 'fail', 'blocked'] as const, `${label}.verdict`),
+    verdict: enumValue(root.verdict, NATIVE_VERIFIER_VERDICTS, `${label}.verdict`),
     checks,
     summary: parsePortableText(root.summary, `${label}.summary`),
     risks: arrayValue(root.risks, `${label}.risks`, (entry, index) =>
@@ -628,6 +639,20 @@ function parseHistoryOverflow(value: unknown): NativePortableHistoryOverflow {
 }
 
 function assertReferences(state: NativePortableState): void {
+  if (state.verifier_action) {
+    nativeVerifierActionInput(state.verifier_action);
+    if (state.verifier_action.runId !== state.name)
+      throw new Error('Native Verifier action belongs to another change');
+    if (
+      state.phase === 'verify' &&
+      state.status === 'active' &&
+      state.loop.next_action === 'await-verifier-result' &&
+      ['pending', 'running', 'unknown'].includes(state.verifier_action.status) &&
+      !nativeVerifierActionMatchesState(state, state.verifier_action)
+    ) {
+      throw new Error('Native Verifier action is stale for the current candidate or attempt');
+    }
+  }
   const acceptanceIds = new Set(state.acceptance.map((entry) => entry.id));
   for (const id of state.loop.previous_unresolved_ids) {
     if (!acceptanceIds.has(id))
@@ -847,6 +872,9 @@ export function parseNativePortableState(value: unknown): NativePortableState {
     acceptance,
     builder_handoff:
       root.builder_handoff === null ? null : parseBuilderHandoff(root.builder_handoff),
+    ...(root.verifier_action === undefined
+      ? {}
+      : { verifier_action: parseRuntimeAction(root.verifier_action) }),
     blockers: arrayValue(root.blockers, 'Native blockers', parseBlocker),
     verification: root.verification === null ? null : parseVerification(root.verification),
     history,
@@ -944,17 +972,9 @@ export function appendNativePortableHistory(
   return parseNativePortableState({ ...parsedState, history, history_overflow: overflow });
 }
 
-function parseYaml(source: string, label: string): unknown {
-  const document = parseDocument(source, { uniqueKeys: true });
-  if (document.errors.length > 0) {
-    throw new Error(`${label} is invalid YAML: ${document.errors[0].message}`);
-  }
-  return document.toJS({ mapAsMap: false });
-}
-
 export async function readNativePortableState(file: string): Promise<NativePortableState> {
   const source = await fs.readFile(file, 'utf8');
-  return parseNativePortableState(parseYaml(source, 'Native portable state'));
+  return parseNativePortableState(parseNativeStateDocument(source, 'Native portable state'));
 }
 
 export async function writeNativePortableState(

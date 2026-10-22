@@ -3,6 +3,13 @@ import { runStateFromDocument, type StateDocument } from '../../domains/engine/s
 
 export const CLASSIC_PROFILES = ['full', 'hotfix', 'tweak'] as const;
 export const CLASSIC_MIGRATION_VERSION = 1;
+export const CLASSIC_CHANGE_ID_PATTERN =
+  /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/u;
+export const CLASSIC_MANAGED_RUN_MARKER = '# comet-execution: managed-run\n';
+
+export function hasClassicManagedRunMarker(source: string): boolean {
+  return /^# comet-execution: managed-run\r?\n/u.test(source);
+}
 
 const PHASES = ['open', 'design', 'build', 'verify', 'archive'] as const;
 const ARTIFACT_LANGUAGES = ['en', 'zh-CN'] as const;
@@ -100,7 +107,12 @@ export const CLASSIC_WIRE_KEYS = [
 ] as const;
 
 /** Fields that appear in .comet.yaml to link to the Run state. */
-export const RUN_WIRE_KEYS = ['run_id'] as const;
+export const RUN_WIRE_KEYS = [
+  'change_id',
+  'run_id',
+  'run_checkpoint',
+  'application_checkpoint',
+] as const;
 
 const KNOWN_KEYS = new Set<string>([...CLASSIC_WIRE_KEYS, ...RUN_WIRE_KEYS]);
 // NOTE: review_mode is intentionally omitted — pre-0.4.0 state files lack this field,
@@ -247,6 +259,11 @@ export function parseClassicStateDocument(
   doc: StateDocument,
   run?: RunState | null,
 ): ClassicStateProjection {
+  if (
+    doc.change_id !== undefined &&
+    (typeof doc.change_id !== 'string' || !CLASSIC_CHANGE_ID_PATTERN.test(doc.change_id))
+  )
+    throw new Error('Invalid Classic state: change_id must be an immutable UUID');
   // Run state is stored separately in .comet/run-state.json.
   // If not provided, check for a run_id link (but don't parse full Run state from yaml).
   let resolvedRun: RunState | null = run ?? null;

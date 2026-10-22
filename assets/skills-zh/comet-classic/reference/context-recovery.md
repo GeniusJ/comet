@@ -12,7 +12,11 @@ comet state check <change-name> <phase> --json
 
 普通入口和恢复入口都会返回 layout、configuration、`configurationReadiness`、nextAction、taskState、coordination 和 delivery。`configurationReadiness` 的 `missingFields` 与 `invalidFields` 为空时，表示当前执行配置可沿用；只根据其中列出的字段补问或修复，不逐字段重新查询。taskState 为 `{authority, revision, total, completed, needsIds, next}`；coordination 为 `{path, stale, taskIds, stage, sessionId, reviewRounds, unresolved}`。按 classic-layout.md 确定各逻辑路径对应的目录，根据实际 phase 进入对应阶段。摘要中已有的字段不再逐个查询。状态写入，或工作区、需求发生变化后，重新读取受影响的状态。
 
-nextAction 为 `{kind, reason, taskId?}`。先阅读 reason，再根据 kind 完成对应步骤：reconcile-task 表示核对实际成果，review 表示补充审查，checkoff 表示补记任务完成状态，check 表示补充检查，reconcile-plan 表示补齐旧计划与任务的对应关系或同步状态，plan 表示补充有效计划，configure 表示补齐配置，workspace 表示修复工作区归属，delivery 表示完成已授权的交付，continue-phase 表示按当前阶段继续未完成步骤，repair-design 表示修正设计文档关联，design/complete-design 表示补充或完成设计 handoff，transition/verify/archive/confirm-archive 表示按 reason 推进对应阶段动作，paused 表示按 reason 等待恢复条件。nextAction 不允许跳过验收；其中的 taskId 必须对应 tasks.md 中的任务。
+恢复后先按 [任务上下文协议](scripts.md#任务上下文与产物语言) 执行 `contextRequest`，重新获取当前阶段适用的偏好和项目知识；协调检查点保存任务进度与证据，不替代记忆获取。换 Agent 时使用接收方会话标识；同一 Agent 恢复时沿用原标识并获取 snapshot。
+
+SDK 响应先按 auto-transition.md 处理 `continuation.mode` 和 `waitReason`：手动衔接不是运行中任务，`running`/`unknown` 则先核对原执行者。当前 Run 的 `current.actions`、Action 输入和完成模板决定下一步；不从旧阶段名猜测 Skill。下文的任务与协调记录命令对两种 Runtime 都适用，但它们不推进 SDK Run。SDK 的归档和 Git 收尾只按当前 continuation 及 Archive 入口执行，不使用 Compat delivery 命令。
+
+以下 `nextAction` 分类只解释 Compat 响应。nextAction 为 `{kind, reason, taskId?}`。先阅读 reason，再根据 kind 完成对应步骤：reconcile-task 表示核对实际成果，review 表示补充审查，checkoff 表示补记任务完成状态，check 表示补充检查，reconcile-plan 表示补齐旧计划与任务的对应关系或同步状态，plan 表示补充有效计划，configure 表示补齐配置，workspace 表示修复工作区归属，delivery 表示完成已授权的交付，continue-phase 表示按当前阶段继续未完成步骤，repair-design 表示修正设计文档关联，design/complete-design 表示补充或完成设计 handoff，transition/verify/archive/confirm-archive 表示按 reason 推进对应阶段动作，paused 表示按 reason 等待恢复条件。nextAction 不允许跳过验收；其中的 taskId 必须对应 tasks.md 中的任务。
 
 仅在新会话没有先前上下文、对话被压缩或恢复证据不足时使用：
 
@@ -32,27 +36,29 @@ comet state check <change-name> <phase> --recover --details --json
 
 用户未明确调用 Classic，但仓库可能存在未归档的 change 时，按 scripts.md 将当前请求通过 stdin 传给 `comet resume-probe . --stdin --json`。返回 auto_resume 才自动恢复；返回 ask_user 时按 `reason` 选择下面的问题和选项提问（遵循 `comet-classic/reference/decision-point.md`，优先使用 AskUserQuestion；选项必须是真实可选的动作，不得问没有选项的"是否继续"）；返回 out_of_scope/none 时不进入流程。
 
-| reason                                      | 问题与选项                                                                                                                  |
-| ------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
-| 多个 active change 需要点名                 | 单选：列出全部活跃 change 名称与当前 phase，选择继续哪一个；用户也可以直接说明是哪个 change。                             |
-| 未提交改动需要归属                         | 单选：归入当前 change；属于另一个 change（请用户说明名称）；请用户自己说明归属。没有归属信息前不修改、不提交这些改动。       |
-| active change 停在决策点                    | 说明该 change 停在哪个阶段的确认项（按各阶段 skill 的确认清单），选项：恢复该阶段继续处理确认项；用户直接给出决定。         |
-| OpenSpec change 缺少 Comet 状态             | 说明缺失内容，选项：按「入口错误与恢复」为它建立 Comet 状态；用户说明这不是 Comet 需求。                                    |
-| 请求看似与现有 change 无关                  | 单选：恢复现有 change（列出名称与 phase）；本次请求是新的工作（请用户确认走新流程）。                                      |
+| reason                          | 问题与选项                                                                                                             |
+| ------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| 多个 active change 需要点名     | 单选：列出全部活跃 change 名称与当前 phase，选择继续哪一个；用户也可以直接说明是哪个 change。                          |
+| 未提交改动需要归属              | 单选：归入当前 change；属于另一个 change（请用户说明名称）；请用户自己说明归属。没有归属信息前不修改、不提交这些改动。 |
+| active change 停在决策点        | 说明该 change 停在哪个阶段的确认项（按各阶段 skill 的确认清单），选项：恢复该阶段继续处理确认项；用户直接给出决定。    |
+| OpenSpec change 缺少 Comet 状态 | 说明缺失内容，选项：按「入口错误与恢复」为它建立 Comet 状态；用户说明这不是 Comet 需求。                               |
+| 请求看似与现有 change 无关      | 单选：恢复现有 change（列出名称与 phase）；本次请求是新的工作（请用户确认走新流程）。                                  |
 
 ## 入口错误与恢复
 
+同一 change 下两种状态文件共存时（包括其中一个是失效符号链接），保留两个文件并停止，核对来源后再处理冲突；不能删除其中一个来强行继续。
+
 命令失败、依赖不可用、状态缺失或产物不完整时，保留原错误并按对应原因处理。只有能根据当前输入确认正确的恢复动作才自动执行；恢复成功后，重新运行受影响的入口检查。
 
-| 遇到的问题                                             | 如何恢复，以及何时必须停止                                                                                                                                                                                                     |
-| ------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `comet classic openspec -- list --json` 失败           | 核对 OpenSpec 是否已安装，并查看命令的实际错误。产物根目录缺失或损坏时，说明 `comet update --scope project` / `comet init --scope project` 可用于修复；不把命令失败当作“没有未归档的 change”，不擅自升级或重新初始化用户环境。 |
-| 当前阶段要求的 Comet/OpenSpec/Superpowers Skill 不可用 | 停止依赖该 Skill 的动作，说明缺少哪个 Skill，以及需要安装或启用什么。必须使用的 Skill 不能用普通对话代替，也不能擅自更换用户选定的执行方式。                                                                                   |
-| `.comet.yaml` 缺失                                     | 先从本次明确选择和可验证产物核对 workflow；full 返回 `/comet-open`，hotfix/tweak 返回对应预设的初始化步骤，完成初始化后再 `comet state select`。workflow 无法确定时请求用户选择，不默认改成 full。                             |
-| `.comet.yaml` 格式异常                                 | 报告解析错误，从版本控制、备份或可验证产物恢复；不能用 `comet state set` 覆盖损坏文件，也不能根据现有文件猜测 phase 后推进。                                                                                                   |
-| change 目录或必需产物不完整                            | 按当前 workflow 的 Open 初始化规则，以及产物检查返回的依赖关系补齐文件。保留已有的有效产物；文件完整后仍需请用户最终检查并确认 Open 产物。                                                                                     |
-| 工作区绑定冲突或路径越界                               | 按 workspace.md 核对绑定与实际路径；需要切回绑定分支或 rebind 时展示合法选项并等待明确选择，无法确认归属时停止写入。                                                                                                           |
-| 构建、测试或手动验证失败                               | 保留当前 change 与失败证据，按 debug-gate.md 调查。Build 失败时不能通过完成 Guard 进入下一阶段；Verify 失败时按该阶段规则修复并重新验证，不能用以前的通过结果覆盖本次失败。                                                    |
+| 遇到的问题                                             | 如何恢复，以及何时必须停止                                                                                                                                                                                                                                                                             |
+| ------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `comet classic openspec -- list --json` 失败           | 核对 OpenSpec 是否已安装，并查看命令的实际错误。产物根目录缺失或损坏时，说明 `comet update --scope project` / `comet init --scope project` 可用于修复；不把命令失败当作“没有未归档的 change”，不擅自升级或重新初始化用户环境。                                                                         |
+| 当前阶段要求的 Comet/OpenSpec/Superpowers Skill 不可用 | 停止依赖该 Skill 的动作，说明缺少哪个 Skill，以及需要安装或启用什么。必须使用的 Skill 不能用普通对话代替，也不能擅自更换用户选定的执行方式。                                                                                                                                                           |
+| `comet-state.yaml` 与 `.comet.yaml` 均缺失             | 先确认没有 SDK Run 或归属记录；已有归属时先用 Runtime 恢复投影，不能重新初始化。只有确认未初始化时，再从本次明确选择和可验证产物核对 workflow；full 返回 `/comet-open`，hotfix/tweak 返回对应预设的初始化步骤，完成初始化后再 `comet state select`。workflow 无法确定时请求用户选择，不默认改成 full。 |
+| 实际状态文件格式异常                                   | 报告解析错误，从版本控制、备份或可验证产物恢复；不能用 `comet state set` 覆盖损坏文件，也不能根据现有文件猜测 phase 后推进。                                                                                                                                                                           |
+| change 目录或必需产物不完整                            | 按当前 workflow 的 Open 初始化规则，以及产物检查返回的依赖关系补齐文件。保留已有的有效产物；文件完整后仍需请用户最终检查并确认 Open 产物。                                                                                                                                                             |
+| 工作区绑定冲突或路径越界                               | 按 workspace.md 核对绑定与实际路径；需要切回绑定分支或 rebind 时展示合法选项并等待明确选择，无法确认归属时停止写入。                                                                                                                                                                                   |
+| 构建、测试或手动验证失败                               | 保留当前 change 与失败证据，按 debug-gate.md 调查。Build 失败时不能通过完成 Guard 进入下一阶段；Verify 失败时按该阶段规则修复并重新验证，不能用以前的通过结果覆盖本次失败。                                                                                                                            |
 
 ## 任务核对与补勾
 
@@ -118,4 +124,4 @@ evidence 保存实际提交、RED/GREEN 结果和审查证据的引用；unresol
 - Build：继续使用有效计划和配置。autonomous 不加载外部执行 Skill；其他策略只在上下文缺少所需方法时加载。委派任务按 subagent-dispatch.md 恢复原先分配的任务范围，以及负责实现的子代理会话；subagent-driven-development 模式下，主会话不接管实现。全部任务完成后，返回 Build 执行退出检查，不恢复旧的 Build final-review/final-fix 步骤。
 - Design：尚未确认的方案继续澄清；已确认的方案只补正式 Design Doc 或未完成的状态写入。按需读取 brainstorm-summary.md 和一份 Markdown 交接文件；供程序使用的 JSON 默认由 Runtime 校验，不重复读取全部上下文。
 - Verify：核对报告、实际 diff 和有效的审查证据，只补充缺失的检查或受影响的审查，不从规模评估重新开始整个阶段。
-- Archive：普通入口和 delivery 读取不会访问网络。使用 `comet state delivery <change-name> --verify` 只读核对 Git、远端和 PR 状态，从返回的 `{delivery, verification}` 中确认授权与实际结果。已经归档的不再归档，已经提交的不再提交，远端已完成的操作不再重复 push 或创建 PR。不能根据 handled 推断已获得授权或交付成功；记录缺失或目标变化时，按 Archive 规则确认。
+- Archive：SDK 只按当前 continuation 和 Archive Skill 核对同一 Run 的交付，不调用 Compat `state delivery`。Compat 的普通入口和 delivery 读取不会访问网络。使用 `comet state delivery <change-name> --verify` 只读核对 Git、远端和 PR 状态，从返回的 `{delivery, verification}` 中确认授权与实际结果。已经归档的不再归档，已经提交的不再提交，远端已完成的操作不再重复 push 或创建 PR。不能根据 handled 推断已获得授权或交付成功；记录缺失或目标变化时，按 Archive 规则确认。

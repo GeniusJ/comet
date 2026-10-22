@@ -1,6 +1,14 @@
+import { listNativeSdkHistoryPartitions } from './native-sdk-history-discovery.js';
+import { readNativeTextFilePrefix } from './native-bounded-file.js';
+import { NATIVE_MANAGED_RUN_MARKER } from './native-state-document.js';
+import { runWithHookReadCache } from '../../platform/process/hook-read-cache.js';
+import { isNativeSdkChangeCancellationComplete } from './native-sdk-cancellation.js';
+import { mapWithConcurrency } from './native-concurrency.js';
 import path from 'node:path';
 import { realpathSync } from 'node:fs';
 
+import { readSdkChangeOwner } from '../workflow-contract/change-runtime-owner.js';
+import { inspectProtectedProjectPath } from '../workflow-contract/protected-project-path.js';
 import {
   gitWorktreeContextFromEntries,
   inspectGitWorktree,
@@ -10,13 +18,23 @@ import {
 
 import { canonicalHash } from './native-canonical-hash.js';
 import { inspectNativeChangeStateDocument } from './native-change.js';
-import { readProjectConfig } from './native-config.js';
+import { defaultProjectConfig, readProjectConfig } from './native-config.js';
 import {
   inspectNativeStatus,
   listNativeChangeNames,
   NATIVE_STATUS_PAGE_LIMITS,
 } from './native-diagnostics.js';
 import { nativeProjectPaths } from './native-paths.js';
+import { listNativeSdkChangeNames, loadOwnedNativeSdkRuntime } from './native-runtime-ownership.js';
+import { inspectPristineNativeSdkChange } from './native-sdk-create.js';
+import { inspectNativeSdkStatus, type NativeSdkStatusProjection } from './native-sdk-status.js';
+import {
+  hasNativeManagedRunMarker,
+  NativeSdkRunRecoveryRequiredError,
+  hasNativePortableRunCheckpoint,
+  findNativeSdkArchivedStateFile,
+} from './native-sdk-state-store.js';
+import { nativeLocalExecutionFile, nativePortableStateFile } from './native-portable-storage.js';
 import {
   listNativeArchivedStatusRecords,
   nativeArchiveSupersedes,
@@ -52,6 +70,8 @@ interface NativeWorkspaceSource {
   config: CometProjectConfig;
   paths: NativeProjectPaths;
   gitContext: GitWorktreeContext;
+  sdkNames?: string[];
+  sdkActiveNames?: string[];
   changes: Array<{ name: string; kind: 'portable' | 'legacy' }>;
   archives?: NativeStatusRecord[];
   archiveErrors?: Array<{ name: string; message: string }>;
@@ -66,6 +86,8 @@ interface NativeStatusCandidate {
   workspace: NativeWorkspaceProjection | NativePortableStatusProjection['workspace'];
   portableStatus: NativePortableStatusProjection | null;
   inspectionError: string | null;
+  missingRunHistory?: boolean;
+  recoverableRun?: boolean;
   record?: NativeStatusRecord;
   finishJournal?: NativeWorkspaceFinishJournal | null;
 }
@@ -73,6 +95,7 @@ interface NativeStatusCandidate {
 export type NativeDiscoveredStatusProjection =
   | NativeStatusProjection
   | NativePortableStatusProjection
+  | NativeSdkStatusProjection
   | NativeLegacyMigrationStatusProjection
   | NativeInspectionErrorStatusProjection;
 
@@ -144,7 +167,8 @@ export interface NativeLegacyMigrationStatusProjection {
 }
 
 export interface NativeDiscoveredStatusPageProjection {
-  schema: 'comet.native.status-page.v1' | 'comet.native.status-page.v2';
+  schema:
+    'comet.native.status-page.v1' | 'comet.native.status-page.v2' | 'comet.native.status-page.v3';
   total: number;
   offset: number;
   items: NativeDiscoveredStatusProjection[];
@@ -152,6 +176,16 @@ export interface NativeDiscoveredStatusPageProjection {
   nextPageCommand: string | null;
   nextPageArgs: string[] | null;
   limits: typeof NATIVE_STATUS_PAGE_LIMITS;
+}
+
+/** A read-only status lookup leaves an untouched copied change for a mutating command to recover. */
+export class NativePristineSdkRunRecoverableError extends Error {
+  constructor(
+    readonly projectRoot: string,
+    readonly change: string,
+  ) {
+    super(`Native change ${change} can continue with comet native next ${change}`);
+  }
 }
 
 function samePath(left: string, right: string): boolean {
@@ -180,14 +214,59 @@ function displayCommandArgs(args: readonly string[]): string {
 async function discoverChanges(
   paths: NativeProjectPaths,
   targetName?: string,
+  sdkNames?: ReadonlySet<string>,
+  historyNames?: ReadonlySet<string>,
 ): Promise<NativeWorkspaceSource['changes']> {
-  const changes: NativeWorkspaceSource['changes'] = [];
-  for (const name of await listNativeChangeNames(paths)) {
-    if (targetName !== undefined && name !== targetName) continue;
-    changes.push({
+  const names = (await listNativeChangeNames(paths)).filter(
+    (name) => (targetName === undefined || name === targetName) && !historyNames?.has(name),
+  );
+  const results = await mapWithConcurrency(
+    names,
+    4,
+    async (
       name,
-      kind: (await isNativePortableChange(paths, name)) ? 'portable' : 'legacy',
-    });
+    ): Promise<PromiseSettledResult<NativeWorkspaceSource['changes'][number] | null>> => {
+      try {
+        // 同工作区 SDK 投影先核对 marker 和本地执行冲突，不再为分类读取整个 YAML。
+        if (sdkNames?.has(name)) {
+          const prefix = await readNativeTextFilePrefix({
+            root: path.dirname(nativePortableStateFile(paths, name)),
+            ref: path.basename(nativePortableStateFile(paths, name)),
+            maxBytes: 512,
+          }).catch((error: NodeJS.ErrnoException) => {
+            if (error.code === 'ENOENT') return { text: '' };
+            throw error;
+          });
+          const marked = prefix.text.startsWith(NATIVE_MANAGED_RUN_MARKER);
+          const local = await inspectProtectedProjectPath(
+            paths.workspaceRuntimeRoot,
+            path.relative(paths.workspaceRuntimeRoot, nativeLocalExecutionFile(paths, name)),
+            { label: 'Native local execution state', expected: 'file' },
+          );
+          if (marked && !local.exists) {
+            // 非规范/旧 header 仍回退全文件分类；只省略已经证明是 v4 的投影。
+            const portable =
+              /^schema:\s*comet\.native\.v4[^\S\r\n]*\r?\n/mu.test(prefix.text) ||
+              (await isNativePortableChange(paths, name));
+            if (portable) return { status: 'fulfilled', value: null };
+          }
+        }
+        return {
+          status: 'fulfilled',
+          value: {
+            name,
+            kind: (await isNativePortableChange(paths, name)) ? 'portable' : 'legacy',
+          },
+        };
+      } catch (reason) {
+        return { status: 'rejected', reason };
+      }
+    },
+  );
+  const changes: NativeWorkspaceSource['changes'] = [];
+  for (const result of results) {
+    if (result.status === 'rejected') throw result.reason;
+    if (result.value) changes.push(result.value);
   }
   return changes;
 }
@@ -195,6 +274,7 @@ async function discoverChanges(
 async function discoverSources(
   projectRoot: string,
   targetName?: string,
+  omitSdkProjections = false,
 ): Promise<NativeWorkspaceSource[]> {
   const requestedRoot = path.resolve(projectRoot);
   const worktrees = listGitWorktrees(projectRoot);
@@ -211,22 +291,42 @@ async function discoverSources(
     const key = process.platform === 'win32' ? identity.toLowerCase() : identity;
     if (seen.has(key)) continue;
     seen.add(key);
-    const config = await readProjectConfig(candidate);
-    if (!config) continue;
-    const paths = await nativeProjectPaths(candidate, config.native.artifact_root);
+    const configured = await readProjectConfig(candidate);
+    const partitions = omitSdkProjections
+      ? await listNativeSdkHistoryPartitions(candidate)
+      : undefined;
+    const sdkNames = partitions
+      ? [...partitions.active, ...partitions.history]
+      : !configured
+        ? await listNativeSdkChangeNames(candidate, { readOnly: true })
+        : undefined;
+    if (!configured && sdkNames?.length === 0) continue;
+    const config = configured ?? defaultProjectConfig();
+    const paths = await nativeProjectPaths(candidate, config.native.artifact_root, {
+      readOnly: true,
+    });
     sources.push({
       projectRoot: candidate,
       config,
       paths,
+      sdkNames,
+      sdkActiveNames: partitions?.active,
       gitContext:
         gitWorktreeContextFromEntries(candidate, worktrees) ?? inspectGitWorktree(candidate),
-      changes: await discoverChanges(paths, targetName),
+      changes: await discoverChanges(
+        paths,
+        targetName,
+        omitSdkProjections ? new Set(sdkNames) : undefined,
+        partitions ? new Set(partitions.history) : undefined,
+      ),
     });
   }
   if (sources.length === 0) {
     const config = await readProjectConfig(projectRoot);
     if (!config) throw new Error('.comet/config.yaml was not found in any registered worktree');
-    const paths = await nativeProjectPaths(projectRoot, config.native.artifact_root);
+    const paths = await nativeProjectPaths(projectRoot, config.native.artifact_root, {
+      readOnly: true,
+    });
     sources.push({
       projectRoot: path.resolve(projectRoot),
       config,
@@ -659,12 +759,20 @@ async function inspectCandidate(
         status: 'blocked',
         disposition: 'blocked',
         action: 'none',
-        commandArgs: ['comet', 'native', 'doctor', candidate.name, '--repair'],
+        commandArgs: candidate.recoverableRun
+          ? ['comet', 'native', 'next', candidate.name]
+          : candidate.missingRunHistory
+            ? ['comet', 'native', 'doctor', candidate.name]
+            : ['comet', 'native', 'doctor', candidate.name, '--repair'],
         requiredInputs: [],
         // Doctor repairs the workspace it runs in. When the broken copy lives in
         // another worktree, name it so the command runs there instead of looping
         // between a healthy primary and the same blocked status.
-        message: `Run the repair command in the workspace holding this change: ${candidate.source.paths.projectRoot}`,
+        message: candidate.recoverableRun
+          ? `This change can continue from its saved state with comet native next ${candidate.name} in ${candidate.source.paths.projectRoot}.`
+          : candidate.missingRunHistory
+            ? `Run history is missing in ${candidate.source.paths.projectRoot}; inspect with Doctor and preserve the change files. Do not replay an unknown Action.`
+            : `Run the repair command in the workspace holding this change: ${candidate.source.paths.projectRoot}`,
         runnerAction: { kind: 'none', candidateId: null, iteration: 0, attempt: 0 },
       },
     };
@@ -705,6 +813,25 @@ async function inspectCandidate(
   return inspectLegacyCandidate(candidate, details, acceptanceCursor);
 }
 
+async function conflictsWithSdkOwner(
+  candidate: NativeStatusCandidate,
+  ownerRoot: string,
+): Promise<boolean> {
+  if (candidate.record?.state.archived) return false;
+  if (!samePath(candidate.source.projectRoot, ownerRoot) || candidate.kind !== 'portable') {
+    return true;
+  }
+  const stateFile = nativePortableStateFile(candidate.source.paths, candidate.name);
+  if (!(await hasNativeManagedRunMarker(stateFile))) return true;
+  const localFile = nativeLocalExecutionFile(candidate.source.paths, candidate.name);
+  const local = await inspectProtectedProjectPath(
+    candidate.source.paths.workspaceRuntimeRoot,
+    path.relative(candidate.source.paths.workspaceRuntimeRoot, localFile),
+    { label: 'Native local execution state', expected: 'file' },
+  );
+  return local.exists;
+}
+
 export async function inspectDiscoveredNativeStatus(options: {
   projectRoot: string;
   name: string;
@@ -718,6 +845,80 @@ export async function inspectDiscoveredNativeStatus(options: {
     options.projectRoot,
     options.name,
   );
+  const sdkSources = (
+    await Promise.all(
+      sources.map(async (source) =>
+        (await readSdkChangeOwner(source.projectRoot, 'native', options.name, { readOnly: true }))
+          ? source
+          : null,
+      ),
+    )
+  ).filter((source): source is NativeWorkspaceSource => source !== null);
+  if (sdkSources.length > 1) {
+    throw new Error(`Native SDK change ${options.name} has multiple workspace owners`);
+  }
+  if (sdkSources.length === 1) {
+    if (
+      (
+        await Promise.all(
+          candidates.map((candidate) =>
+            conflictsWithSdkOwner(candidate, sdkSources[0].projectRoot),
+          ),
+        )
+      ).some(Boolean)
+    ) {
+      throw new Error(`Native change ${options.name} has conflicting SDK and legacy Runtime state`);
+    }
+    if (options.detailsCursor) {
+      throw new Error('SDK Native status details do not use --cursor');
+    }
+    options.onSelectedRoot?.(sdkSources[0].projectRoot);
+    return inspectNativeSdkStatus({
+      projectRoot: sdkSources[0].projectRoot,
+      name: options.name,
+      details: options.details,
+    });
+  }
+  for (const source of sources) {
+    const archivedFile = await findNativeSdkArchivedStateFile(source.paths, options.name);
+    if (
+      archivedFile &&
+      (await hasNativeManagedRunMarker(archivedFile)) &&
+      (await hasNativePortableRunCheckpoint(archivedFile, options.name))
+    ) {
+      // Validate the original fixed application and checkpoint without restoring
+      // either. Corrupt packages or missing Supervisor worktrees remain visible.
+      await (
+        await loadOwnedNativeSdkRuntime(source.projectRoot, options.name, { readOnly: true })
+      ).runtime.inspect(options.name);
+      throw new NativeSdkRunRecoveryRequiredError(source.projectRoot, options.name);
+    }
+    const marked = await hasNativeManagedRunMarker(
+      nativePortableStateFile(source.paths, options.name),
+    ).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === 'ENOENT') return false;
+      throw error;
+    });
+    if (marked) {
+      if (
+        await hasNativePortableRunCheckpoint(
+          nativePortableStateFile(source.paths, options.name),
+          options.name,
+        )
+      ) {
+        await (
+          await loadOwnedNativeSdkRuntime(source.projectRoot, options.name, { readOnly: true })
+        ).runtime.inspect(options.name);
+        throw new NativeSdkRunRecoveryRequiredError(source.projectRoot, options.name);
+      }
+      if (await inspectPristineNativeSdkChange(source.paths, options.name)) {
+        throw new NativePristineSdkRunRecoverableError(source.projectRoot, options.name);
+      }
+      throw new Error(
+        `Native change ${options.name} has a portable state file but lost its local Run history`,
+      );
+    }
+  }
   if (candidates.length === 0) {
     const current =
       sources.find((source) => samePath(source.projectRoot, options.projectRoot)) ?? sources[0];
@@ -769,18 +970,121 @@ export async function discoverNativeChangeProjectRoot(options: {
     .projectRoot;
 }
 
-export async function listDiscoveredNativeStatusPage(options: {
+export function listDiscoveredNativeStatusPage(options: {
   projectRoot: string;
   cursor?: string | null;
 }): Promise<NativeDiscoveredStatusPageProjection> {
-  const sources = await discoverSources(options.projectRoot);
-  const candidates = await discoverCandidates(options.projectRoot, sources);
+  return runWithHookReadCache(() => listDiscoveredNativeStatusPageWithinScope(options));
+}
+
+async function listDiscoveredNativeStatusPageWithinScope(options: {
+  projectRoot: string;
+  cursor?: string | null;
+}): Promise<NativeDiscoveredStatusPageProjection> {
+  const sources = await discoverSources(options.projectRoot, undefined, true);
+
+  // Check authoritative cancellation before portable discovery. Unknown or
+  // incomplete cancellation remains visible; the complete owner name set is
+  // retained for cross-workspace and legacy ownership conflict checks.
+  const sdkDiscoveries = await Promise.all(
+    sources.map(async (source) => {
+      const names =
+        source.sdkNames ?? (await listNativeSdkChangeNames(source.projectRoot, { readOnly: true }));
+      return { source, names, activeNames: source.sdkActiveNames ?? names, kept: [] as string[] };
+    }),
+  );
+  const cancellationCandidates = sdkDiscoveries.flatMap((discovery) =>
+    discovery.activeNames.map((name) => ({ discovery, name })),
+  );
+  // 所有工作区合计最多四路；逐项失败保留候选，收齐结果后按原顺序过滤。
+  const completed = await mapWithConcurrency(cancellationCandidates, 4, ({ discovery, name }) =>
+    isNativeSdkChangeCancellationComplete(discovery.source.projectRoot, name).catch(() => false),
+  );
+  for (const [index, { discovery, name }] of cancellationCandidates.entries()) {
+    if (!completed[index]) discovery.kept.push(name);
+  }
+  const legacyCandidates = await discoverCandidates(options.projectRoot, sources);
+  const sdkCandidates = sdkDiscoveries.flatMap(({ source, kept }) =>
+    kept.map((name) => ({
+      kind: 'sdk' as const,
+      name,
+      projectRoot: source.projectRoot,
+      bindingState: 'aligned' as const,
+    })),
+  );
+  const legacyByName = new Map<string, NativeStatusCandidate[]>();
+  for (const candidate of legacyCandidates) {
+    const matching = legacyByName.get(candidate.name) ?? [];
+    matching.push(candidate);
+    legacyByName.set(candidate.name, matching);
+  }
+  const sdkNames = new Set<string>();
+  for (const sdk of sdkDiscoveries.flatMap(({ source, names }) =>
+    names.map((name) => ({ name, projectRoot: source.projectRoot })),
+  )) {
+    if (sdkNames.has(sdk.name)) {
+      throw new Error(`Native SDK change ${sdk.name} has multiple workspace owners`);
+    }
+    sdkNames.add(sdk.name);
+    if (
+      (
+        await Promise.all(
+          (legacyByName.get(sdk.name) ?? []).map((candidate) =>
+            conflictsWithSdkOwner(candidate, sdk.projectRoot),
+          ),
+        )
+      ).some(Boolean)
+    ) {
+      throw new Error(`Native change ${sdk.name} has conflicting SDK and legacy Runtime state`);
+    }
+  }
+  const unownedCandidates = await Promise.all(
+    legacyCandidates
+      .filter((candidate) => !sdkNames.has(candidate.name))
+      .map(async (candidate) => {
+        if (candidate.kind !== 'portable') return candidate;
+        const marked = await hasNativeManagedRunMarker(
+          nativePortableStateFile(candidate.source.paths, candidate.name),
+        ).catch((error: NodeJS.ErrnoException) => {
+          if (error.code === 'ENOENT') return false;
+          throw error;
+        });
+        const recoverable = marked
+          ? (await hasNativePortableRunCheckpoint(
+              nativePortableStateFile(candidate.source.paths, candidate.name),
+              candidate.name,
+            )) ||
+            (await inspectPristineNativeSdkChange(candidate.source.paths, candidate.name)) !== null
+          : false;
+        return marked
+          ? {
+              ...candidate,
+              missingRunHistory: true,
+              recoverableRun: recoverable,
+              inspectionError: recoverable
+                ? `Native change ${candidate.name} can continue from its saved state with comet native next ${candidate.name}`
+                : `Native change ${candidate.name} has a portable state file but lost its local Run history`,
+            }
+          : candidate;
+      }),
+  );
+  const candidates = [...unownedCandidates, ...sdkCandidates].sort((left, right) =>
+    `${left.name}\0${left.kind === 'sdk' ? left.projectRoot : left.source.projectRoot}`.localeCompare(
+      `${right.name}\0${right.kind === 'sdk' ? right.projectRoot : right.source.projectRoot}`,
+    ),
+  );
+  if (candidates.length > NATIVE_STATUS_PAGE_LIMITS.maxChanges) {
+    throw new Error(
+      `Native status discovery exceeds ${NATIVE_STATUS_PAGE_LIMITS.maxChanges} visible changes`,
+    );
+  }
   const candidatesHash = canonicalHash(
     'comet.native.workspace-status-candidates.v1',
     candidates.map((candidate) => ({
       name: candidate.name,
-      projectRoot: candidate.source.projectRoot,
-      bindingState: candidate.workspace.bindingState,
+      projectRoot: candidate.kind === 'sdk' ? candidate.projectRoot : candidate.source.projectRoot,
+      bindingState:
+        candidate.kind === 'sdk' ? candidate.bindingState : candidate.workspace.bindingState,
       kind: candidate.kind,
     })),
   );
@@ -792,12 +1096,18 @@ export async function listDiscoveredNativeStatusPage(options: {
   const projected = await Promise.all(
     candidates
       .slice(offset, offset + NATIVE_STATUS_PAGE_LIMITS.maxItems)
-      .map((candidate) => inspectCandidate(candidate, false)),
+      .map((candidate) =>
+        candidate.kind === 'sdk'
+          ? inspectNativeSdkStatus({ projectRoot: candidate.projectRoot, name: candidate.name })
+          : inspectCandidate(candidate, false),
+      ),
   );
   const items: NativeDiscoveredStatusProjection[] = [];
-  const schema = candidates.some(({ kind }) => kind === 'portable')
-    ? ('comet.native.status-page.v2' as const)
-    : ('comet.native.status-page.v1' as const);
+  const schema = candidates.some(({ kind }) => kind === 'sdk')
+    ? ('comet.native.status-page.v3' as const)
+    : candidates.some(({ kind }) => kind === 'portable')
+      ? ('comet.native.status-page.v2' as const)
+      : ('comet.native.status-page.v1' as const);
   for (const candidate of projected) {
     const trialItems = [...items, candidate];
     const nextOffset = offset + trialItems.length;

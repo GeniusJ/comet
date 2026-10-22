@@ -1,9 +1,34 @@
 import { createHash, randomUUID } from 'node:crypto';
+import {
+  nativeLegacyArchiveGitStatus,
+  type NativeLegacyArchiveOverlay,
+} from './native-archive-legacy-overlay.js';
 import { promises as fs } from 'node:fs';
+import {
+  activeNativeVerifierAction,
+  completeNativeVerifierAction,
+  currentNativeVerifierAction,
+  nativeVerifierActionExecutionRef,
+  startNativeVerifierAction,
+} from './native-verifier-action.js';
 import type { Dirent } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { gitStatusPaths, runGitCommand } from '../../platform/process/git.js';
+import {
+  parseGitStatusPaths,
+  readGitStatusPorcelain,
+  runGitCommand,
+  readGitBlobs,
+} from '../../platform/process/git.js';
+import {
+  approvedEditFingerprint,
+  inspectEditReviews,
+  type EditReviewScope,
+} from '../workflow-contract/edit-review.js';
+import { editContentHash } from '../workflow-contract/edit-impact.js';
+import { isNeutralDocumentPath } from '../workflow-contract/neutral-document-path.js';
+import { readProjectConfig } from './native-config.js';
+import { nativeEditReviewScope } from './native-edit-review.js';
 import {
   inspectProcessLiveness,
   readProcessIdentity,
@@ -12,6 +37,8 @@ import { canonicalHash } from './native-canonical-hash.js';
 import { nativeRunnerInputArtifactPaths } from './native-runner-input-artifacts.js';
 import {
   executeNativeCheck,
+  inspectNativeCheckProcessTreeLiveness,
+  isNativeCheckTerminationUnconfirmedError,
   nativeCheckPlanKey,
   nativePortableArgvDisplay,
   preflightNativeCheckPlans,
@@ -57,6 +84,11 @@ import {
   writePortableMutation,
 } from './native-portable-storage.js';
 import { ensureNativePortableAcceptanceCurrentLocked } from './native-portable-requirements.js';
+import { readNativeBoundedTextFile } from './native-bounded-file.js';
+import {
+  nativeSourceCommentFingerprint,
+  supportsNativeSourceComments,
+} from './native-source-comments.js';
 
 export function localCheckCwdRef(projectRoot: string, cwd: string): string {
   const relative = path.relative(path.resolve(projectRoot), path.resolve(cwd));
@@ -158,9 +190,7 @@ export async function inspectNativePortableCheckExecution(
   const execution = local.execution;
   if (execution === null || execution.status !== 'running') return 'not-running';
   if (execution.ownerPid === undefined) return 'unknown';
-  // Probe failures land on 'unknown' instead of 'running': the doctor repair path
-  // can take those over, while a host whose probes never succeed no longer parks
-  // the change on an undying zombie owner.
+  // 探测失败保持 unknown；Doctor 仅可接管没有未确认检查进程的 owner 登记。
   const ownerLiveness = await inspectProcessLiveness(execution.ownerPid, execution.ownerIdentity);
   if (ownerLiveness === 'alive') return 'running';
 
@@ -172,7 +202,7 @@ export async function inspectNativePortableCheckExecution(
       unknown = true;
       continue;
     }
-    const liveness = await inspectProcessLiveness(active.pid, active.identity);
+    const liveness = await inspectNativeCheckProcessTreeLiveness(active.pid, active.identity);
     if (liveness === 'alive') return 'running';
     if (liveness === 'unknown') unknown = true;
   }
@@ -263,18 +293,40 @@ export async function digestNativeInputFileContent(
   const handle = await fs.open(file, 'r');
   let total = 0;
   try {
-    const buffer = Buffer.allocUnsafe(NATIVE_INPUT_BASE64_CHUNK_BYTES);
-    while (true) {
-      const { bytesRead } = await handle.read(buffer, 0, buffer.length, null);
+    const buffer = Buffer.allocUnsafe(
+      Math.min(NATIVE_INPUT_BASE64_CHUNK_BYTES, Math.max(3, Math.ceil(before.size / 3) * 3)),
+    );
+    let buffered = 0;
+    // 长度来自读取前的 stat；读后仍核对长度、身份和时间，省去每个文件的额外 EOF 读取。
+    while (total < before.size) {
+      const { bytesRead } = await handle.read(
+        buffer,
+        buffered,
+        Math.min(buffer.length - buffered, before.size - total),
+        null,
+      );
       if (bytesRead === 0) break;
       total += bytesRead;
-      hash.update(buffer.subarray(0, bytesRead).toString('base64'));
+      buffered += bytesRead;
+      // 短读也先补齐三字节对齐的块，只有文件末尾允许 base64 填充。
+      if (buffered === buffer.length || total === before.size) {
+        hash.update(buffer.subarray(0, buffered).toString('base64'));
+        buffered = 0;
+      }
     }
   } finally {
     await handle.close();
   }
   const after = await fs.lstat(file);
-  if (after.size !== before.size || after.mtimeMs !== before.mtimeMs) {
+  if (
+    !after.isFile() ||
+    after.ino !== before.ino ||
+    after.dev !== before.dev ||
+    after.size !== before.size ||
+    after.mtimeMs !== before.mtimeMs ||
+    after.ctimeMs !== before.ctimeMs ||
+    total !== before.size
+  ) {
     throw new Error('Native check input changed while reading');
   }
   return { digest: hash.digest('hex'), size: total };
@@ -344,6 +396,7 @@ const NATIVE_PHYSICAL_INPUT_EXCLUDED_DIRECTORIES = new Set([
 // invalidate its own binding. The project configuration remains an input and is
 // intentionally not excluded.
 const NATIVE_RUNTIME_INPUT_EXCLUSIONS = [
+  ':(exclude).comet/runtime',
   ':(exclude).comet/runtime/**',
   ':(exclude).comet/current-change.json',
 ] as const;
@@ -377,7 +430,11 @@ function isNativeRuntimeInputPath(
   managedArtifactRoot?: string,
 ): boolean {
   const normalized = relative.replaceAll('\\', '/').replace(/^\.\//u, '');
-  if (normalized === '.comet/current-change.json' || normalized.startsWith('.comet/runtime/')) {
+  if (
+    normalized === '.comet/current-change.json' ||
+    normalized === '.comet/runtime' ||
+    normalized.startsWith('.comet/runtime/')
+  ) {
     return true;
   }
   if (
@@ -425,7 +482,7 @@ async function nativeIgnoredCheckInputSnapshot(
   managedArtifactRoot?: string,
   runnerInputs: ReadonlySet<string> = new Set(),
 ): Promise<NativeIgnoredInputSnapshot> {
-  const cwdRefs = [...new Set(plans.map(({ cwdRef }) => cwdRef))];
+  const cwdRefs = [...new Set(plans.length ? plans.map(({ cwdRef }) => cwdRef) : ['.'])];
   if (cwdRefs.length === 0) return { complete: true, files: [] };
 
   let ignoredPaths: string[];
@@ -483,7 +540,7 @@ async function nativePhysicalCheckInputSnapshot(
   managedArtifactRoot?: string,
   runnerInputs: ReadonlySet<string> = new Set(),
 ): Promise<NativeIgnoredInputSnapshot> {
-  const cwdRefs = [...new Set(plans.map(({ cwdRef }) => cwdRef))];
+  const cwdRefs = [...new Set(plans.length ? plans.map(({ cwdRef }) => cwdRef) : ['.'])];
   const files = new Map<string, NativeIgnoredInputFile>();
   let totalBytes = 0;
   const isGeneratedDirectory = (name: string): boolean =>
@@ -523,7 +580,6 @@ async function nativePhysicalCheckInputSnapshot(
         }
         continue;
       }
-      if (!insideGeneratedDirectory) continue;
       if (sensitiveNativeIgnoredInputPath(relative)) return false;
       if (!entry.isFile()) return false;
       try {
@@ -650,7 +706,7 @@ export async function nativeCheckInputFingerprint(options: {
       .split('\0')
       .filter(Boolean)
       .sort();
-    gitSnapshot.diff = await mapWithConcurrency(changed, 4, async (relative) => {
+    gitSnapshot.diff = await mapWithConcurrency(changed, 16, async (relative) => {
       const target = path.resolve(options.projectRoot, ...relative.split('/'));
       try {
         const { digest } = await digestNativeInputFileContent(target);
@@ -686,7 +742,7 @@ export async function nativeCheckInputFingerprint(options: {
       .split('\0')
       .filter(Boolean)
       .sort();
-    gitSnapshot.untracked = await mapWithConcurrency(untracked, 4, async (relative) => {
+    gitSnapshot.untracked = await mapWithConcurrency(untracked, 16, async (relative) => {
       const target = path.resolve(options.projectRoot, ...relative.split('/'));
       try {
         const { digest, size } = await digestNativeInputFileContent(target);
@@ -792,6 +848,12 @@ interface NativeCheckInputGateOptions {
   candidateId: string | null;
   plans?: readonly NativeCheckPlan[];
   managedArtifactRoot?: string;
+  editReviewScope?: EditReviewScope;
+  legacyExecutionBinding?: boolean;
+  /** 仅供 Archive 排除另外绑定的事务写入和迁移材料。 */
+  archiveOwnedPaths?: readonly string[];
+  /** 仅重建原 Archive 事务写入前的候选；调用方仍须匹配旧摘要。 */
+  legacyArchiveOverlay?: NativeLegacyArchiveOverlay;
 }
 
 async function readNativeCheckInputObservation(options: NativeCheckInputGateOptions) {
@@ -799,19 +861,19 @@ async function readNativeCheckInputObservation(options: NativeCheckInputGateOpti
     const runnerInputs = await nativeRunnerInputArtifactPaths(options.projectRoot);
     const exclusions = [
       ...nativeRuntimeInputExclusions(options.projectRoot, options.managedArtifactRoot),
+      ...(options.archiveOwnedPaths ?? []).map((ref) => `:(exclude,literal)${ref}`),
       ...[...runnerInputs].map((relative) => `:(exclude,literal)${relative}`),
     ];
     const head = runGitCommand(options.projectRoot, ['rev-parse', 'HEAD']);
     const branch = runGitCommand(options.projectRoot, ['branch', '--show-current']);
-    const status = runGitCommand(options.projectRoot, [
-      'status',
-      '--porcelain=v1',
-      '-z',
-      '--untracked-files=all',
-      '--ignore-submodules=none',
-      '--',
-      ...exclusions,
-    ]);
+    const actualStatus = readGitStatusPorcelain(options.projectRoot, exclusions);
+    const status = options.legacyArchiveOverlay
+      ? nativeLegacyArchiveGitStatus(
+          options.projectRoot,
+          actualStatus,
+          options.legacyArchiveOverlay,
+        )
+      : actualStatus;
     const staged = runGitCommand(options.projectRoot, [
       'ls-files',
       '--stage',
@@ -821,7 +883,7 @@ async function readNativeCheckInputObservation(options: NativeCheckInputGateOpti
     ]);
     if (head === null || status === null) return null;
     const workingTree: Array<{ path: string; digest: string | null }> = [];
-    for (const changedPath of gitStatusPaths(options.projectRoot).filter(
+    for (const changedPath of parseGitStatusPaths(status).filter(
       (changedPath) =>
         !runnerInputs.has(changedPath) &&
         !isNativeRuntimeInputPath(changedPath, options.projectRoot, options.managedArtifactRoot),
@@ -829,7 +891,11 @@ async function readNativeCheckInputObservation(options: NativeCheckInputGateOpti
       const target = path.resolve(options.projectRoot, ...changedPath.split('/'));
       let digest: string | null = null;
       try {
-        digest = (await digestNativeInputFileContent(target)).digest;
+        const virtual = options.legacyArchiveOverlay?.get(changedPath);
+        if (virtual?.text === null) return null;
+        digest = virtual
+          ? digestNativeCheckInput((virtual.bytes ?? Buffer.from(virtual.text!)).toString('base64'))
+          : (await digestNativeInputFileContent(target)).digest;
       } catch {
         // A dirty submodule is a directory. Its porcelain entry alone cannot
         // distinguish two different dirty contents, so disable the fast gate
@@ -891,6 +957,214 @@ export async function nativeCheckInputGate(
   return nativeCheckGateFromObservation(options, await readNativeCheckInputObservation(options));
 }
 
+async function nativeCandidateCommentGate(
+  options: NativeCheckInputGateOptions,
+  observation: Awaited<ReturnType<typeof readNativeCheckInputObservation>>,
+): Promise<string | null> {
+  if (!observation) {
+    try {
+      // 非 Git 工作区也比较实际源码；不完整读取不能证明候选未变。
+      const runnerInputs = await nativeRunnerInputArtifactPaths(options.projectRoot);
+      const physical = await nativePhysicalCheckInputSnapshot(
+        options.projectRoot,
+        options.plans ?? [],
+        options.managedArtifactRoot,
+        runnerInputs,
+      );
+      if (!physical.complete) return null;
+      if (options.legacyArchiveOverlay) {
+        const files = new Map(physical.files.map((file) => [file.path, file]));
+        for (const [ref, original] of options.legacyArchiveOverlay) {
+          if (original.text === null) files.delete(ref);
+          else if (
+            (options.plans?.length ? options.plans.map(({ cwdRef }) => cwdRef) : ['.']).some(
+              (cwd) => cwd === '.' || ref === cwd || ref.startsWith(`${cwd}/`),
+            ) &&
+            !ref
+              .split('/')
+              .slice(0, -1)
+              .some((part) => NATIVE_PHYSICAL_INPUT_EXCLUDED_DIRECTORIES.has(part)) &&
+            !isNativeRuntimeInputPath(ref, options.projectRoot, options.managedArtifactRoot)
+          )
+            files.set(ref, {
+              path: ref,
+              digest: digestNativeCheckInput(
+                (original.bytes ?? Buffer.from(original.text)).toString('base64'),
+              ),
+              size: original.bytes?.length ?? Buffer.byteLength(original.text),
+            });
+        }
+        physical.files = [...files.values()].sort((left, right) =>
+          left.path.localeCompare(right.path, 'en'),
+        );
+      }
+      observation = {
+        runnerInputs,
+        binding: {
+          candidateId: options.candidateId,
+          head: '',
+          branch: '',
+          status: '',
+          staged: '',
+          workingTree: physical.files
+            .filter(
+              ({ path: ref }) =>
+                !(options.archiveOwnedPaths ?? []).some(
+                  (owned) => ref === owned || ref.startsWith(`${owned}/`),
+                ),
+            )
+            .map(({ path, digest }) => ({ path, digest })),
+          projectRoot: path.resolve(options.projectRoot),
+          machineId: os.hostname(),
+          execPath: process.execPath,
+          node: process.version,
+          platform: process.platform,
+          arch: process.arch,
+          boundEnvironment: boundEnvironmentEntries(),
+        },
+      };
+    } catch {
+      return null;
+    }
+  }
+  const unchangedPaths = new Set<string>();
+  const workingTree: typeof observation.binding.workingTree = [];
+  const index = new Map(
+    observation.binding.staged.split('\0').flatMap((record) => {
+      const match = record.match(/^(100644|100755) ([a-f0-9]+) 0\t(.+)$/u);
+      return match ? [[match[3], { mode: match[1], objectId: match[2] }] as const] : [];
+    }),
+  );
+  const config = await readProjectConfig(options.projectRoot);
+  const reviews = options.editReviewScope ? await inspectEditReviews(options.editReviewScope) : [];
+  for (let offset = 0; offset < observation.binding.workingTree.length; offset += 64) {
+    const batch = observation.binding.workingTree.slice(offset, offset + 64);
+    let indexedBlobs: Map<string, string>;
+    try {
+      indexedBlobs = readGitBlobs(
+        options.projectRoot,
+        batch.flatMap((entry) => {
+          const indexed = index.get(entry.path);
+          return indexed ? [indexed.objectId] : [];
+        }),
+      );
+    } catch {
+      return null;
+    }
+    for (const entry of batch) {
+      if (
+        config?.native.document_writes !== 'revert' &&
+        isNeutralDocumentPath(entry.path, [
+          '.comet',
+          ...(options.managedArtifactRoot
+            ? [
+                path
+                  .relative(options.projectRoot, path.join(options.managedArtifactRoot, 'comet'))
+                  .replaceAll('\\', '/'),
+              ]
+            : []),
+        ])
+      ) {
+        unchangedPaths.add(entry.path);
+        continue;
+      }
+      if (!supportsNativeSourceComments(entry.path) && !options.editReviewScope) {
+        workingTree.push(entry);
+        continue;
+      }
+      try {
+        const virtual = options.legacyArchiveOverlay?.get(entry.path);
+        if (virtual?.bytes && !Buffer.from(virtual.text ?? '').equals(virtual.bytes))
+          throw new Error('旧 Archive 二进制材料沿用原始字节摘要');
+        const source =
+          virtual?.text != null
+            ? { text: virtual.text }
+            : await readNativeBoundedTextFile({
+                root: options.projectRoot,
+                ref: entry.path,
+              });
+        if (digestNativeCheckInput(Buffer.from(source.text).toString('base64')) !== entry.digest)
+          return null;
+        const reviewed = options.editReviewScope
+          ? await approvedEditFingerprint(options.editReviewScope, entry.path, source.text, reviews)
+          : null;
+        const fingerprint =
+          reviewed?.fingerprint ?? nativeSourceCommentFingerprint(entry.path, source.text);
+        if (!fingerprint) {
+          workingTree.push(entry);
+          continue;
+        }
+        const indexed = index.get(entry.path);
+        if (indexed) {
+          const mode =
+            virtual?.mode ?? (await fs.lstat(path.resolve(options.projectRoot, entry.path))).mode;
+          // chmod、重命名和删除仍需新候选，不能被注释判定掩盖。
+          const modeMatches =
+            process.platform === 'win32' || Boolean(mode & 0o111) === (indexed.mode === '100755');
+          const indexedSource = indexedBlobs.get(indexed.objectId);
+          if (indexedSource === undefined) {
+            workingTree.push(entry);
+            continue;
+          }
+          if (
+            modeMatches &&
+            (reviewed
+              ? editContentHash(indexedSource) === reviewed.beforeHash
+              : nativeSourceCommentFingerprint(entry.path, indexedSource) === fingerprint)
+          ) {
+            unchangedPaths.add(entry.path);
+            continue;
+          }
+        }
+        const mode =
+          virtual?.mode ?? (await fs.lstat(path.resolve(options.projectRoot, entry.path))).mode;
+        workingTree.push({
+          path: entry.path,
+          digest:
+            reviewed && !reviewed.semantic
+              ? fingerprint
+              : canonicalHash('comet.native.comment-source.v1', {
+                  fingerprint,
+                  executable: process.platform === 'win32' ? false : Boolean(mode & 0o111),
+                }),
+        });
+      } catch {
+        // 二进制、大文件及不支持的语法沿用真实内容绑定。
+        workingTree.push(entry);
+      }
+    }
+  }
+  const status = observation.binding.status
+    .split('\0')
+    .filter((record) => {
+      if (config?.native.document_writes !== 'revert') {
+        const ref = record.length >= 4 ? record.slice(3) : '';
+        if (
+          unchangedPaths.has(ref) &&
+          isNeutralDocumentPath(ref, ['.comet', ...(options.editReviewScope?.formalPrefixes ?? [])])
+        )
+          return false;
+      }
+      const match = record.trimStart().match(/^M (.+)$/u);
+      return !match || !unchangedPaths.has(match[1]);
+    })
+    .join('\0')
+    .trim();
+  // 执行环境仍绑定检查收据；候选语义只绑定实现，环境变化可重跑检查。
+  const { boundEnvironment: _environment, ...candidateBinding } = observation.binding;
+  void _environment;
+  return canonicalHash(
+    options.legacyExecutionBinding
+      ? 'comet.native.candidate-comment-gate.v1'
+      : 'comet.native.candidate-comment-gate.v2',
+    {
+      ...(options.legacyExecutionBinding ? observation.binding : candidateBinding),
+      status,
+      workingTree,
+    },
+  );
+}
+
 /** Share only the reservation's observation; checks and later requests still capture fresh inputs. */
 async function nativeCheckInputGates(options: NativeCheckInputGateOptions) {
   const observation = await readNativeCheckInputObservation(options);
@@ -900,8 +1174,14 @@ async function nativeCheckInputGates(options: NativeCheckInputGateOptions) {
         ? currentBranch(options.projectRoot)
         : observation.binding.branch || null,
     gate: await nativeCheckGateFromObservation(options, observation),
-    candidateGate: await nativeCheckGateFromObservation({ ...options, plans: [] }, observation),
+    candidateGate: await nativeCandidateCommentGate(options, observation),
   };
+}
+
+export async function nativeCandidateInputGate(
+  options: NativeCheckInputGateOptions,
+): Promise<string | null> {
+  return nativeCandidateCommentGate(options, await readNativeCheckInputObservation(options));
 }
 
 export function authoritativePortableChecks(options: {
@@ -993,14 +1273,20 @@ export async function readCurrentLocalExecution(options: {
     const local = await readNativeLocalExecution(
       nativeLocalExecutionFile(options.paths, options.state.name),
     );
+    const action = activeNativeVerifierAction(options.state);
+    const boundToAction =
+      action &&
+      local?.execution?.operationId === action.id &&
+      local?.candidateId === options.state.builder_handoff?.candidate_id;
     if (
       local === null ||
       local.change !== options.state.name ||
-      local.basedOnStateVersion !== options.state.state_version
+      (local.basedOnStateVersion !== options.state.state_version && !boundToAction) ||
+      (action && !boundToAction)
     ) {
       return null;
     }
-    return local;
+    return { ...local, basedOnStateVersion: options.state.state_version };
   } catch {
     return null;
   }
@@ -1016,6 +1302,15 @@ export async function persistVerifierExecutionError(options: {
     state: options.state,
     summary: options.summary,
   });
+  const action = currentNativeVerifierAction(options.state, local);
+  const executionRef = nativeVerifierActionExecutionRef(action);
+  if (executionRef)
+    next.verifier_action = completeNativeVerifierAction({
+      action,
+      executionRef,
+      response: { kind: 'execution-error', summary: options.summary },
+      status: 'failed',
+    }).action;
   const written = await writePortableMutation({
     paths: options.paths,
     previous: options.state,
@@ -1175,6 +1470,7 @@ async function reserveNativePortableCheckPlan(options: {
         candidateId: state.builder_handoff?.candidate_id ?? null,
         plans: options.plans,
         managedArtifactRoot: options.paths.artifactRoot,
+        editReviewScope: nativeEditReviewScope(options.paths, state),
       });
       let branch = observedBranch;
       const file = nativeLocalExecutionFile(options.paths, state.name);
@@ -1274,7 +1570,7 @@ async function reserveNativePortableCheckPlan(options: {
         if (liveness !== 'orphaned') {
           throw new Error(
             liveness === 'unknown'
-              ? 'Native check plan owner could not be proven to have exited; inspect the Runtime overlay before changing its binding'
+              ? 'Native check plan owner or process tree could not be proven to have exited; inspect the Runtime overlay before changing its binding'
               : 'Native check plan is already in progress on another workspace binding',
           );
         }
@@ -1347,7 +1643,7 @@ async function reserveNativePortableCheckPlan(options: {
           if (liveness !== 'orphaned') {
             throw new Error(
               liveness === 'unknown'
-                ? 'Native check plan owner could not be proven to have exited; inspect the Runtime overlay before retrying'
+                ? 'Native check plan owner or process tree could not be proven to have exited; inspect the Runtime overlay before retrying'
                 : 'Native check plan is already in progress',
             );
           }
@@ -1694,6 +1990,7 @@ export async function executeNativePortableCheckPlan(options: {
       }),
     });
   } catch (error) {
+    if (isNativeCheckTerminationUnconfirmedError(error)) throw error;
     try {
       await updateReservedNativeCheckPlan({
         paths: options.paths,
@@ -1835,6 +2132,29 @@ export async function reserveVerifierRequestedChecks(options: {
   response: Extract<NativeVerifierResponse, { kind: 'request-checks' }>;
   suppliedChecks: readonly NativePortableCheckSummary[];
 }): Promise<NativeVerifierRequestedCheckReservation> {
+  const action = currentNativeVerifierAction(options.state, options.local);
+  const started = startNativeVerifierAction(action, options.envelope.verifierExecutionRef);
+  if (!options.state.verifier_action || action.status === 'pending') {
+    const written = await writePortableMutation({
+      paths: options.paths,
+      previous: options.state,
+      next: {
+        ...options.state,
+        state_version: options.state.state_version + 1,
+        verifier_action: started,
+      },
+    });
+    options = {
+      ...options,
+      state: written,
+      local: { ...options.local, basedOnStateVersion: written.state_version },
+    };
+    await writeNativeLocalExecution(
+      nativeLocalExecutionFile(options.paths, written.name),
+      options.local,
+      { containedRoot: options.paths.runtimeDir },
+    );
+  }
   const file = nativeLocalExecutionFile(options.paths, options.state.name);
   const local = options.local;
   if (
@@ -2098,6 +2418,7 @@ export async function executeReservedVerifierRequestedChecks(options: {
       }),
     });
   } catch (error) {
+    if (isNativeCheckTerminationUnconfirmedError(error)) throw error;
     try {
       await updateReservedVerifierRequestedChecks({
         paths: options.paths,

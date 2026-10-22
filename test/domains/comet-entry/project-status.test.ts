@@ -2,7 +2,7 @@ import { promises as fs } from 'fs';
 import { spawnSync } from 'child_process';
 import os from 'os';
 import path from 'path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { inspectCometProjectStatus } from '../../../domains/comet-entry/project-status.js';
 import {
@@ -15,6 +15,11 @@ import {
 } from '../../../domains/comet-native/native-config.js';
 import { nativeProjectPaths } from '../../../domains/comet-native/native-paths.js';
 import { createNativePortableChange } from '../../../domains/comet-native/native-portable-runtime.js';
+import * as nativeDiagnostics from '../../../domains/comet-native/native-diagnostics.js';
+import * as portableRuntime from '../../../domains/comet-native/native-portable-runtime.js';
+import * as protectedClassic from '../../../domains/comet-classic/classic-protected-path.js';
+import * as projectConfigReader from '../../../domains/workflow-contract/project-config-reader.js';
+import * as classicStore from '../../../domains/comet-classic/classic-store.js';
 
 const VALID_BRIEF = `# Outcome
 Ship one outcome.
@@ -35,6 +40,14 @@ Run focused checks.
 `;
 
 const classicStateScript = path.resolve('assets', 'skills', 'comet', 'scripts', 'comet-state.mjs');
+
+function initializeGitProject(projectRoot: string): void {
+  const initialized = spawnSync('git', ['init', '-b', 'main'], {
+    cwd: projectRoot,
+    encoding: 'utf8',
+  });
+  expect(initialized.status, initialized.stderr).toBe(0);
+}
 
 function bothProjectConfig(nativeRoot: string) {
   const config = defaultProjectConfig(nativeRoot);
@@ -62,10 +75,14 @@ async function writeClassicOnlyConfig(projectRoot: string): Promise<void> {
 
 async function initializeClassicChange(projectRoot: string, name: string): Promise<void> {
   await fs.mkdir(path.join(projectRoot, 'openspec'), { recursive: true });
-  const result = spawnSync(process.execPath, [classicStateScript, 'init', name, 'full'], {
-    cwd: projectRoot,
-    encoding: 'utf8',
-  });
+  const result = spawnSync(
+    process.execPath,
+    [classicStateScript, 'init', name, 'full', '--runtime', 'compat'],
+    {
+      cwd: projectRoot,
+      encoding: 'utf8',
+    },
+  );
   expect(result.status, result.stderr).toBe(0);
 }
 
@@ -98,7 +115,95 @@ describe('Comet project status', () => {
     await fs.rm(projectRoot, { recursive: true, force: true });
   });
 
+  it('reuses the inspected config for entry resolution and observes later config edits', async () => {
+    await writeProjectConfig(projectRoot, defaultProjectConfig('.'));
+    await fs.mkdir(path.join(projectRoot, 'openspec', 'changes'), { recursive: true });
+    const read = vi.spyOn(projectConfigReader, 'readWorkflowProjectConfig');
+    try {
+      expect((await inspectCometProjectStatus(projectRoot)).defaultEntry).toMatchObject({
+        workflow: 'native',
+      });
+      expect(read).toHaveBeenCalledTimes(1);
+      await writeClassicOnlyConfig(projectRoot);
+      expect((await inspectCometProjectStatus(projectRoot)).defaultEntry).toMatchObject({
+        workflow: 'classic',
+      });
+      expect(read.mock.calls.length).toBeGreaterThan(1);
+    } finally {
+      read.mockRestore();
+    }
+  });
+
+  it('bounds Native inspections and preserves discovery order', async () => {
+    await writeProjectConfig(projectRoot, defaultProjectConfig('.'));
+    const names = Array.from(
+      { length: 24 },
+      (_, index) => `change-${String(index).padStart(2, '0')}`,
+    );
+    const listed = vi.spyOn(nativeDiagnostics, 'listNativeChangeNames').mockResolvedValue(names);
+    const portable = vi.spyOn(portableRuntime, 'isNativePortableChange').mockResolvedValue(false);
+    let active = 0;
+    let maximum = 0;
+    const inspected = vi
+      .spyOn(nativeDiagnostics, 'inspectNativeStatus')
+      .mockImplementation(async (_paths, name) => {
+        active++;
+        maximum = Math.max(maximum, active);
+        await new Promise((resolve) => setTimeout(resolve, name.endsWith('0') ? 10 : 1));
+        active--;
+        return { name } as Awaited<ReturnType<typeof nativeDiagnostics.inspectNativeStatus>>;
+      });
+    try {
+      const status = await inspectCometProjectStatus(projectRoot);
+      expect(status.workflows.native.changes.map((change) => change.name)).toEqual(names);
+      expect(maximum).toBeGreaterThan(1);
+      expect(maximum).toBeLessThanOrEqual(8);
+    } finally {
+      listed.mockRestore();
+      portable.mockRestore();
+      inspected.mockRestore();
+    }
+  });
+
+  it('inspects Classic changes concurrently while retaining stable sorted output', async () => {
+    await writeClassicOnlyConfig(projectRoot);
+    const names = Array.from(
+      { length: 20 },
+      (_, index) => `change-${String(index).padStart(2, '0')}`,
+    );
+    for (const name of names) {
+      const directory = path.join(projectRoot, 'openspec', 'changes', name);
+      await fs.mkdir(directory, { recursive: true });
+      await fs.writeFile(path.join(directory, 'tasks.md'), '- [ ] task\n');
+    }
+    const original = protectedClassic.readClassicProjectFile;
+    let active = 0;
+    let maximum = 0;
+    const read = vi
+      .spyOn(protectedClassic, 'readClassicProjectFile')
+      .mockImplementation(async (...args) => {
+        if (!String(args[1]).endsWith('tasks.md')) return original(...args);
+        active++;
+        maximum = Math.max(maximum, active);
+        try {
+          await new Promise((resolve) => setTimeout(resolve, 5));
+          return await original(...args);
+        } finally {
+          active--;
+        }
+      });
+    try {
+      const status = await inspectCometProjectStatus(projectRoot);
+      expect(status.unmanagedOpenSpec.map((change) => change.name)).toEqual(names);
+      expect(maximum).toBeGreaterThan(1);
+      expect(maximum).toBeLessThanOrEqual(8);
+    } finally {
+      read.mockRestore();
+    }
+  });
+
   it('partitions configured Native changes under a versioned status contract', async () => {
+    initializeGitProject(projectRoot);
     await writeProjectConfig(projectRoot, defaultProjectConfig('.'));
     const paths = await nativeProjectPaths(projectRoot, '.');
     const state = await createNativeChange({ paths, name: 'native-only', language: 'en' });
@@ -282,6 +387,32 @@ describe('Comet project status', () => {
     expect(status.unmanagedOpenSpec).toEqual([]);
   });
 
+  it('reads each Classic projection once per status request and observes subsequent edits', async () => {
+    await writeClassicOnlyConfig(projectRoot);
+    await initializeClassicChange(projectRoot, 'read-once');
+    const read = vi.spyOn(classicStore, 'readClassicState');
+    try {
+      const status = await inspectCometProjectStatus(projectRoot);
+      expect(status.workflows.classic.changes[0]).toMatchObject({
+        name: 'read-once',
+        phase: 'open',
+      });
+      expect(read).toHaveBeenCalledTimes(1);
+
+      const statePath = path.join(projectRoot, 'openspec', 'changes', 'read-once', '.comet.yaml');
+      await fs.appendFile(statePath, '\nunknown_status_field: true\n');
+      const updated = await inspectCometProjectStatus(projectRoot);
+      expect(read).toHaveBeenCalledTimes(2);
+      expect(updated.workflows.classic.changes[0]).toMatchObject({
+        name: 'read-once',
+        phase: 'invalid',
+        error: expect.stringContaining('unknown_status_field'),
+      });
+    } finally {
+      read.mockRestore();
+    }
+  });
+
   it('reports Classic unavailable without guessing a legacy root when project config is malformed', async () => {
     await writeClassicOnlyConfig(projectRoot);
     await initializeClassicChange(projectRoot, 'classic-survives');
@@ -392,6 +523,7 @@ describe('Comet project status', () => {
   });
 
   it('keeps same-name Native and Classic changes separate under a custom artifact root', async () => {
+    initializeGitProject(projectRoot);
     await writeProjectConfig(projectRoot, bothProjectConfig('docs'));
     const paths = await nativeProjectPaths(projectRoot, 'docs');
     const native = await createNativeChange({ paths, name: 'shared-name', language: 'en' });
@@ -408,6 +540,7 @@ describe('Comet project status', () => {
   });
 
   it('reports an incomplete Native artifact-root move instead of projecting stale changes', async () => {
+    initializeGitProject(projectRoot);
     await writeProjectConfig(projectRoot, defaultProjectConfig('.'));
     const paths = await nativeProjectPaths(projectRoot, '.');
     const native = await createNativeChange({ paths, name: 'stale-change', language: 'en' });
@@ -431,6 +564,7 @@ describe('Comet project status', () => {
   });
 
   it('discovers the configured project from a nested working directory', async () => {
+    initializeGitProject(projectRoot);
     await writeProjectConfig(projectRoot, bothProjectConfig('docs'));
     const paths = await nativeProjectPaths(projectRoot, 'docs');
     const native = await createNativeChange({ paths, name: 'nested-native', language: 'en' });
@@ -449,6 +583,7 @@ describe('Comet project status', () => {
   });
 
   it('does not let corrupt changes on either workflow hide healthy changes', async () => {
+    initializeGitProject(projectRoot);
     await writeProjectConfig(projectRoot, bothProjectConfig('.'));
     const paths = await nativeProjectPaths(projectRoot, '.');
     const healthyNative = await createNativeChange({
@@ -512,6 +647,7 @@ describe('Comet project status', () => {
   });
 
   it('reads mixed Native, Classic, and OpenSpec status without changing project files', async () => {
+    initializeGitProject(projectRoot);
     await writeProjectConfig(projectRoot, bothProjectConfig('docs'));
     const paths = await nativeProjectPaths(projectRoot, 'docs');
     const native = await createNativeChange({ paths, name: 'native-readonly', language: 'en' });

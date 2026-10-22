@@ -83,10 +83,13 @@ async function ensureConfig(
   return false;
 }
 
-async function appendLocalExclude(projectRoot: string, worktreePath: string): Promise<boolean> {
-  if (!isInside(projectRoot, worktreePath)) return false;
-  const relative = path.relative(projectRoot, worktreePath).replaceAll('\\', '/');
-  const pattern = `/${relative.replace(/\/+$/u, '')}/`;
+async function appendLocalExclude(projectRoot: string, worktreePath?: string): Promise<boolean> {
+  // 历史分支可能尚未包含新的 .gitignore；本机 fence 不能把准备好的 worktree 变脏。
+  const patterns = ['/.comet/runtime'];
+  if (worktreePath && isInside(projectRoot, worktreePath)) {
+    const relative = path.relative(projectRoot, worktreePath).replaceAll('\\', '/');
+    patterns.push(`/${relative.replace(/\/+$/u, '')}/`);
+  }
   const rawCommonDir = runGitCommand(projectRoot, ['rev-parse', '--git-common-dir']);
   const commonDir = path.resolve(projectRoot, rawCommonDir);
   const excludeFile = path.join(commonDir, 'info', 'exclude');
@@ -96,10 +99,11 @@ async function appendLocalExclude(projectRoot: string, worktreePath: string): Pr
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
   }
-  if (existing.split(/\r?\n/u).includes(pattern)) return false;
+  const missing = patterns.filter((pattern) => !existing.split(/\r?\n/u).includes(pattern));
+  if (missing.length === 0) return false;
   await fs.mkdir(path.dirname(excludeFile), { recursive: true });
   const prefix = existing.length === 0 || existing.endsWith('\n') ? '' : '\n';
-  await fs.appendFile(excludeFile, `${prefix}${pattern}\n`, 'utf8');
+  await fs.appendFile(excludeFile, `${prefix}${missing.join('\n')}\n`, 'utf8');
   return true;
 }
 
@@ -214,6 +218,8 @@ export async function prepareNativeWorkspace(options: {
         throw new Error(`Native target branch is not a verified local branch: ${targetBranch}`);
       }
 
+      const runtimeExcludeUpdated = await appendLocalExclude(context.primaryWorktreeRoot);
+
       if (options.isolation === 'branch') {
         if (options.worktreePath) {
           throw new Error('--worktree-path is only valid with --isolation worktree');
@@ -243,7 +249,7 @@ export async function prepareNativeWorkspace(options: {
               worktreePath: null,
               createdBranch,
               createdWorktree: false,
-              gitExcludeUpdated: false,
+              gitExcludeUpdated: runtimeExcludeUpdated,
               configInitialized: false,
             },
             { cause: error },
@@ -260,7 +266,7 @@ export async function prepareNativeWorkspace(options: {
             worktreePath: null,
             createdBranch,
             createdWorktree: false,
-            gitExcludeUpdated: false,
+            gitExcludeUpdated: runtimeExcludeUpdated,
             configInitialized,
           },
         };
@@ -295,7 +301,7 @@ export async function prepareNativeWorkspace(options: {
               worktreePath: initialRoot,
               createdBranch: false,
               createdWorktree: false,
-              gitExcludeUpdated: false,
+              gitExcludeUpdated: runtimeExcludeUpdated,
               configInitialized: false,
             },
             { cause: error },
@@ -312,7 +318,7 @@ export async function prepareNativeWorkspace(options: {
             worktreePath: initialRoot,
             createdBranch: false,
             createdWorktree: false,
-            gitExcludeUpdated: false,
+            gitExcludeUpdated: runtimeExcludeUpdated,
             configInitialized,
           },
         };
@@ -342,7 +348,7 @@ export async function prepareNativeWorkspace(options: {
               worktreePath: existing.root,
               createdBranch: false,
               createdWorktree: false,
-              gitExcludeUpdated: false,
+              gitExcludeUpdated: runtimeExcludeUpdated,
               configInitialized: false,
             },
             { cause: error },
@@ -359,7 +365,7 @@ export async function prepareNativeWorkspace(options: {
             worktreePath: existing.root,
             createdBranch: false,
             createdWorktree: false,
-            gitExcludeUpdated: false,
+            gitExcludeUpdated: runtimeExcludeUpdated,
             configInitialized,
           },
         };
@@ -378,7 +384,11 @@ export async function prepareNativeWorkspace(options: {
         options.worktreePath,
       );
       await assertPathAbsent(worktreePath);
-      const gitExcludeUpdated = await appendLocalExclude(context.primaryWorktreeRoot, worktreePath);
+      const worktreeExcludeUpdated = await appendLocalExclude(
+        context.primaryWorktreeRoot,
+        worktreePath,
+      );
+      const gitExcludeUpdated = runtimeExcludeUpdated || worktreeExcludeUpdated;
       const preparation: NativeWorkspacePreparation = {
         isolation: 'worktree',
         projectRoot: worktreePath,

@@ -4,6 +4,10 @@ import path from 'node:path';
 
 import { atomicWriteJson, type NativeAtomicWriteOptions } from './native-atomic-file.js';
 import {
+  activeNativeVerifierAction,
+  nativeVerifierActionExecutionRef,
+} from './native-verifier-action.js';
+import {
   NATIVE_LOCAL_EXECUTION_SCHEMA,
   type NativeLocalCheckState,
   type NativeLocalExecutionState,
@@ -389,13 +393,15 @@ export async function readNativeLocalExecution(
 
 /**
  * Return the currently running Verifier execution identity only when the
- * local overlay is bound to this exact portable state and candidate. Status,
+ * portable Action or local overlay is bound to this exact state and candidate. Status,
  * Show, and Next must not print an identity from a stale or completed run.
  */
 export function nativeVerifierExecutionRefForState(
   state: NativePortableState,
   local: NativeLocalExecutionState | null,
 ): string | undefined {
+  const action = activeNativeVerifierAction(state);
+  if (action) return nativeVerifierActionExecutionRef(action) ?? undefined;
   const execution = local?.execution;
   if (
     state.phase !== 'verify' ||
@@ -422,8 +428,11 @@ export function nativeVerifierStartupConfirmationForState(
   state: NativePortableState,
   local: NativeLocalExecutionState | null,
 ): 'unconfirmed' | 'confirmed' | undefined {
+  const action = activeNativeVerifierAction(state);
+  if (action) return action.claim ? 'confirmed' : 'unconfirmed';
   if (nativeVerifierExecutionRefForState(state, local) === undefined) return undefined;
-  return local!.execution!.verifierStartedAt != null || local!.execution!.requestCheckRounds > 0
+  return local?.execution?.verifierStartedAt != null ||
+    (local?.execution?.requestCheckRounds ?? 0) > 0
     ? 'confirmed'
     : 'unconfirmed';
 }

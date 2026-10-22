@@ -1,11 +1,16 @@
+import { resolveCometDaemonRoute, shouldAutoStartCometDaemon } from './comet-daemon-route.js';
 import { spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import {
   closeSync,
+  constants,
   existsSync,
+  fstatSync,
+  lstatSync,
   mkdirSync,
   openSync,
-  readFileSync,
-  statSync,
+  readSync,
+  renameSync,
   unlinkSync,
   writeFileSync,
 } from 'node:fs';
@@ -13,33 +18,10 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const CLASSIC_READ_COMMANDS = new Set(['current', 'next']);
-const NATIVE_READ_COMMANDS = new Set(['status', 'show', 'root']);
+export { resolveCometDaemonRoute, shouldAutoStartCometDaemon } from './comet-daemon-route.js';
 
-function packageVersion() {
-  try {
-    return JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
-  } catch {
-    return 'unknown';
-  }
-}
-
-function daemonBuildId(serverPath) {
-  try {
-    const assetPaths = [
-      serverPath,
-      fileURLToPath(new URL('../dist/platform/process/comet-daemon.js', import.meta.url)),
-      fileURLToPath(new URL('../assets/skills/comet/scripts/comet-runtime.mjs', import.meta.url)),
-      fileURLToPath(
-        new URL('../assets/skills/comet-native/scripts/comet-native-runtime.mjs', import.meta.url),
-      ),
-    ];
-    const stamps = assetPaths.map((file) => Math.trunc(statSync(file).mtimeMs)).join('-');
-    return `${packageVersion()}:${stamps}`;
-  } catch {
-    return packageVersion();
-  }
-}
+const AUTO_DAEMON_PROBE_TIMEOUT_MS = 100;
+const AUTO_DAEMON_RETRY_DELAY_MS = 15_000;
 
 function projectRootFromArgs(args) {
   const index = args.indexOf('--project-root');
@@ -53,22 +35,6 @@ function projectRootFromArgs(args) {
     if (parent === cursor) return path.resolve(process.cwd());
     cursor = parent;
   }
-}
-
-function route(argv) {
-  if (argv.length === 0 || argv.includes('--help') || argv.includes('-h')) return null;
-  if (argv.some((value) => value.startsWith('--comet-'))) return null;
-  if (argv[0] === 'state' && CLASSIC_READ_COMMANDS.has(argv[1])) {
-    return { runtime: 'classic', commandArgs: [...argv] };
-  }
-  if (
-    argv[0] === 'native' &&
-    NATIVE_READ_COMMANDS.has(argv[1]) &&
-    !(argv[1] === 'root' && argv[2] && argv[2] !== 'show')
-  ) {
-    return { runtime: 'native', commandArgs: [argv[1], ...argv.slice(2)] };
-  }
-  return null;
 }
 
 async function daemonModule() {
@@ -91,18 +57,90 @@ function launchLockPath(endpoint) {
   return path.join(os.tmpdir(), 'comet-daemon-launch', `${key}.lock`);
 }
 
+function launchRetryPath(endpoint) {
+  return `${launchLockPath(endpoint)}.retry`;
+}
+
+function checkLaunchDirectory(file) {
+  const directory = lstatSync(path.dirname(file));
+  if (
+    !directory.isDirectory() ||
+    (typeof process.getuid === 'function' && directory.uid !== process.getuid()) ||
+    (process.platform !== 'win32' && (directory.mode & 0o022) !== 0)
+  ) {
+    throw new Error('Unsafe Comet daemon launch directory');
+  }
+}
+
+function removeLaunchFile(file) {
+  if (!file) return;
+  try {
+    checkLaunchDirectory(file);
+    unlinkSync(file);
+  } catch {
+    // 启动记录清理失败不能阻止本地 Runtime 回退；后续启动仍可按期限重试。
+  }
+}
+
+function launchRetryAge(file) {
+  let fd;
+  try {
+    checkLaunchDirectory(file);
+    if (!lstatSync(file).isFile()) return Infinity;
+    fd = openSync(
+      file,
+      constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0),
+    );
+    const stats = fstatSync(fd);
+    if (!stats.isFile() || stats.size > 64) return Infinity;
+    const buffer = Buffer.alloc(65);
+    const bytes = readSync(fd, buffer, 0, buffer.length, 0);
+    if (bytes > 64) return Infinity;
+    return Date.now() - Number(buffer.toString('utf8', 0, bytes));
+  } catch (error) {
+    if (error?.code === 'ENOENT' || error?.code === 'ELOOP') return Infinity;
+    throw error;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+}
+
+function writeLaunchRetry(file) {
+  checkLaunchDirectory(file);
+  const temporary = `${file}.${randomUUID()}.tmp`;
+  const fd = openSync(temporary, 'wx', 0o600);
+  try {
+    try {
+      writeFileSync(fd, String(Date.now()), 'utf8');
+    } finally {
+      closeSync(fd);
+    }
+    // 替换路径本身，不跟随已有符号链接写入其他文件。
+    renameSync(temporary, file);
+  } finally {
+    removeLaunchFile(temporary);
+  }
+}
+
 function takeLaunchLock(endpoint) {
   const lockPath = launchLockPath(endpoint);
   mkdirSync(path.dirname(lockPath), { recursive: true, mode: 0o700 });
+  checkLaunchDirectory(lockPath);
+  let created = false;
   try {
     const fd = openSync(lockPath, 'wx');
-    writeFileSync(fd, `${process.pid}\n`, 'utf8');
-    closeSync(fd);
+    created = true;
+    try {
+      writeFileSync(fd, `${process.pid}\n`, 'utf8');
+    } finally {
+      closeSync(fd);
+    }
     return lockPath;
   } catch (error) {
+    if (created) removeLaunchFile(lockPath);
     if (error?.code !== 'EEXIST') return null;
     try {
-      if (Date.now() - statSync(lockPath).mtimeMs > 15_000) unlinkSync(lockPath);
+      if (Date.now() - lstatSync(lockPath).mtimeMs > 15_000) unlinkSync(lockPath);
     } catch {
       // Another launcher may be holding or removing the lock.
     }
@@ -110,12 +148,23 @@ function takeLaunchLock(endpoint) {
   }
 }
 
-function startServer(module, endpoint, buildId, projectRoot) {
+function startServer(module, endpoint, buildId, projectRoot, automatic = false) {
   const entry = serverPath();
   if (!existsSync(entry)) return false;
-  const lockPath = takeLaunchLock(endpoint);
-  if (!lockPath) return false;
+  let lockPath;
   try {
+    lockPath = takeLaunchLock(endpoint);
+    if (!lockPath) return false;
+    if (automatic) {
+      const retryPath = launchRetryPath(endpoint);
+      const age = launchRetryAge(retryPath);
+      if (age >= 0 && age < AUTO_DAEMON_RETRY_DELAY_MS) {
+        removeLaunchFile(lockPath);
+        return false;
+      }
+      // 独立 CLI 进程也共享冷却时间；即使子进程启动失败并移除锁，也不会反复拉起。
+      writeLaunchRetry(retryPath);
+    }
     const cwd = fileURLToPath(new URL('../', import.meta.url));
     const env = {
       ...process.env,
@@ -133,6 +182,7 @@ function startServer(module, endpoint, buildId, projectRoot) {
       if (!launched.started) throw new Error(launched.error ?? 'Windows daemon launch failed');
       return true;
     }
+    const lockIdentity = lstatSync(lockPath);
     const child = spawn(process.execPath, [entry, endpoint.endpoint, buildId, projectRoot], {
       // Keep the detached server out of the project workspace. A daemon must
       // not keep a temporary project root as its process cwd after the client
@@ -143,15 +193,24 @@ function startServer(module, endpoint, buildId, projectRoot) {
       windowsHide: true,
       env,
     });
+    child.once('error', () => {
+      try {
+        const current = lstatSync(lockPath);
+        if (
+          current.dev === lockIdentity.dev &&
+          current.ino === lockIdentity.ino &&
+          current.ctimeMs === lockIdentity.ctimeMs
+        ) {
+          removeLaunchFile(lockPath);
+        }
+      } catch {
+        // 只清理本次启动的锁；其他进程已替换或删除的锁不再归本调用所有。
+      }
+    });
     child.unref();
     return true;
   } catch {
-    try {
-      unlinkSync(lockPath);
-    } catch {
-      // The launcher no longer owns a usable child; a later attempt can age
-      // out this lock if the filesystem refused immediate cleanup.
-    }
+    removeLaunchFile(lockPath);
     return false;
   }
 }
@@ -160,11 +219,15 @@ function wait(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
-async function requestWithLaunch(module, options, launch, waitForLaunch = true) {
-  const deadline =
-    process.platform === 'win32' && launch && waitForLaunch ? performance.now() + 10_000 : null;
+async function requestWithLaunch(
+  module,
+  options,
+  launch,
+  waitForLaunch = true,
+  deadline = performance.now() + (launch && waitForLaunch ? 10_000 : (options.timeoutMs ?? 5_000)),
+) {
+  const waitForPendingLaunch = process.platform === 'win32' && launch && waitForLaunch;
   const request = () => {
-    if (deadline === null) return module.sendCometDaemonRequest(options);
     const remaining = Math.ceil(deadline - performance.now());
     if (remaining <= 0) throw new Error('Comet daemon startup timed out');
     return module.sendCometDaemonRequest({
@@ -175,16 +238,18 @@ async function requestWithLaunch(module, options, launch, waitForLaunch = true) 
   try {
     return await request();
   } catch {
-    if (!launch) return null;
+    if (!launch || performance.now() >= deadline) return null;
     const started = startServer(module, options.endpoint, options.buildId, options.projectRoot);
-    if (!started && (deadline === null || !existsSync(launchLockPath(options.endpoint)))) return null;
+    if (!started && (!waitForPendingLaunch || !existsSync(launchLockPath(options.endpoint)))) {
+      return null;
+    }
   }
   if (!waitForLaunch) return null;
   const delays = [20, 40, 80, 160, 320, 640, 1_000];
-  // Windows explicit start shares one deadline across backoff and IPC. Reads
-  // already returned above; they never wait for the background WMI handoff.
-  for (let attempt = 0; deadline !== null || attempt < delays.length; attempt += 1) {
-    const remaining = deadline === null ? Infinity : deadline - performance.now();
+  // 所有平台的 IPC 和启动重试共用总期限，超时后仍由调用方回退到本地 Runtime。
+  // 自动读取不等待后台启动；Windows 显式 start 可等候已有启动锁。
+  for (let attempt = 0; waitForPendingLaunch || attempt < delays.length; attempt += 1) {
+    const remaining = deadline - performance.now();
     if (remaining <= 0) return null;
     await wait(Math.min(delays[attempt] ?? 1_000, remaining));
     try {
@@ -202,35 +267,41 @@ function writeCommandResponse(response) {
   process.exitCode = response.exitCode ?? (response.ok ? 0 : 70);
 }
 
-export function shouldAutoStartCometDaemon(environment = process.env) {
-  return environment.COMET_DAEMON !== 'off';
-}
-
 export async function tryRunCometDaemon(argv = process.argv.slice(2)) {
   if (!shouldAutoStartCometDaemon() || process.env.COMET_DAEMON_SERVER === '1') return false;
-  const selected = route(argv);
+  const selected = resolveCometDaemonRoute(argv);
   if (!selected) return false;
   const module = await daemonModule();
   if (!module) return false;
   const root = projectRootFromArgs(argv);
-  const entry = serverPath();
-  const buildId = process.env.COMET_DAEMON_BUILD_ID ?? daemonBuildId(entry);
+  const buildId = process.env.COMET_DAEMON_BUILD_ID ?? module.resolveCometDaemonBuildId();
   const endpoint = module.resolveCometDaemonEndpoint(root, buildId);
+  const options = {
+    endpoint,
+    buildId,
+    projectRoot: root,
+    cwd: process.cwd(),
+  };
+  // 短期限只约束探活：不可用时立即回退，已就绪服务的读取仍保留原有响应时间。
+  const ready = await requestWithLaunch(
+    module,
+    { ...options, control: 'ping', timeoutMs: AUTO_DAEMON_PROBE_TIMEOUT_MS },
+    false,
+    false,
+  );
+  if (!ready) startServer(module, endpoint, buildId, root, true);
+  if (!ready?.ok) return false;
+  removeLaunchFile(launchRetryPath(endpoint));
   const response = await requestWithLaunch(
     module,
     {
-      endpoint,
-      buildId,
-      projectRoot: root,
-      cwd: process.cwd(),
+      ...options,
       runtime: selected.runtime,
       argv: selected.commandArgs,
       timeoutMs: 5_000,
     },
-    true,
-    // Let the first Windows request run in the caller while the broker warms
-    // the daemon. Later requests reuse the server once it is listening.
-    process.platform !== 'win32',
+    false,
+    false,
   );
   if (!response?.ok) return false;
   writeCommandResponse(response);
@@ -255,6 +326,7 @@ function parseControlArgs(argv) {
 }
 
 export async function runCometDaemonCommand(argv = process.argv.slice(2)) {
+  const startedAt = performance.now();
   if (argv[0] !== 'daemon') return false;
   const parsed = parseControlArgs(argv);
   if (parsed.action === '--help' || parsed.action === '-h') {
@@ -268,13 +340,12 @@ export async function runCometDaemonCommand(argv = process.argv.slice(2)) {
     return true;
   }
   const module = await daemonModule();
-  const entry = serverPath();
   if (!module) {
     process.stderr.write('Comet daemon runtime is not built; run pnpm build first.\n');
     process.exitCode = 70;
     return true;
   }
-  const buildId = process.env.COMET_DAEMON_BUILD_ID ?? daemonBuildId(entry);
+  const buildId = process.env.COMET_DAEMON_BUILD_ID ?? module.resolveCometDaemonBuildId();
   const endpoint = module.resolveCometDaemonEndpoint(parsed.root, buildId);
   if (parsed.action === 'start') {
     const response = await requestWithLaunch(
@@ -288,6 +359,8 @@ export async function runCometDaemonCommand(argv = process.argv.slice(2)) {
         timeoutMs: 5_000,
       },
       true,
+      true,
+      startedAt + 10_000,
     );
     if (!response?.ok) {
       process.stderr.write('Unable to start the Comet daemon.\n');
@@ -307,6 +380,8 @@ export async function runCometDaemonCommand(argv = process.argv.slice(2)) {
       timeoutMs: 3_000,
     },
     false,
+    false,
+    startedAt + 3_000,
   );
   if (parsed.action === 'status') {
     const value = response?.ok ? { running: true, ...response.status } : { running: false };

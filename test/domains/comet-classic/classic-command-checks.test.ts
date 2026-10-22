@@ -4,7 +4,17 @@ import { promises as fs } from 'fs';
 import os from 'os';
 import path from 'path';
 import type { RunState, TrajectoryEvent } from '../../../domains/engine/types.js';
-import { appendTrajectory, readTrajectory } from '../../../domains/engine/run-store.js';
+import {
+  appendTrajectory,
+  readTrajectory,
+} from '../../../domains/comet-classic/classic-run-store.js';
+import {
+  readClassicState,
+  writeClassicState,
+} from '../../../domains/comet-classic/classic-store.js';
+import { parseClassicStateDocument } from '../../../domains/comet-classic/classic-state.js';
+import { resolveClassicLocalTarget } from '../../../domains/comet-classic/classic-runtime-paths.js';
+import { prepareClassicLegacyProject } from '../../helpers/classic-project.js';
 import {
   latestCommandCheck,
   recordCommandCheck,
@@ -47,10 +57,32 @@ describe('Classic command check evidence', () => {
 
   beforeEach(async () => {
     projectRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'comet-command-check-'));
+    await prepareClassicLegacyProject(projectRoot);
     changeDir = path.join(projectRoot, 'openspec', 'changes', 'demo');
     await fs.mkdir(changeDir, { recursive: true });
     run = runState();
+    await writeClassicState(changeDir, { classic: classicFixture(), run });
   });
+
+  function classicFixture() {
+    return parseClassicStateDocument({
+      workflow: 'full',
+      phase: 'build',
+      design_doc: null,
+      plan: null,
+      build_mode: 'direct',
+      isolation: 'current',
+      verify_mode: 'light',
+      verify_result: 'pending',
+      verified_at: null,
+      archived: false,
+    }).classic!;
+  }
+  async function localPath(ref: string): Promise<string> {
+    const target = await resolveClassicLocalTarget(projectRoot, path.resolve(projectRoot, ref));
+    if (!target) throw new Error(`Expected a local Classic record: ${ref}`);
+    return target.target;
+  }
 
   afterEach(async () => {
     await fs.rm(projectRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
@@ -207,6 +239,19 @@ describe('Classic command check evidence', () => {
     });
   });
 
+  it('rejects a check when a persisted Run belongs to a different execution', async () => {
+    await writeClassicState(changeDir, {
+      ...(await readClassicState(changeDir)),
+      run: runState('another-run'),
+    });
+    await expect(
+      executeCommandCheck(projectRoot, changeDir, run, {
+        scope: 'build',
+        argv: [process.execPath, '-e', 'process.exit(0)'],
+      }),
+    ).rejects.toThrow('Classic check Run changed before launch');
+  });
+
   it.each([
     ['null data', null],
     ['missing data', undefined],
@@ -251,7 +296,7 @@ describe('Classic command check evidence', () => {
     expect(recorded.manifestRef).toMatch(
       /^openspec\/changes\/demo\/\.comet\/checks\/.+\.manifest$/,
     );
-    const serialized = await fs.readFile(path.join(projectRoot, recorded.manifestRef!), 'utf8');
+    const serialized = await fs.readFile(await localPath(recorded.manifestRef!), 'utf8');
     expect(recorded.manifestHash).toBe(createHash('sha256').update(serialized).digest('hex'));
     expect(await usableCommandCheck(projectRoot, changeDir, run, 'build')).toMatchObject({
       sequence: recorded.sequence,
@@ -266,6 +311,7 @@ describe('Classic command check evidence', () => {
 
   it('reuses the same reusable command across Build and Verify without rerunning it', async () => {
     const marker = path.join(changeDir, '.comet', 'check-count.txt');
+    await fs.mkdir(path.dirname(marker), { recursive: true });
     const argv = [
       process.execPath,
       '-e',
@@ -349,6 +395,7 @@ describe('Classic command check evidence', () => {
       type: 'command_check_recorded',
       data: { scope: 'build', command: 'placeholder', exitCode: 0, cwd },
     });
+    await fs.mkdir(path.join(changeDir, '.comet'), { recursive: true });
     const inputAfter = await legacyCheckInputFingerprint(projectRoot, changeDir, { argv, cwd });
     const environment = await checkEnvironmentFingerprint(
       argv,
@@ -391,7 +438,7 @@ describe('Classic command check evidence', () => {
       argv: [process.execPath, '-e', 'process.exit(0)'],
       reusable: true,
     });
-    const manifestPath = path.join(projectRoot, recorded.manifestRef!);
+    const manifestPath = await localPath(recorded.manifestRef!);
     await fs.writeFile(manifestPath, '{"p":"tampered","h":"0","s":null,"m":null}\n');
     expect(await usableCommandCheck(projectRoot, changeDir, run, 'build')).toBeNull();
     await fs.rm(manifestPath);
@@ -526,7 +573,7 @@ describe('Classic command check evidence', () => {
 
     // A rewritten log changes both content and stat, so revalidation must
     // reject it through the full content-hash path even with the stat present.
-    const logPath = path.join(projectRoot, recorded.logRef!);
+    const logPath = await localPath(recorded.logRef!);
     const stat = await fs.stat(logPath);
     await fs.writeFile(logPath, 'tampered output\n');
     await fs.utimes(logPath, stat.atime, stat.mtime).catch(() => {});
@@ -550,6 +597,7 @@ describe('Classic command check evidence', () => {
     const docsChangeDir = path.join(projectRoot, 'docs', 'openspec', 'changes', 'demo');
     await fs.mkdir(docsChangeDir, { recursive: true });
     const docsRun = runState('run-docs');
+    await writeClassicState(docsChangeDir, { classic: classicFixture(), run: docsRun });
     await fs.writeFile(path.join(docsChangeDir, 'tasks.md'), '- [x] one\n');
     await executeCommandCheck(projectRoot, docsChangeDir, docsRun, {
       scope: 'build',

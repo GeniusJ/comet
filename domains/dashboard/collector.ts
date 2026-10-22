@@ -1,6 +1,11 @@
+import { resolveClassicStateFile } from '../comet-classic/classic-state-file.js';
+import { inspectClassicProjectTarget } from '../comet-classic/classic-protected-path.js';
 import { promises as fs } from 'fs';
+import { runWithHookReadCache } from '../../platform/process/hook-read-cache.js';
 import path from 'path';
+import os from 'node:os';
 import { collectGitSnapshot } from './git.js';
+import { fingerprintDashboardFiles, fingerprintDashboardFileGroups } from './source-version.js';
 import {
   collectNativeDashboardOverview,
   collectNativeDashboardProjection,
@@ -12,6 +17,7 @@ import { parseCometYaml, type CometYaml } from './yaml.js';
 import { resolveVerify } from './verify-parser.js';
 import {
   collectDashboardWorkspaceSources,
+  withDashboardReadScope,
   dashboardWorkspaceIdentity,
   encodeDashboardChangeLocator,
   parseDashboardChangeLocator,
@@ -146,6 +152,9 @@ export class DashboardChangeQueryError extends Error {
 }
 
 interface ClassicChangeCandidate {
+  refreshPaths: string[];
+  refreshFingerprint: string | null;
+  refreshStable: boolean;
   id: string;
   locator: string;
   name: string;
@@ -167,6 +176,8 @@ interface ClassicChangeCandidate {
 }
 
 interface ClassicCandidateCollection {
+  candidates?: ClassicChangeCandidate[];
+  refreshStable?: boolean;
   active: ClassicChangeCandidate[];
   archived: ClassicChangeCandidate[];
   errors: string[];
@@ -182,7 +193,39 @@ export async function collectDashboardChangePage(
   projectPath: string,
   options: DashboardChangePageOptions,
 ): Promise<DashboardChangePage> {
+  return withDashboardReadScope(projectPath, () =>
+    collectDashboardChangePageUncached(projectPath, options),
+  );
+}
+
+/** 统计与筛选一次读取完整活跃摘要，避免每页重复校验全部文件。 */
+export async function collectDashboardChangeSummary(
+  projectPath: string,
+  options: { status?: DashboardChangeTab; query?: string; limit?: number } = {},
+): Promise<DashboardChangePage> {
+  return withDashboardReadScope(projectPath, async () => {
+    const collection = await collectClassicChangeCandidates(path.resolve(projectPath));
+    if (collection.errors.length > 0)
+      throw new DashboardChangeQueryError(collection.errors.join('\n'));
+    const limit = options.limit ?? Number.MAX_SAFE_INTEGER;
+    if (!Number.isSafeInteger(limit) || limit < 1)
+      throw new DashboardChangeQueryError('Change summary limit must be a positive integer');
+    return buildDashboardChangePage(
+      collection,
+      { ...options, status: options.status ?? 'active' },
+      limit,
+    );
+  });
+}
+
+async function collectDashboardChangePageUncached(
+  projectPath: string,
+  options: DashboardChangePageOptions,
+): Promise<DashboardChangePage> {
   const collection = await collectClassicChangeCandidates(path.resolve(projectPath));
+  if (collection.errors.length > 0) {
+    throw new DashboardChangeQueryError(collection.errors.join('\n'));
+  }
   return buildDashboardChangePage(collection, options);
 }
 
@@ -190,6 +233,15 @@ export async function collectDashboardChangePage(
 export async function collectDashboardOverview(
   projectPath: string,
   options: DashboardOverviewOptions = {},
+): Promise<DashboardOverview> {
+  return withDashboardReadScope(projectPath, () =>
+    collectDashboardOverviewUncached(projectPath, options),
+  );
+}
+
+async function collectDashboardOverviewUncached(
+  projectPath: string,
+  options: DashboardOverviewOptions,
 ): Promise<DashboardOverview> {
   const resolvedRoot = path.resolve(projectPath);
   const [classic, git, nativeResult] = await Promise.all([
@@ -247,6 +299,15 @@ export async function collectDashboardChangeDetail(
   projectPath: string,
   locatorOrId: string,
 ): Promise<ChangeDashboardItem | null> {
+  return withDashboardReadScope(projectPath, () =>
+    collectDashboardChangeDetailUncached(projectPath, locatorOrId),
+  );
+}
+
+async function collectDashboardChangeDetailUncached(
+  projectPath: string,
+  locatorOrId: string,
+): Promise<ChangeDashboardItem | null> {
   const requestedRoot = path.resolve(projectPath);
   const sources = collectDashboardWorkspaceSources(requestedRoot);
   const parsedLocator = parseDashboardChangeLocator(locatorOrId);
@@ -268,7 +329,7 @@ export async function collectDashboardChangeDetail(
   ) {
     return null;
   }
-  return tryBuildChangeItem({
+  return buildChangeItem({
     name: location.name,
     dir,
     status: location.status,
@@ -279,10 +340,114 @@ export async function collectDashboardChangeDetail(
   });
 }
 
-async function collectClassicChangeCandidates(
+const classicCandidateCollections = new Map<string, Promise<ClassicCandidateCollection>>();
+const classicCandidateCache = new Map<
+  string,
+  {
+    collection: ClassicCandidateCollection;
+    fingerprint: string;
+    discoveryPaths: string[];
+    identity: string;
+  }
+>();
+
+// active/archived 与 candidates 共享对象；估算驻留内容时只计算一次正文。
+function classicCollectionCacheBytes(collection: ClassicCandidateCollection): number {
+  const seen = new Set<object>();
+  return Buffer.byteLength(
+    JSON.stringify(collection, (_key, value: unknown) => {
+      if (value !== null && typeof value === 'object') {
+        if (seen.has(value)) return null;
+        seen.add(value);
+      }
+      return value;
+    }),
+  );
+}
+
+async function collectCachedClassicCandidates(root: string): Promise<ClassicCandidateCollection> {
+  const sources = collectDashboardWorkspaceSources(root);
+  const identity = JSON.stringify({
+    workspaces: sources.map(({ id, branch, current }) => [id, branch, current]),
+    runtimeDataRoot: process.env.COMET_DATA_DIR ?? path.join(os.homedir(), '.comet'),
+  });
+  const cached = classicCandidateCache.get(root);
+  const reusable = new Map<string, ClassicChangeCandidate>();
+  if (cached?.identity === identity) {
+    const candidates = cached.collection.candidates ?? [];
+    const fingerprints = await fingerprintDashboardFileGroups(
+      candidates.map((candidate) => candidate.refreshPaths),
+      '',
+    );
+    candidates.forEach((candidate, index) => {
+      if (
+        candidate.refreshStable &&
+        candidate.refreshFingerprint !== null &&
+        fingerprints[index] === candidate.refreshFingerprint
+      )
+        reusable.set(candidate.dir, candidate);
+    });
+    if (
+      reusable.size === cached.collection.candidates?.length &&
+      (await fingerprintDashboardFiles(cached.discoveryPaths, identity)) === cached.fingerprint
+    )
+      return cached.collection;
+  }
+  const discoveryPaths = [
+    ...new Set(
+      sources.flatMap(({ projectRoot }) => [
+        projectRoot,
+        path.join(projectRoot, '.comet'),
+        path.join(projectRoot, '.comet', 'config.yaml'),
+        path.join(projectRoot, 'docs'),
+        ...CLASSIC_CHANGES_ROOTS.flatMap((relative) => [
+          path.dirname(path.join(projectRoot, relative)),
+          path.join(projectRoot, relative),
+          path.join(projectRoot, relative, ARCHIVE_SEGMENT),
+        ]),
+      ]),
+    ),
+  ].sort();
+  const before = await fingerprintDashboardFiles(discoveryPaths, identity);
+  const collection = await collectClassicChangeCandidatesUncached(root, sources, reusable);
+  if (
+    before !== null &&
+    collection.refreshStable &&
+    collection.errors.length === 0 &&
+    before === (await fingerprintDashboardFiles(discoveryPaths, identity)) &&
+    classicCollectionCacheBytes(collection) <= 16 * 1024 * 1024
+  ) {
+    classicCandidateCache.delete(root);
+    classicCandidateCache.set(root, {
+      collection,
+      fingerprint: before,
+      discoveryPaths,
+      identity,
+    });
+    while (classicCandidateCache.size > 4)
+      classicCandidateCache.delete(classicCandidateCache.keys().next().value!);
+  } else classicCandidateCache.delete(root);
+  return collection;
+}
+
+function collectClassicChangeCandidates(projectRoot: string): Promise<ClassicCandidateCollection> {
+  const root = path.resolve(projectRoot);
+  const existing = classicCandidateCollections.get(root);
+  if (existing) return existing;
+  // Only this read-only scan shares path checks. Every request checks index
+  // dependencies again; path inspections are discarded when the scan ends.
+  const collection = runWithHookReadCache(() => collectCachedClassicCandidates(root)).finally(() =>
+    classicCandidateCollections.delete(root),
+  );
+  classicCandidateCollections.set(root, collection);
+  return collection;
+}
+
+async function collectClassicChangeCandidatesUncached(
   projectRoot: string,
+  sources = collectDashboardWorkspaceSources(projectRoot),
+  reusable = new Map<string, ClassicChangeCandidate>(),
 ): Promise<ClassicCandidateCollection> {
-  const sources = collectDashboardWorkspaceSources(projectRoot);
   const collections = (
     await Promise.all(
       sources.map((source) =>
@@ -296,6 +461,7 @@ async function collectClassicChangeCandidates(
                 changesRelative,
                 status: 'active',
                 source,
+                reusable,
               }),
               collectCandidatesWithError({
                 changesRoot: path.join(changesRoot, ARCHIVE_SEGMENT),
@@ -303,6 +469,7 @@ async function collectClassicChangeCandidates(
                 changesRelative,
                 status: 'archived',
                 source,
+                reusable,
               }),
             ]);
             return {
@@ -324,6 +491,10 @@ async function collectClassicChangeCandidates(
   );
 
   return {
+    candidates: collections.flatMap(({ active, archived }) => [...active, ...archived]),
+    refreshStable: collections.every(({ active, archived }) =>
+      [...active, ...archived].every(({ refreshStable }) => refreshStable),
+    ),
     active,
     archived,
     errors: collections.flatMap((collection) => collection.errors),
@@ -360,7 +531,9 @@ async function collectCandidatesWithError(
   input: CollectCandidatesInput,
 ): Promise<{ items: ClassicChangeCandidate[]; errors: string[] }> {
   try {
-    return { items: await collectChangeCandidatesFromRoot(input), errors: [] };
+    const errors: string[] = [];
+    const items = await collectChangeCandidatesFromRoot(input, errors);
+    return { items, errors };
   } catch (error) {
     return {
       items: [],
@@ -382,10 +555,12 @@ interface CollectCandidatesInput {
   changesRelative: string;
   status: 'active' | 'archived';
   source: DashboardWorkspaceSource;
+  reusable?: Map<string, ClassicChangeCandidate>;
 }
 
 async function collectChangeCandidatesFromRoot(
   input: CollectCandidatesInput,
+  errors: string[],
 ): Promise<ClassicChangeCandidate[]> {
   const relativeRoot =
     input.status === 'archived'
@@ -409,10 +584,12 @@ async function collectChangeCandidatesFromRoot(
     CHANGE_INDEX_CONCURRENCY,
     async (entry) => {
       const dir = path.join(input.changesRoot, entry);
+      const cached = input.reusable?.get(dir);
+      if (cached) return cached;
       if (!(await safeProjectDirectoryExists(input.projectRoot, dir, `Classic change ${entry}`))) {
         return null;
       }
-      return tryBuildChangeCandidate({ ...input, name: entry, dir });
+      return tryBuildChangeCandidate({ ...input, name: entry, dir }, errors);
     },
   );
   return candidates.filter((candidate): candidate is ClassicChangeCandidate => candidate !== null);
@@ -420,10 +597,12 @@ async function collectChangeCandidatesFromRoot(
 
 async function tryBuildChangeCandidate(
   input: CollectCandidatesInput & { name: string; dir: string },
+  errors: string[],
 ): Promise<ClassicChangeCandidate | null> {
   try {
     return await buildChangeCandidate(input);
   } catch (error) {
+    errors.push(formatClassicCollectionError(projectRelative(input.projectRoot, input.dir), error));
     console.warn(
       `[dashboard] skipping change index "${input.name}": ${(error as Error).message ?? error}`,
     );
@@ -434,17 +613,47 @@ async function tryBuildChangeCandidate(
 async function buildChangeCandidate(
   input: CollectCandidatesInput & { name: string; dir: string },
 ): Promise<ClassicChangeCandidate> {
-  const yamlPath = path.join(input.dir, '.comet.yaml');
+  const yamlPath = await resolveClassicStateFile(input.dir);
   const tasksPath = path.join(input.dir, 'tasks.md');
+  const basePaths = [input.dir, yamlPath, tasksPath];
+  const before = await fingerprintDashboardFiles(basePaths, '');
   const proposalPath = path.join(input.dir, 'proposal.md');
   const designPath = path.join(input.dir, 'design.md');
   const localPlanPath = path.join(input.dir, 'plan.md');
   const yaml: CometYaml = (await readProjectCometYaml(input.projectRoot, yamlPath)) ?? {};
   const yamlPlanPath = stripNullish(yaml.plan);
-  const resolvedPlanPath =
-    (yamlPlanPath
-      ? await resolveArtifactPointer(input.projectRoot, yamlPlanPath, 'Classic plan artifact')
-      : null) ?? localPlanPath;
+  const explicitPlanPath = yamlPlanPath
+    ? await resolveArtifactPointer(input.projectRoot, yamlPlanPath, 'Classic plan artifact')
+    : null;
+  const resolvedPlanPath = explicitPlanPath ?? localPlanPath;
+  const reportPointer = stripNullish(yaml.verification_report ?? yaml.verificationReport);
+  const resolvedReportPath = reportPointer
+    ? await resolveArtifactPointer(input.projectRoot, reportPointer, 'Classic verification report')
+    : path.join(input.dir, '.comet', 'verify-result.md');
+  const pointerParents: string[] = [];
+  for (const target of [resolvedPlanPath, resolvedReportPath]) {
+    if (!target) continue;
+    for (
+      let parent = path.dirname(target);
+      parent !== input.projectRoot && parent !== path.dirname(parent);
+      parent = path.dirname(parent)
+    )
+      pointerParents.push(parent);
+  }
+  const refreshPaths = [
+    ...basePaths,
+    input.projectRoot,
+    path.join(input.projectRoot, '.comet'),
+    path.join(input.projectRoot, '.comet', 'config.yaml'),
+    proposalPath,
+    designPath,
+    resolvedPlanPath,
+    ...(resolvedReportPath ? [resolvedReportPath] : []),
+    ...pointerParents,
+    path.join(input.dir, '.comet'),
+    path.join(input.dir, '.comet', 'verify-result.md'),
+  ].filter((value, index, values) => values.indexOf(value) === index);
+  const refreshFingerprint = await fingerprintDashboardFiles(refreshPaths, '');
   const [tasks, verify, proposal, design, hasTasks, plan, cometYamlExists, updatedAt] =
     await Promise.all([
       readTasks(input.projectRoot, tasksPath),
@@ -493,6 +702,15 @@ async function buildChangeCandidate(
       : 'drifted'
     : 'unbound';
   return {
+    refreshPaths,
+    refreshFingerprint,
+    refreshStable:
+      before !== null &&
+      refreshFingerprint !== null &&
+      (!yamlPlanPath || explicitPlanPath !== null) &&
+      (!reportPointer || resolvedReportPath !== null) &&
+      before === (await fingerprintDashboardFiles(basePaths, '')) &&
+      refreshFingerprint === (await fingerprintDashboardFiles(refreshPaths, '')),
     id,
     locator: encodeDashboardChangeLocator(input.source.id, `classic:${id}`),
     name: input.name,
@@ -518,8 +736,8 @@ async function buildChangeCandidate(
 function buildDashboardChangePage(
   collection: ClassicCandidateCollection,
   options: DashboardChangePageOptions,
+  limit = normalizeChangePageLimit(options.limit),
 ): DashboardChangePage {
-  const limit = normalizeChangePageLimit(options.limit);
   const active = filterAndSortCandidates(collection.active, options.query, 'active');
   const archived = filterAndSortCandidates(collection.archived, options.query, 'archived');
   const candidates =
@@ -726,19 +944,23 @@ interface ClassicCollection {
 
 async function collectClassicChanges(projectRoot: string): Promise<ClassicCollection> {
   const candidates = await collectClassicChangeCandidates(projectRoot);
+  const errors = [...candidates.errors];
   const collect = async (
     entries: readonly ClassicChangeCandidate[],
   ): Promise<ChangeDashboardItem[]> => {
     const items = await mapWithConcurrency(entries, CHANGE_INDEX_CONCURRENCY, (candidate) =>
-      tryBuildChangeItem({
-        name: candidate.name,
-        dir: candidate.dir,
-        status: candidate.status,
-        projectRoot: candidate.projectRoot,
-        changesRelative: candidate.changesRelative,
-        workspace: candidate.workspace,
-        locator: candidate.locator,
-      }),
+      tryBuildChangeItem(
+        {
+          name: candidate.name,
+          dir: candidate.dir,
+          status: candidate.status,
+          projectRoot: candidate.projectRoot,
+          changesRelative: candidate.changesRelative,
+          workspace: candidate.workspace,
+          locator: candidate.locator,
+        },
+        errors,
+      ),
     );
     return items.filter((item): item is ChangeDashboardItem => item !== null);
   };
@@ -746,7 +968,7 @@ async function collectClassicChanges(projectRoot: string): Promise<ClassicCollec
     collect(candidates.active),
     collect(candidates.archived),
   ]);
-  return { active, archived, errors: candidates.errors };
+  return { active, archived, errors };
 }
 
 function formatClassicCollectionError(relativePath: string, error: unknown): string {
@@ -759,10 +981,14 @@ function formatClassicCollectionError(relativePath: string, error: unknown): str
  * sweep continues. This collection path is read-only and "best effort by design";
  * a single malformed yaml or unreadable directory shouldn't blank the page.
  */
-async function tryBuildChangeItem(input: BuildChangeInput): Promise<ChangeDashboardItem | null> {
+async function tryBuildChangeItem(
+  input: BuildChangeInput,
+  errors: string[],
+): Promise<ChangeDashboardItem | null> {
   try {
     return await buildChangeItem(input);
   } catch (error) {
+    errors.push(formatClassicCollectionError(projectRelative(input.projectRoot, input.dir), error));
     console.warn(
       `[dashboard] skipping change "${input.name}": ${(error as Error).message ?? error}`,
     );
@@ -792,7 +1018,7 @@ async function buildChangeItem(input: BuildChangeInput): Promise<ChangeDashboard
   if (!changeInspection.exists) {
     throw new Error(`Classic change ${input.name} disappeared during collection`);
   }
-  const yamlPath = path.join(input.dir, '.comet.yaml');
+  const yamlPath = await resolveClassicStateFile(input.dir);
   const tasksPath = path.join(input.dir, 'tasks.md');
   const designPath = path.join(input.dir, 'design.md');
   const proposalPath = path.join(input.dir, 'proposal.md');
@@ -984,14 +1210,18 @@ async function readArtifactPreviews(
       };
 
       try {
-        const relative = path.relative(projectRoot, filePath).replaceAll('\\', '/');
+        const inspection = await inspectClassicProjectTarget(projectRoot, filePath, {
+          label: `${label} preview`,
+          expected: 'file',
+        });
         const result = await readProtectedProjectFile(
-          projectRoot,
-          relative,
+          inspection.projectRoot,
+          inspection.relative,
           ARTIFACT_READ_LIMIT_BYTES,
           { label: `${label} preview` },
         );
         const stat = result.stat;
+        preview.path = inspection.target;
         preview.exists = true;
         preview.size = Number(stat.size);
         preview.updatedAt = stat.mtime.toISOString();
@@ -1029,11 +1259,8 @@ async function safeProjectFileExists(
   label: string,
 ): Promise<boolean> {
   try {
-    return await protectedProjectFileExists(
-      projectRoot,
-      path.relative(projectRoot, file).replaceAll('\\', '/'),
-      { label },
-    );
+    return (await inspectClassicProjectTarget(projectRoot, file, { label, expected: 'file' }))
+      .exists;
   } catch {
     return false;
   }
@@ -1256,7 +1483,7 @@ function buildGroupedArtifacts(input: GroupedInput): GroupedArtifact[] {
     },
     {
       key: 'cometYaml',
-      label: '.comet.yaml',
+      label: path.basename(input.cometYamlPath),
       source: 'comet',
       exists: input.cometYamlExists,
       path: input.cometYamlPath,

@@ -1,3 +1,5 @@
+import { nativeTaskContextRequest } from './native-task-context.js';
+import type { CliContinuationMode } from '../workflow-contract/output-envelope.js';
 import type { NativeChildrenInspection } from './native-children.js';
 import type { NativePortableExpectedContinuationAction } from './native-portable-runtime.js';
 import {
@@ -5,6 +7,13 @@ import {
   type NativePortableState,
 } from './native-portable-types.js';
 import { NATIVE_MAX_SUPERVISOR_BUILDER_FAILURES } from './native-supervisor-model.js';
+import {
+  NATIVE_ACCEPTANCE_REVIEW_STATUSES,
+  NATIVE_BUILDER_CHECK_RESULTS,
+  NATIVE_VERIFIER_ACCEPTANCE_RESULTS,
+  NATIVE_VERIFIER_VERDICTS,
+  nativeEnumPlaceholder,
+} from './native-input-enum.js';
 
 type NativePortableContinuationInputOption = {
   name: string;
@@ -52,9 +61,12 @@ export interface NativePortableContinuation {
   skill: 'comet-native';
   change: string;
   phase: NativePortableState['phase'];
-  status: NativePortableState['status'];
+  status: NativePortableState['status'] | 'cancelling' | 'cancelled';
   stateVersion: number;
   disposition: 'continue' | 'await-user' | 'blocked' | 'done';
+  mode: CliContinuationMode;
+  cwd?: string;
+  contextRequest?: ReturnType<typeof nativeTaskContextRequest>;
   requiresUserDecision: boolean;
   action:
     | 'prepare-shape-confirmation'
@@ -69,6 +81,7 @@ export interface NativePortableContinuation {
     | 'retry-checks'
     | 'await-verifier'
     | 'repair'
+    | 'review-edit'
     | 'retry-verifier'
     | 'archive'
     | 'none';
@@ -718,6 +731,8 @@ export function nativePortableContinuation(
     phase: state.phase,
     status: state.status,
     stateVersion: state.state_version,
+    ...(state.status === 'active' ? { contextRequest: nativeTaskContextRequest(state) } : {}),
+    mode: 'execute' as const,
     inputOptions: [] as NativePortableContinuation['inputOptions'],
     requiresUserDecision: userCommunication.required,
     userCommunication,
@@ -732,6 +747,7 @@ export function nativePortableContinuation(
     return {
       ...base,
       disposition: 'done',
+      mode: 'done',
       action: 'none',
       commandArgs: null,
       requiredInputs: [],
@@ -743,6 +759,7 @@ export function nativePortableContinuation(
       return {
         ...base,
         disposition: 'await-user',
+        mode: 'ask',
         action: 'confirm-shape',
         commandArgs: null,
         requiredInputs: [
@@ -792,6 +809,7 @@ export function nativePortableContinuation(
       return {
         ...base,
         disposition: 'await-user',
+        mode: 'ask',
         action: 'confirm-skill-coordinated-pass',
         commandArgs: null,
         requiredInputs: ['summary', 'user-decision'],
@@ -821,6 +839,14 @@ export function nativePortableContinuation(
             flag: '--accept-result',
             confirmationInput: 'user-decision',
           }),
+          nativeNextDecisionAlternative({
+            name: 'retry-verifier',
+            change: state.name,
+            stateVersion: state.state_version,
+            expectedAction: 'retry-verifier',
+            flag: '--retry-verifier',
+            confirmationInput: 'user-decision',
+          }),
           ...nativeNextRevisionAlternatives({
             change: state.name,
             stateVersion: state.state_version,
@@ -837,6 +863,7 @@ export function nativePortableContinuation(
       return {
         ...base,
         disposition: 'await-user',
+        mode: 'ask',
         action: 'confirm-verifier-unavailable',
         commandArgs: null,
         requiredInputs: ['summary', 'user-decision'],
@@ -866,6 +893,7 @@ export function nativePortableContinuation(
       return {
         ...base,
         disposition: 'await-user',
+        mode: 'ask',
         action: 'resolve-verifier-blocker',
         commandArgs: null,
         requiredInputs: ['summary', 'user-decision'],
@@ -891,6 +919,7 @@ export function nativePortableContinuation(
       return {
         ...base,
         disposition: 'await-user',
+        mode: 'ask',
         action: 'resolve-loop-stop',
         commandArgs: null,
         requiredInputs: ['summary', 'user-decision'],
@@ -905,6 +934,7 @@ export function nativePortableContinuation(
     return {
       ...base,
       disposition: 'await-user',
+      mode: 'ask',
       action: 'none',
       commandArgs: null,
       // Fallback for uncovered await-user states: surface the blocker message
@@ -937,6 +967,7 @@ export function nativePortableContinuation(
     return {
       ...base,
       disposition: 'blocked',
+      mode: 'reconcile',
       action: retry ? 'retry-verifier' : 'none',
       commandArgs: retry
         ? boundNativeNextCommandArgs({
@@ -1053,11 +1084,17 @@ export function nativePortableContinuation(
                 addressed_acceptance_ids: state.acceptance.map(({ id }) => id),
                 acceptance_review: state.acceptance.map(({ id }) => ({
                   id,
-                  status: 'not-implemented',
+                  status: nativeEnumPlaceholder(NATIVE_ACCEPTANCE_REVIEW_STATUSES),
                   evidence: [],
                   note: '<implementation and evidence summary>',
                 })),
-                checks: [{ name: '<check-name>', result: 'not-run', note: null }],
+                checks: [
+                  {
+                    name: '<check-name>',
+                    result: nativeEnumPlaceholder(NATIVE_BUILDER_CHECK_RESULTS),
+                    note: null,
+                  },
+                ],
                 verification_checks: [nativeCheckPlanTemplate()],
                 known_limits: [],
               },
@@ -1150,6 +1187,7 @@ export function nativePortableContinuation(
       return {
         ...base,
         disposition: blockedWithoutBuilderRetry ? 'blocked' : 'continue',
+        mode: blockedWithoutBuilderRetry ? 'reconcile' : 'execute',
         action: 'advance-children',
         commandArgs: blockedWithoutBuilderRetry
           ? null
@@ -1218,12 +1256,18 @@ export function nativePortableContinuation(
                   }
                 : {
                     id,
-                    status: 'not-implemented',
+                    status: nativeEnumPlaceholder(NATIVE_ACCEPTANCE_REVIEW_STATUSES),
                     evidence: [],
                     note: '<implementation and evidence summary>',
                   };
             }),
-            checks: [{ name: '<check-name>', result: 'not-run', note: null }],
+            checks: [
+              {
+                name: '<check-name>',
+                result: nativeEnumPlaceholder(NATIVE_BUILDER_CHECK_RESULTS),
+                note: null,
+              },
+            ],
             verification_checks: [],
             known_limits: [],
           },
@@ -1279,6 +1323,7 @@ export function nativePortableContinuation(
             }
           : base.userCommunication,
       disposition: 'continue',
+      mode: awaiting ? 'wait' : 'execute',
       action: awaiting ? 'await-verifier' : 'dispatch-verifier',
       commandArgs: [
         'comet',
@@ -1319,11 +1364,11 @@ export function nativePortableContinuation(
                     result: {
                       iteration: state.loop.iteration,
                       attempt: state.loop.attempt,
-                      verdict: 'blocked',
+                      verdict: nativeEnumPlaceholder(NATIVE_VERIFIER_VERDICTS),
                       acceptance: [
                         {
                           id: '<acceptance-id>',
-                          result: 'blocked',
+                          result: nativeEnumPlaceholder(NATIVE_VERIFIER_ACCEPTANCE_RESULTS),
                           reason: '<reason>',
                         },
                       ],
@@ -1378,6 +1423,7 @@ export function nativePortableContinuation(
       return {
         ...base,
         disposition: 'blocked',
+        mode: 'reconcile',
         action: 'archive',
         commandArgs: null,
         requiredInputs: ['archive-blocker-resolution'],
@@ -1408,6 +1454,7 @@ export function nativePortableContinuation(
         return {
           ...base,
           disposition: 'blocked',
+          mode: 'reconcile',
           action: 'archive',
           commandArgs: null,
           requiredInputs: ['archive-blocker-resolution'],
@@ -1432,6 +1479,7 @@ export function nativePortableContinuation(
       return {
         ...base,
         disposition: 'await-user',
+        mode: 'ask',
         action: 'archive',
         commandArgs: null,
         requiredInputs: ['workspace-finish'],

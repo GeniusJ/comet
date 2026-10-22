@@ -2,6 +2,7 @@ import { defineConfig } from 'vitest/config';
 
 export default defineConfig({
   test: {
+    setupFiles: ['test/helpers/runtime-home.ts'],
     testTimeout: 120_000,
     // Git-heavy fixtures can exceed Vitest's 10s hook default under bounded full-suite concurrency.
     hookTimeout: 120_000,
@@ -24,6 +25,9 @@ export default defineConfig({
       exclude: [
         // Classic runtime behavior is generated to .mjs and exercised through subprocess smoke tests.
         'domains/comet-classic/**',
+        // AJV-generated code is checked for freshness and differentially tested against AJV.
+        // Keep authored schema selection/fallback and the generator in their normal test scopes.
+        'domains/engine/runtime-schema.generated.ts',
       ],
       thresholds: {
         branches: 75,

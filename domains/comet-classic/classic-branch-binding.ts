@@ -1,3 +1,4 @@
+import { resolveClassicStateFile } from './classic-state-file.js';
 import { measureCometGitCommand } from '../../platform/process/runtime-metrics.js';
 import { execFileSync } from 'child_process';
 import { promises as fs } from 'fs';
@@ -11,19 +12,29 @@ import { atomicWriteContainedText } from '../workflow-contract/contained-atomic-
 import { readProtectedProjectFile } from '../workflow-contract/protected-project-path.js';
 
 export function liveGitBranch(cwd: string): string | null {
+  const options = {
+    cwd,
+    encoding: 'utf8' as const,
+    stdio: ['ignore', 'pipe', 'ignore'] as ['ignore', 'pipe', 'ignore'],
+    timeout: 10_000,
+    windowsHide: true,
+  };
   try {
     const branch = measureCometGitCommand(() =>
-      execFileSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], {
-        cwd,
-        encoding: 'utf8',
-        stdio: ['ignore', 'pipe', 'ignore'],
-        timeout: 10_000,
-        windowsHide: true,
-      }).trim(),
+      execFileSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], options).trim(),
     );
-    return branch && branch !== 'HEAD' ? branch : null;
+    if (branch && branch !== 'HEAD') return branch;
   } catch {
-    return null;
+    // An unborn branch has no HEAD commit yet; symbolic-ref still names it.
+  }
+  try {
+    return (
+      measureCometGitCommand(() =>
+        execFileSync('git', ['symbolic-ref', '--quiet', '--short', 'HEAD'], options).trim(),
+      ) || null
+    );
+  } catch {
+    return null; // Detached HEAD or not a Git worktree.
   }
 }
 
@@ -115,7 +126,7 @@ async function resolveBranchBindingLocked(
   changeDir: string,
   options: { heal: boolean; cwd: string },
 ): Promise<BranchBindingOutcome> {
-  const file = path.join(changeDir, '.comet.yaml');
+  const file = await resolveClassicStateFile(changeDir);
   const document = parseDocument(await fs.readFile(file, 'utf8'), { uniqueKeys: false });
   if (document.errors.length > 0) {
     throw new Error(`Invalid .comet.yaml: ${document.errors[0].message}`);
@@ -145,9 +156,9 @@ export async function healBoundBranch(changeDir: string, branch: string): Promis
 }
 
 async function healBoundBranchLocked(changeDir: string, branch: string): Promise<void> {
-  const file = path.join(changeDir, '.comet.yaml');
+  const file = await resolveClassicStateFile(changeDir);
   const source = (
-    await readProtectedProjectFile(changeDir, '.comet.yaml', CLASSIC_PROJECT_FILE_MAX_BYTES, {
+    await readProtectedProjectFile(changeDir, path.basename(file), CLASSIC_PROJECT_FILE_MAX_BYTES, {
       label: 'Classic branch binding',
     })
   ).bytes.toString('utf8');

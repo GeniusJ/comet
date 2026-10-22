@@ -1,3 +1,4 @@
+import { resolveClassicRunDirectory } from './classic-runtime-paths.js';
 import { promises as fs } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -10,7 +11,7 @@ import {
   type ClassicState,
   type ClassicStateProjection,
 } from './classic-state.js';
-import { appendTrajectory, readTrajectory } from '../../domains/engine/run-store.js';
+import { appendTrajectory, readTrajectory } from './classic-run-store.js';
 import type { RunState } from '../../domains/engine/types.js';
 import { loadRuntimePackage, loadSkillPackage } from '../../domains/skill/load.js';
 import { readSkillSnapshot } from '../../domains/skill/snapshot.js';
@@ -346,7 +347,10 @@ async function loadValidatedClassicRuntime(
     );
   }
 
-  const snapshot = await readSkillSnapshot(changeDir, projection.run.skillHash);
+  const snapshot = await readSkillSnapshot(
+    await resolveClassicRunDirectory(changeDir),
+    projection.run.skillHash,
+  );
   if (snapshot.definition.metadata.name !== projection.run.skill) {
     throw new Error(
       `Classic Run snapshot skill mismatch: expected ${projection.run.skill}, got ${snapshot.definition.metadata.name}`,
@@ -355,7 +359,12 @@ async function loadValidatedClassicRuntime(
   return {
     classic: projection.classic,
     run: projection.run,
-    snapshotDir: path.join(changeDir, '.comet', 'skill-snapshots', projection.run.skillHash),
+    snapshotDir: path.join(
+      await resolveClassicRunDirectory(changeDir),
+      '.comet',
+      'skill-snapshots',
+      projection.run.skillHash,
+    ),
   };
 }
 

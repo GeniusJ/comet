@@ -13,6 +13,34 @@ import yaml
 from scaffold.python.validation.core import _normalize_skill_invocations
 
 
+def _valid_runtime_entry(target: Path):
+    if target.is_symlink():
+        return False
+    if target.is_dir():
+        return True
+    try:
+        if not target.is_file() or target.stat().st_size > 16384:
+            return False
+        fence = json.loads(target.read_text(encoding="utf-8"))
+        if not isinstance(fence, dict):
+            return False
+        identity = fence.get("workspaceId")
+        source = str(fence.get("source", "")).replace("\\", "/")
+        destination = str(fence.get("target", "")).replace("\\", "/")
+        return (
+            fence.get("schema") == "comet.workspace-runtime-migration.v1"
+            and fence.get("kind") == "directory"
+            and isinstance(identity, str) and re.fullmatch(r"[a-f0-9]{64}", identity) is not None
+            and re.match(r"^(?:/|[A-Za-z]:/)", source) is not None
+            and source.endswith("/.comet/runtime")
+            and re.match(r"^(?:/|[A-Za-z]:/)", destination) is not None
+            and destination.endswith(f"/workspaces/{identity}/runtime")
+            and not destination.startswith(source[:-len('/.comet/runtime')] + "/")
+        )
+    except (OSError, ValueError):
+        return False
+
+
 def _failure(name: str, reason: str) -> str:
     return f"{name}: {reason}"
 
@@ -190,6 +218,17 @@ def validate_native_workflow(
 
     events = outputs.get("events") or {}
     invoked = _normalize_skill_invocations(events, outputs)
+    explicit = events.get("skill_invocations") if isinstance(events, dict) else None
+    if isinstance(explicit, list) and explicit:
+        # A shell existence check may mention another Skill path without loading it.
+        # Keep actual Skill tool calls and SKILL.md reads as invocation evidence.
+        invoked = [skill for skill in explicit if isinstance(skill, str)]
+        for path in events.get("files_read", []):
+            if not isinstance(path, str):
+                continue
+            match = re.search(r"[\\/]skills[\\/]([^\\/]+)[\\/]SKILL\.md$", path)
+            if match and match.group(1) not in invoked:
+                invoked.append(match.group(1))
     if isinstance(events, dict):
         events["skills_invoked"] = invoked
     unexpected_skills = sorted({skill for skill in invoked if skill != "comet-native"})
@@ -326,7 +365,7 @@ def validate_native_workflow(
     invalid_comet_entries = []
     for name in hidden_entries & allowed_comet_entries:
         target = comet_config_dir / name
-        if name == "runtime" and (target.is_symlink() or not target.is_dir()):
+        if name == "runtime" and not _valid_runtime_entry(target):
             invalid_comet_entries.append(name)
         elif name != "runtime" and (target.is_symlink() or not target.is_file()):
             invalid_comet_entries.append(name)
@@ -349,5 +388,29 @@ def validate_native_workflow(
         failed.append(_failure("native_isolation", "Classic or hidden workflow artifacts exist"))
     else:
         passed.append("native_isolation")
+
+    if outputs.get("treatment_name") == "COMET_NATIVE_SDK_CURRENT":
+        managed_paths = (
+            ".comet/runtime/",
+            ".comet/current-change.json",
+            "docs/comet/changes/",
+        )
+        commands = events.get("commands_run", []) if isinstance(events, dict) else []
+        manual_mutation = any(
+            re.match(r"^\s*(?:rm|mv)\s+(?:-\S+\s+)*", line)
+            and any(path in line for path in managed_paths)
+            for command in commands
+            if isinstance(command, str)
+            for line in command.splitlines()
+        )
+        if manual_mutation:
+            failed.append(
+                _failure(
+                    "native_runtime_ownership",
+                    "managed Runtime state was manually removed or moved",
+                )
+            )
+        else:
+            passed.append("native_runtime_ownership")
 
     return passed, failed

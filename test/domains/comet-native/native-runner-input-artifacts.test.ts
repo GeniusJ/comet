@@ -1,3 +1,4 @@
+import { resolveWorkspaceRuntimeRootSync } from '../../../domains/workflow-contract/workspace-runtime.js';
 import { execFileSync } from 'node:child_process';
 import { promises as fs } from 'node:fs';
 import os from 'node:os';
@@ -15,7 +16,7 @@ import { nativeCheckInputGate } from '../../../domains/comet-native/native-porta
 
 describe('validated Native Runner input boundaries', () => {
   let root: string;
-  const registry = '.comet/runtime/native/runner-input-artifacts.json';
+  const registry = 'native/runner-input-artifacts.json';
   const git = (...args: string[]) => execFileSync('git', args, { cwd: root, stdio: 'ignore' });
   const gate = () => nativeCheckInputGate({ projectRoot: root, candidateId: 'fixture-candidate' });
   async function register(file: string) {
@@ -113,7 +114,9 @@ describe('validated Native Runner input boundaries', () => {
     await fs.writeFile(path.join(root, 'invalid.json'), '{}');
     await expect(register('invalid.json')).rejects.toThrow();
     expect(await nativeRunnerInputArtifactPaths(root)).toEqual(new Set());
-    await expect(fs.lstat(path.join(root, registry))).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(
+      fs.lstat(path.join(resolveWorkspaceRuntimeRootSync(root), registry)),
+    ).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
   it('does not exclude files reached through a directory link or a corrupted registry', async () => {
@@ -129,7 +132,7 @@ describe('validated Native Runner input boundaries', () => {
     );
     await expect(register('linked-inputs/handoff.json')).rejects.toThrow(/symbolic link|junction/u);
     await register('inputs/handoff.json');
-    await fs.writeFile(path.join(root, registry), '{broken');
+    await fs.writeFile(path.join(resolveWorkspaceRuntimeRootSync(root), registry), '{broken');
     expect(await nativeRunnerInputArtifactPaths(root)).toEqual(new Set());
   });
 });

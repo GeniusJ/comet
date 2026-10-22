@@ -1,3 +1,4 @@
+import { resolveWorkspaceRuntimeRootSync } from '../../../domains/workflow-contract/workspace-runtime.js';
 import { fixtureAcceptanceReview } from '../../helpers/native-builder-acceptance-review.js';
 import { execFileSync } from 'node:child_process';
 import { promises as fs } from 'node:fs';
@@ -9,6 +10,7 @@ import { runNativeCli } from '../../../domains/comet-native/native-cli.js';
 import { archiveNativePortableChange } from '../../../domains/comet-native/native-portable-archive.js';
 import { nativeProjectPaths } from '../../../domains/comet-native/native-paths.js';
 import { nativeWorkspaceIsClean } from '../../../domains/comet-native/native-workspace-config.js';
+import { ensureCometProjectGitignore } from '../../../domains/workflow-contract/project-gitignore.js';
 
 const roots: string[] = [];
 const git = (root: string, args: string[]) =>
@@ -94,10 +96,7 @@ async function repository() {
   git(root, ['init', '-b', 'main']);
   git(root, ['config', 'user.name', 'Native Test']);
   git(root, ['config', 'user.email', 'native@example.test']);
-  await fs.writeFile(
-    path.join(root, '.gitignore'),
-    '.comet/runtime/\n.comet/current-change.json\n',
-  );
+  await ensureCometProjectGitignore(root);
   git(root, ['add', '.']);
   git(root, ['commit', '-m', 'seed']);
   return root;
@@ -179,7 +178,14 @@ describe('Native public user-option paths', () => {
     'accepts the result and keeps its %s workspace in one guarded decision',
     async (isolation) => {
       const primary = await repository();
-      const created = await cli(primary, ['new', 'combined', '--isolation', isolation]);
+      const created = await cli(primary, [
+        'new',
+        'combined',
+        '--runtime',
+        'compat',
+        '--isolation',
+        isolation,
+      ]);
       const root = created.preparation.projectRoot;
       await fs.writeFile(
         path.join(root, 'docs/comet/changes/combined/brief.md'),
@@ -201,8 +207,9 @@ describe('Native public user-option paths', () => {
 
   it('rejects an expired one-step Archive choice without recording finish', async () => {
     const primary = await repository();
-    const root = (await cli(primary, ['new', 'stale-finish', '--isolation', 'branch'])).preparation
-      .projectRoot;
+    const root = (
+      await cli(primary, ['new', 'stale-finish', '--runtime', 'compat', '--isolation', 'branch'])
+    ).preparation.projectRoot;
     await fs.writeFile(
       path.join(root, 'docs/comet/changes/stale-finish/brief.md'),
       supervisorBrief('The fixture works.'),
@@ -237,7 +244,14 @@ describe('Native public user-option paths', () => {
       const primary = await repository();
       const original = git(primary, ['rev-parse', 'main']);
       // Exercise Runtime-created configuration, not a precommitted fixture config.
-      const created = await cli(primary, ['new', 'parent', '--isolation', isolation]);
+      const created = await cli(primary, [
+        'new',
+        'parent',
+        '--runtime',
+        'compat',
+        '--isolation',
+        isolation,
+      ]);
       const root = created.preparation.projectRoot;
       const dir = path.join(root, 'docs/comet/changes/parent');
       await fs.mkdir(path.join(dir, 'specs/options'), { recursive: true });
@@ -265,8 +279,8 @@ describe('Native public user-option paths', () => {
       // Simulate an upgrade from the old target binding, then loss of the
       // machine overlay. Both recover from the real portable/Git state.
       const supervisorFile = path.join(
-        root,
-        '.comet/runtime/native/changes/parent/supervisor/state.json',
+        resolveWorkspaceRuntimeRootSync(root),
+        'native/changes/parent/supervisor/state.json',
       );
       const legacySupervisor = JSON.parse(await fs.readFile(supervisorFile, 'utf8'));
       legacySupervisor.integration.targetBranch = 'main';
@@ -389,8 +403,9 @@ describe('Native public user-option paths', () => {
     const primary = await repository();
     const worktrees: string[] = [];
     for (const name of ['first', 'second']) {
-      const root = (await cli(primary, ['new', name, '--isolation', 'worktree'])).preparation
-        .projectRoot;
+      const root = (
+        await cli(primary, ['new', name, '--runtime', 'compat', '--isolation', 'worktree'])
+      ).preparation.projectRoot;
       worktrees.push(root);
       const dir = path.join(root, 'docs/comet/changes', name);
       await fs.writeFile(path.join(dir, 'brief.md'), supervisorBrief('Shared behavior works.'));

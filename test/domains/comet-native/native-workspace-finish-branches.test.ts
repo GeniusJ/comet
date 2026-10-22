@@ -46,6 +46,7 @@ const paths: NativeProjectPaths = {
   specsDir: path.join(projectRoot, 'comet', 'specs'),
   changesDir: path.join(projectRoot, 'comet', 'changes'),
   archiveDir: path.join(projectRoot, 'comet', 'archive'),
+  workspaceRuntimeRoot: path.join(os.tmpdir(), 'native-finish-runtime'),
   runtimeDir: path.join(projectRoot, '.comet', 'runtime', 'native'),
   changesRuntimeDir: path.join(projectRoot, '.comet', 'runtime', 'native', 'changes'),
   locksDir: path.join(projectRoot, '.comet', 'runtime', 'native', 'locks'),

@@ -7,9 +7,18 @@
 #   ./docker.sh build <directory> [--force]
 #   ./docker.sh run <directory> <command...>
 #   ./docker.sh run-python <directory> <script.py> [args...]
-#   ./docker.sh run-agent <directory> <prompt> --agent AGENT [--model MODEL] [--timeout SECONDS]
+#   ./docker.sh run-agent <directory> {<prompt>|--prompt-file <file>} --agent AGENT [--model MODEL] [--timeout SECONDS]
 
 set -euo pipefail
+
+EVAL_LABEL_ARGS=()
+if [[ -n "${COMET_EVAL_EXPERIMENT_ID:-}" ]]; then
+    EVAL_LABEL_ARGS=(--label "comet.eval.experiment=$COMET_EVAL_EXPERIMENT_ID")
+    if [[ -n "${COMET_EVAL_PROJECT_ID:-}" ]]; then
+        [[ "$COMET_EVAL_PROJECT_ID" =~ ^[a-f0-9]{64}$ ]] || { echo 'ERROR: Invalid Eval project identity' >&2; return 1 2>/dev/null || exit 1; }
+        EVAL_LABEL_ARGS+=(--label "comet.eval.project=$COMET_EVAL_PROJECT_ID")
+    fi
+fi
 
 # Docker on Windows runs as a native binary needing Windows-style host paths,
 # but git-bash (MSYS) rewrites POSIX-looking args. We want:
@@ -188,7 +197,7 @@ check_docker() {
 # HASH-BASED IMAGE CACHING
 # =============================================================================
 
-# Get hash of build inputs for cache key (Dockerfile + requirements.txt)
+# Get hash of build inputs for cache key (Dockerfile + dependency manifests).
 get_dockerfile_hash() {
     local dir="$1"
     local dockerfile="$dir/Dockerfile"
@@ -203,13 +212,16 @@ get_dockerfile_hash() {
         return 1
     fi
 
-    # Hash Dockerfile + requirements.txt (the files that affect the image).
+    # Dependency manifests copied into the image must invalidate the cache.
     # Don't hash the entire directory — test scripts and scaffold files are
     # added at runtime and would cause a different hash every run.
     local combined
     combined=$(cat "$dockerfile")
     if [[ -f "$dir/requirements.txt" ]]; then
         combined="$combined$(cat "$dir/requirements.txt")"
+    fi
+    if [[ -f "$dir/current-comet-package.json" ]]; then
+        combined="$combined$(cat "$dir/current-comet-package.json")"
     fi
 
     if command -v md5 &> /dev/null; then
@@ -322,9 +334,9 @@ docker_execution_identity() {
     local executable
     executable=$(agent_executable "$agent")
     if [[ "$agent" == "claude-code" && "${TRACE_TO_LANGFUSE:-}" != "true" ]]; then
-        agent_version_output=$(docker run --rm "$image_id" claude --version 2>/dev/null)
+        agent_version_output=$(docker run --rm ${EVAL_LABEL_ARGS[@]+"${EVAL_LABEL_ARGS[@]}"} "$image_id" claude --version 2>/dev/null)
     else
-        agent_version_output=$(docker run --rm "$image_id" "$executable" --version 2>/dev/null)
+        agent_version_output=$(docker run --rm ${EVAL_LABEL_ARGS[@]+"${EVAL_LABEL_ARGS[@]}"} "$image_id" "$executable" --version 2>/dev/null)
     fi || {
         echo "ERROR: Cannot verify $agent CLI version in benchmark image" >&2
         return 1
@@ -351,6 +363,48 @@ process.stdin.on("end", () => process.stdout.write(JSON.stringify(value.trim()))
 # =============================================================================
 # DOCKER BUILD
 # =============================================================================
+
+# 固定候选 CLI 到镜像层，模型只使用非 root 身份读取，不在每次命令中复制。
+docker_current_comet_image() {
+    local dir="$1" base_image="$2" force="${3:-}"
+    local snapshot="$dir/_eval_current_comet"
+    if [[ ! -f "$snapshot/bin/comet.js" || ! -d "$snapshot/dist" || \
+          ! -f "$snapshot/assets/manifest.json" || ! -f "$snapshot/package.json" ]]; then
+        printf '%s' "$base_image"
+        return 0
+    fi
+    local snapshot_hash base_id image_name context_path overlay_file
+    overlay_file="$SCRIPT_DIR/../docker/current-comet.Dockerfile"
+    snapshot_hash=$(node - "$snapshot" "$overlay_file" <<'NODE'
+const fs = require('fs'), path = require('path'), crypto = require('crypto');
+const root = process.argv[2], hash = crypto.createHash('sha256');
+function visit(dir) {
+    for (const name of fs.readdirSync(dir).sort()) {
+        const file = path.join(dir, name), stat = fs.lstatSync(file);
+        if (stat.isSymbolicLink()) throw new Error('CLI 候选快照不能包含符号链接');
+        if (stat.isDirectory()) visit(file);
+        else if (stat.isFile()) {
+            hash.update(path.relative(root, file).replaceAll('\\', '/'));
+            hash.update('\0'); hash.update(fs.readFileSync(file)); hash.update('\0');
+        }
+    }
+}
+visit(root); hash.update(fs.readFileSync(process.argv[3])); process.stdout.write(hash.digest('hex'));
+NODE
+    ) || return 1
+    base_id=$(docker image inspect --format '{{.Id}}' "$base_image") || return 1
+    image_name="$IMAGE_PREFIX:cli-$(sha256_text "$base_id:$snapshot_hash")"
+    if [[ "$force" != "--force" ]] && image_exists "$image_name"; then
+        printf '%s' "$image_name"
+        return 0
+    fi
+    context_path=$(_winpath "$snapshot")
+    overlay_file=$(_winpath "$overlay_file")
+    docker build -t "$image_name" --build-arg BASE_IMAGE="$base_image" \
+        --build-context "current_cli=$context_path" -f "$overlay_file" \
+        "$(_winpath "$SCRIPT_DIR/../docker")" >&2 || return 1
+    printf '%s' "$image_name"
+}
 
 # Build Docker image with caching
 # Usage: docker_build <directory> [--force]
@@ -382,7 +436,7 @@ docker_build() {
 
     # Check cache unless forced
     if [[ "$force" != "--force" ]] && image_exists "$image_name"; then
-        echo "$image_name"
+        docker_current_comet_image "$dir" "$image_name" "$force" || return 1
         return 0
     fi
 
@@ -394,7 +448,7 @@ docker_build() {
         if docker build -t "$image_name" \
             --build-arg CLAUDE_CODE_VERSION="$CLAUDE_CODE_VERSION" \
             -f "$windockerfile" "$windir" >&2; then
-            echo "$image_name"
+            docker_current_comet_image "$dir" "$image_name" "$force" || return 1
             return 0
         else
             echo "ERROR: Build failed" >&2
@@ -427,7 +481,7 @@ docker_build() {
         --build-arg CUSTOM_INSTALL_VERSION="${COMET_EVAL_CUSTOM_INSTALL_VERSION:-latest}" \
         --build-arg LANGFUSE_ENABLED="${TRACE_TO_LANGFUSE:-false}" \
         -f "$(_winpath "$overlay_file")" "$overlay_context" >&2; then
-        echo "$image_name"
+        docker_current_comet_image "$dir" "$image_name" "$force" || return 1
         return 0
     else
         echo "ERROR: Agent overlay build failed" >&2
@@ -440,7 +494,7 @@ docker_build() {
 # =============================================================================
 
 # Build env var arguments for docker run (populates ENV_ARGS array)
-# Usage: build_env_args; docker run "${ENV_ARGS[@]}" ...
+# Usage: build_env_args; docker run ${ENV_ARGS[@]+"${ENV_ARGS[@]}"} ...
 build_env_args() {
     ENV_ARGS=()
     for key in "${ENV_KEYS[@]}"; do
@@ -453,7 +507,7 @@ build_env_args() {
     if [[ -n "${COMET_EVAL_CUSTOM_CREDENTIALS:-}" ]]; then
         local custom_key
         IFS=',' read -r -a custom_keys <<< "${COMET_EVAL_CUSTOM_CREDENTIALS}"
-        for custom_key in "${custom_keys[@]}"; do
+        for custom_key in ${custom_keys[@]+"${custom_keys[@]}"}; do
             if [[ "$custom_key" =~ ^[A-Z][A-Z0-9_]{1,63}$ ]] && [[ -n "${!custom_key:-}" ]]; then
                 ENV_ARGS+=("-e" "$custom_key")
             fi
@@ -484,6 +538,20 @@ build_agent_runtime_mount_args() {
     ENV_ARGS+=("-e" "CODEX_HOME=/home/agent/.codex")
     ENV_ARGS+=("-e" "QODER_CONFIG_DIR=/home/agent/.qoder")
     ENV_ARGS+=("-e" "COMET_EVAL_CODEBUDDY_CONFIG_DIR=/home/agent/.codebuddy")
+    if [[ -n "${COMET_APPLICATION_EVAL_CONTEXT:-}" ]]; then
+        local application_metadata
+        application_metadata=$(python3 -c 'import json,os; p=json.loads(os.environ["COMET_APPLICATION_EVAL_CONTEXT"])["preview"]; print("\n".join([p["application"]["id"],p["application"]["version"],p["runtimeIdentityHash"]]))') || return 1
+        application_metadata="${application_metadata//$'\r'/}"
+        local -a application_fields=()
+        local application_field
+        while IFS= read -r application_field; do
+            application_fields+=("$application_field")
+        done <<< "$application_metadata"
+        [[ ${#application_fields[@]} -eq 3 ]] || return 1
+        ENV_ARGS+=("-e" "COMET_EVAL_APPLICATION_ID=${application_fields[0]}"
+                   "-e" "COMET_EVAL_APPLICATION_VERSION=${application_fields[1]}"
+                   "-e" "COMET_EVAL_APPLICATION_HASH=${application_fields[2]}")
+    fi
 }
 
 # Build mount + CLI args for the official LangSmith Claude Code plugin.
@@ -555,6 +623,65 @@ build_trusted_oracle_mount_args() {
     fi
 }
 
+eval_runtime_volume() {
+    printf 'comet-eval-data-%s' "$(sha256_text "$1" | cut -c1-24)"
+}
+
+# 当前 Runtime 位于 /workspace 之外；每个用例的执行和校验容器共享同一卷。
+prepare_eval_runtime_data() {
+    local dir="$1" image="$2" volume owner
+    COMET_RUNTIME_MOUNT_ARGS=()
+    [[ -d "$dir/_eval_current_comet" || -f "$dir/.include-current-comet-cli" ]] || return 0
+    volume=$(eval_runtime_volume "$dir") || return 1
+    owner=$(docker image inspect --format '{{.Config.User}}' "$image") || return 1
+    owner="${owner//$'\r'/}"
+    docker volume create --label "comet.eval.workspace=$(sha256_text "$dir")" "$volume" >/dev/null || return 1
+    printf '%s\n' "$volume" > "$dir/.eval-runtime-volume" || return 1
+    docker run --rm ${EVAL_LABEL_ARGS[@]+"${EVAL_LABEL_ARGS[@]}"} --user root -v "$volume://opt/comet-eval-data" "$image" sh -ec '
+        chown "${1:-0}" /opt/comet-eval-data
+        chmod 0700 /opt/comet-eval-data
+    ' _ "$owner" </dev/null || return 1
+    COMET_RUNTIME_MOUNT_ARGS=(-v "$volume://opt/comet-eval-data" -e "COMET_DATA_DIR=//opt/comet-eval-data")
+}
+
+cleanup_eval_runtime_data() {
+    local volume observed
+    volume=$(eval_runtime_volume "$1") || return 1
+    observed=$(docker volume ls -q --filter "name=^${volume}$") || return 1
+    observed="${observed//$'\r'/}"
+    if [[ "$observed" == "$volume" ]]; then
+        docker volume rm "$volume" >/dev/null || return 1
+    fi
+    rm -f -- "$1/.eval-runtime-volume"
+}
+
+# Docker Desktop presents Windows bind-mount roots as root-owned even when the
+# task image runs its Agent as a non-root user. Git rejects /workspace as unsafe
+# when Comet deliberately ignores user/global Git configuration. Change only
+# this isolated workspace mount point, never its contents or the image config.
+prepare_agent_workspace_owner() {
+    local dir="$1"
+    local image_id="$2"
+    case "$(uname -s)" in
+        MINGW*|MSYS*|CYGWIN*) ;;
+        *) return 0 ;;
+    esac
+
+    local windir
+    windir=$(_winpath "$dir")
+    docker run --rm --user root \
+        ${EVAL_LABEL_ARGS[@]+"${EVAL_LABEL_ARGS[@]}"} \
+        -v "$windir://workspace" \
+        "$image_id" \
+        sh -ec '
+            owner="$(id -u agent):$(id -g agent)"
+            if [ "$(stat -c %u:%g /workspace)" != "$owner" ]; then
+                chown --no-dereference "$owner" /workspace
+            fi
+            test "$(stat -c %u:%g /workspace)" = "$owner"
+        '
+}
+
 # Run command in Docker container
 # Usage: docker_run <directory> <command...>
 docker_run() {
@@ -568,16 +695,20 @@ docker_run() {
     build_env_args
     build_trusted_oracle_mount_args "$dir"
 
+    prepare_eval_runtime_data "$dir" "$image_name" || return 1
+
     local windir
     windir=$(_winpath "$dir")
 
     docker run --rm \
+        ${EVAL_LABEL_ARGS[@]+"${EVAL_LABEL_ARGS[@]}"} \
         -v "$windir://workspace" \
+        ${COMET_RUNTIME_MOUNT_ARGS[@]+"${COMET_RUNTIME_MOUNT_ARGS[@]}"} \
         ${TRUSTED_ORACLE_MOUNT_ARGS[@]+"${TRUSTED_ORACLE_MOUNT_ARGS[@]}"} \
         -w //workspace \
-        "${ENV_ARGS[@]}" \
+        ${ENV_ARGS[@]+"${ENV_ARGS[@]}"} \
         "$image_name" \
-        "${cmd[@]}"
+        ${cmd[@]+"${cmd[@]}"}
 }
 
 # Run one user-authored validation command inside the task container.
@@ -604,7 +735,7 @@ docker_run_command() {
                 ;;
         esac
     done
-    if [[ ${#command[@]} -eq 0 ]]; then
+    if [[ -z ${command[@]+present} ]]; then
         echo "ERROR: validation command is required" >&2
         return 2
     fi
@@ -612,11 +743,14 @@ docker_run_command() {
     local image_name
     image_name=$(docker_build "$dir") || return 1
     build_trusted_oracle_mount_args "$dir"
+    prepare_eval_runtime_data "$dir" "$image_name" || return 1
 
     local windir
     windir=$(_winpath "$dir")
     local docker_command=(docker run --rm
+        ${EVAL_LABEL_ARGS[@]+"${EVAL_LABEL_ARGS[@]}"}
         -v "$windir://workspace"
+        ${COMET_RUNTIME_MOUNT_ARGS[@]+"${COMET_RUNTIME_MOUNT_ARGS[@]}"}
         ${TRUSTED_ORACLE_MOUNT_ARGS[@]+"${TRUSTED_ORACLE_MOUNT_ARGS[@]}"}
         -w //workspace
         "$image_name"
@@ -656,92 +790,27 @@ docker_run_node() {
 # Run Claude CLI in Docker
 # Usage: docker_run_claude <directory> <prompt> [--model MODEL] [--timeout SECONDS]
 docker_run_claude() {
-    local dir="$1"
-    local prompt="$2"
-    shift 2
-
-    local model=""
-    local timeout="300"
-    local expected_image_id=""
-
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --model)
-                model="$2"
-                shift 2
-                ;;
-            --timeout)
-                timeout="$2"
-                shift 2
-                ;;
-            --image-id)
-                expected_image_id="$2"
-                shift 2
-                ;;
-            *)
-                shift
-                ;;
-        esac
-    done
-
-    local image_id
-    image_id=$(resolve_runtime_image "$dir" "$expected_image_id") || return 1
-
-    build_env_args
-    build_agent_runtime_mount_args
-    build_plugin_args
-    build_langfuse_plugin_args "claude-code"
-    build_trusted_oracle_mount_args "$dir"
-
-    local cmd=(bash //opt/scaffold-shell/run-agent-runtime.sh claude-code "$model" "$prompt" --)
-    if [[ ${#PLUGIN_CLI_ARGS[@]} -gt 0 ]]; then
-        cmd+=("${PLUGIN_CLI_ARGS[@]}")
-    fi
-    if [[ ${#LANGFUSE_PLUGIN_CLI_ARGS[@]} -gt 0 ]]; then
-        cmd+=("${LANGFUSE_PLUGIN_CLI_ARGS[@]}")
-    fi
-
-    local windir
-    windir=$(_winpath "$dir")
-
-    if [[ -n "$TIMEOUT_CMD" ]]; then
-        $TIMEOUT_CMD "$timeout" docker run --rm \
-            -v "$windir://workspace" \
-            "${RUNTIME_CONFIG_MOUNT_ARGS[@]}" \
-            "${RUNTIME_CONFIG_TMPFS_ARGS[@]}" \
-            ${TRUSTED_ORACLE_MOUNT_ARGS[@]+"${TRUSTED_ORACLE_MOUNT_ARGS[@]}"} \
-            ${PLUGIN_MOUNT_ARGS[@]+"${PLUGIN_MOUNT_ARGS[@]}"} \
-            ${LANGFUSE_PLUGIN_MOUNT_ARGS[@]+"${LANGFUSE_PLUGIN_MOUNT_ARGS[@]}"} \
-            -w //workspace \
-            "${ENV_ARGS[@]}" \
-            "$image_id" \
-            "${cmd[@]}"
-    else
-        docker run --rm \
-            -v "$windir://workspace" \
-            "${RUNTIME_CONFIG_MOUNT_ARGS[@]}" \
-            "${RUNTIME_CONFIG_TMPFS_ARGS[@]}" \
-            ${TRUSTED_ORACLE_MOUNT_ARGS[@]+"${TRUSTED_ORACLE_MOUNT_ARGS[@]}"} \
-            ${PLUGIN_MOUNT_ARGS[@]+"${PLUGIN_MOUNT_ARGS[@]}"} \
-            ${LANGFUSE_PLUGIN_MOUNT_ARGS[@]+"${LANGFUSE_PLUGIN_MOUNT_ARGS[@]}"} \
-            -w //workspace \
-            "${ENV_ARGS[@]}" \
-            "$image_id" \
-            "${cmd[@]}"
-    fi
+    docker_run_agent "$@" --agent claude-code
 }
 
 # Run a selected evaluation agent CLI in Docker.
-# Usage: docker_run_agent <directory> <prompt> --agent AGENT [--model MODEL] [--timeout SECONDS]
-docker_run_agent() {
+# Usage: docker_run_agent <directory> {<prompt>|--prompt-file <file>} --agent AGENT [--model MODEL] [--timeout SECONDS]
+docker_run_agent() (
     local dir="$1"
     local prompt="$2"
     shift 2
+    local prompt_file=""
+    if [[ "$prompt" == "--prompt-file" ]]; then
+        prompt_file="${1:?prompt file is required}"
+        shift
+        [[ -f "$prompt_file" && -r "$prompt_file" ]] || { die 'Prompt file is not readable'; return 1; }
+    fi
 
     local agent="$DEFAULT_AGENT"
     local model=""
     local timeout="300"
     local expected_image_id=""
+    local container_name=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -761,15 +830,28 @@ docker_run_agent() {
                 expected_image_id="$2"
                 shift 2
                 ;;
+            --container-name)
+                container_name="$2"
+                shift 2
+                ;;
             *)
                 shift
                 ;;
         esac
     done
     validate_agent "$agent" || return 1
+    if [[ -z "$container_name" ]]; then
+        container_name="comet-eval-turn-$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+    fi
+    [[ "$container_name" =~ ^comet-eval-turn-[a-f0-9]{32}$ ]] || { die 'Invalid single-turn container identity'; return 1; }
+    if [[ -n "$prompt_file" && "$agent" != claude-code && "$agent" != codex ]]; then
+        die 'This adapter has no verified prompt stdin contract'
+        return 1
+    fi
 
     local image_id
     image_id=$(resolve_runtime_image "$dir" "$expected_image_id" "$agent") || return 1
+    prepare_agent_workspace_owner "$dir" "$image_id" || return 1
 
     build_env_args
     build_agent_runtime_mount_args
@@ -781,40 +863,98 @@ docker_run_agent() {
     fi
     build_langfuse_plugin_args "$agent"
     build_trusted_oracle_mount_args "$dir"
-    AGENT_COMMAND=(bash //opt/scaffold-shell/run-agent-runtime.sh "$agent" "$model" "$prompt" --)
-    if [[ "$agent" == "claude-code" && ${#PLUGIN_CLI_ARGS[@]} -gt 0 ]]; then
-        AGENT_COMMAND+=("${PLUGIN_CLI_ARGS[@]}")
+    prepare_eval_runtime_data "$dir" "$image_id" || return 1
+    local -a prompt_mount_args=() prompt_docker_args=()
+    local prompt_input=/dev/null
+    if [[ -n "$prompt_file" ]]; then
+        prompt_mount_args=(-v "$(_winpath "$prompt_file")://opt/comet-eval-prompt.txt:ro")
+        prompt_docker_args=(-i)
+        prompt_input="$prompt_file"
+        # Host owner reads the private file; the non-root Agent receives its exact
+        # bytes on stdin even when its container uid differs from the host uid.
+        AGENT_COMMAND=(bash //opt/scaffold-shell/run-agent-runtime.sh "$agent" "$model" --prompt-stdin --)
+    else
+        AGENT_COMMAND=(bash //opt/scaffold-shell/run-agent-runtime.sh "$agent" "$model" "$prompt" --)
     fi
-    if [[ "$agent" == "claude-code" && ${#LANGFUSE_PLUGIN_CLI_ARGS[@]} -gt 0 ]]; then
-        AGENT_COMMAND+=("${LANGFUSE_PLUGIN_CLI_ARGS[@]}")
+    if [[ "$agent" == "claude-code" ]]; then
+        AGENT_COMMAND+=(${PLUGIN_CLI_ARGS[@]+"${PLUGIN_CLI_ARGS[@]}"})
+        AGENT_COMMAND+=(${LANGFUSE_PLUGIN_CLI_ARGS[@]+"${LANGFUSE_PLUGIN_CLI_ARGS[@]}"})
     fi
 
     local windir
     windir=$(_winpath "$dir")
+    trap 'turn_status=$?; trap - EXIT; if ! cleanup_agent_turn "$container_name"; then echo "Agent container cleanup is incomplete for $container_name" >&2; exit 125; fi; exit "$turn_status"' EXIT
+    trap 'exit 143' TERM
+    trap 'exit 130' INT
     if [[ -n "$TIMEOUT_CMD" ]]; then
-        $TIMEOUT_CMD "$timeout" docker run --rm \
+        $TIMEOUT_CMD --kill-after=5 "$timeout" docker run --rm --name "$container_name" --label "comet.eval.turn=$container_name" \
+            ${EVAL_LABEL_ARGS[@]+"${EVAL_LABEL_ARGS[@]}"} \
+            ${prompt_docker_args[@]+"${prompt_docker_args[@]}"} \
             -v "$windir://workspace" \
-            "${RUNTIME_CONFIG_MOUNT_ARGS[@]}" \
-            "${RUNTIME_CONFIG_TMPFS_ARGS[@]}" \
+            ${COMET_RUNTIME_MOUNT_ARGS[@]+"${COMET_RUNTIME_MOUNT_ARGS[@]}"} \
+            ${prompt_mount_args[@]+"${prompt_mount_args[@]}"} \
+            ${RUNTIME_CONFIG_MOUNT_ARGS[@]+"${RUNTIME_CONFIG_MOUNT_ARGS[@]}"} \
+            ${RUNTIME_CONFIG_TMPFS_ARGS[@]+"${RUNTIME_CONFIG_TMPFS_ARGS[@]}"} \
             ${TRUSTED_ORACLE_MOUNT_ARGS[@]+"${TRUSTED_ORACLE_MOUNT_ARGS[@]}"} \
             ${PLUGIN_MOUNT_ARGS[@]+"${PLUGIN_MOUNT_ARGS[@]}"} \
             ${LANGFUSE_PLUGIN_MOUNT_ARGS[@]+"${LANGFUSE_PLUGIN_MOUNT_ARGS[@]}"} \
             -w //workspace \
-            "${ENV_ARGS[@]}" \
+            ${ENV_ARGS[@]+"${ENV_ARGS[@]}"} \
             "$image_id" \
-            "${AGENT_COMMAND[@]}"
+            "${AGENT_COMMAND[@]}" < "$prompt_input"
     else
-        docker run --rm \
+        docker run --rm --name "$container_name" --label "comet.eval.turn=$container_name" \
+            ${EVAL_LABEL_ARGS[@]+"${EVAL_LABEL_ARGS[@]}"} \
+            ${prompt_docker_args[@]+"${prompt_docker_args[@]}"} \
             -v "$windir://workspace" \
-            "${RUNTIME_CONFIG_MOUNT_ARGS[@]}" \
-            "${RUNTIME_CONFIG_TMPFS_ARGS[@]}" \
+            ${COMET_RUNTIME_MOUNT_ARGS[@]+"${COMET_RUNTIME_MOUNT_ARGS[@]}"} \
+            ${prompt_mount_args[@]+"${prompt_mount_args[@]}"} \
+            ${RUNTIME_CONFIG_MOUNT_ARGS[@]+"${RUNTIME_CONFIG_MOUNT_ARGS[@]}"} \
+            ${RUNTIME_CONFIG_TMPFS_ARGS[@]+"${RUNTIME_CONFIG_TMPFS_ARGS[@]}"} \
             ${TRUSTED_ORACLE_MOUNT_ARGS[@]+"${TRUSTED_ORACLE_MOUNT_ARGS[@]}"} \
             ${PLUGIN_MOUNT_ARGS[@]+"${PLUGIN_MOUNT_ARGS[@]}"} \
             ${LANGFUSE_PLUGIN_MOUNT_ARGS[@]+"${LANGFUSE_PLUGIN_MOUNT_ARGS[@]}"} \
             -w //workspace \
-            "${ENV_ARGS[@]}" \
+            ${ENV_ARGS[@]+"${ENV_ARGS[@]}"} \
             "$image_id" \
-            "${AGENT_COMMAND[@]}"
+            "${AGENT_COMMAND[@]}" < "$prompt_input"
+    fi
+)
+
+# Bound every cleanup query/removal even when the Docker daemon is unresponsive.
+_agent_turn_docker_call() {
+    if [[ -n "$TIMEOUT_CMD" ]]; then
+        "$TIMEOUT_CMD" --kill-after=1 5 docker "$@"
+        return $?
+    fi
+    docker "$@" &
+    local client=$! status=0 watchdog
+    (sleep 5; kill -KILL "$client" 2>/dev/null || true) >/dev/null 2>&1 &
+    watchdog=$!
+    wait "$client" || status=$?
+    kill "$watchdog" 2>/dev/null || true
+    wait "$watchdog" 2>/dev/null || true
+    return "$status"
+}
+
+cleanup_agent_turn() {
+    local name="${1:-}" observed owner
+    [[ "$name" =~ ^comet-eval-turn-[a-f0-9]{32}$ ]] || { echo 'Invalid single-turn cleanup identity' >&2; return 1; }
+    observed=$(_agent_turn_docker_call container ls -a --filter "name=$name" --format '{{.Names}}') || return 1
+    [[ -n "$observed" ]] || return 0
+    [[ "$observed" == "$name" ]] || { echo 'Single-turn container ownership could not be established' >&2; return 1; }
+    if ! owner=$(_agent_turn_docker_call container inspect --format '{{ index .Config.Labels "comet.eval.turn" }}' "$name"); then
+        observed=$(_agent_turn_docker_call container ls -a --filter "name=$name" --format '{{.Names}}') || return 1
+        [[ -z "$observed" ]] && return 0
+        return 1
+    fi
+    [[ "$owner" == "$name" ]] || { echo "Single-turn container ownership mismatch: $name" >&2; return 1; }
+    local removal_status=0
+    _agent_turn_docker_call rm -f "$name" >/dev/null || removal_status=$?
+    observed=$(_agent_turn_docker_call container ls -a --filter "name=$name" --format '{{.Names}}') || return 1
+    if [[ -n "$observed" ]]; then
+        echo "Single-turn container remains after cleanup: $name (remove exit $removal_status)" >&2
+        return 1
     fi
 }
 
@@ -847,12 +987,14 @@ docker_run_claude_loop() {
 
     local image_id
     image_id=$(resolve_runtime_image "$dir" "$expected_image_id" "claude-code") || return 1
+    prepare_agent_workspace_owner "$dir" "$image_id" || return 1
 
     build_env_args
     build_agent_runtime_mount_args
     build_plugin_args
     build_langfuse_plugin_args "claude-code"
     build_trusted_oracle_mount_args "$dir"
+    prepare_eval_runtime_data "$dir" "$image_id" || return 1
 
     local windir
     windir=$(_winpath "$dir")
@@ -867,19 +1009,21 @@ docker_run_claude_loop() {
     # Mount the scaffold shell scripts read-only so the loop driver is available
     # at /opt/scaffold-shell/ inside the container.
     docker run --rm --name "$container_name" \
+        ${EVAL_LABEL_ARGS[@]+"${EVAL_LABEL_ARGS[@]}"} \
         -v "$windir://workspace" \
-        "${RUNTIME_CONFIG_MOUNT_ARGS[@]}" \
-        "${RUNTIME_CONFIG_TMPFS_ARGS[@]}" \
+        ${COMET_RUNTIME_MOUNT_ARGS[@]+"${COMET_RUNTIME_MOUNT_ARGS[@]}"} \
+        ${RUNTIME_CONFIG_MOUNT_ARGS[@]+"${RUNTIME_CONFIG_MOUNT_ARGS[@]}"} \
+        ${RUNTIME_CONFIG_TMPFS_ARGS[@]+"${RUNTIME_CONFIG_TMPFS_ARGS[@]}"} \
         ${TRUSTED_ORACLE_MOUNT_ARGS[@]+"${TRUSTED_ORACLE_MOUNT_ARGS[@]}"} \
         ${PLUGIN_MOUNT_ARGS[@]+"${PLUGIN_MOUNT_ARGS[@]}"} \
         ${LANGFUSE_PLUGIN_MOUNT_ARGS[@]+"${LANGFUSE_PLUGIN_MOUNT_ARGS[@]}"} \
         -w //workspace \
-        "${ENV_ARGS[@]}" \
+        ${ENV_ARGS[@]+"${ENV_ARGS[@]}"} \
         "$image_id" \
         bash //opt/scaffold-shell/run-claude-loop.sh "$prompt" \
             ${PLUGIN_CLI_ARGS[@]+"${PLUGIN_CLI_ARGS[@]}"} \
             ${LANGFUSE_PLUGIN_CLI_ARGS[@]+"${LANGFUSE_PLUGIN_CLI_ARGS[@]}"} \
-            "${loop_args[@]}"
+            ${loop_args[@]+"${loop_args[@]}"}
 }
 
 # Run the shared multi-turn driver with a selected agent CLI.
@@ -915,6 +1059,7 @@ docker_run_agent_loop() {
 
     local image_id
     image_id=$(resolve_runtime_image "$dir" "$expected_image_id" "$agent") || return 1
+    prepare_agent_workspace_owner "$dir" "$image_id" || return 1
 
     build_env_args
     build_agent_runtime_mount_args
@@ -926,6 +1071,7 @@ docker_run_agent_loop() {
     fi
     build_langfuse_plugin_args "$agent"
     build_trusted_oracle_mount_args "$dir"
+    prepare_eval_runtime_data "$dir" "$image_id" || return 1
 
     local windir
     windir=$(_winpath "$dir")
@@ -934,20 +1080,22 @@ docker_run_agent_loop() {
     docker rm -f "$container_name" &> /dev/null || true
 
     docker run --rm --name "$container_name" \
+        ${EVAL_LABEL_ARGS[@]+"${EVAL_LABEL_ARGS[@]}"} \
         -v "$windir://workspace" \
-        "${RUNTIME_CONFIG_MOUNT_ARGS[@]}" \
-        "${RUNTIME_CONFIG_TMPFS_ARGS[@]}" \
+        ${COMET_RUNTIME_MOUNT_ARGS[@]+"${COMET_RUNTIME_MOUNT_ARGS[@]}"} \
+        ${RUNTIME_CONFIG_MOUNT_ARGS[@]+"${RUNTIME_CONFIG_MOUNT_ARGS[@]}"} \
+        ${RUNTIME_CONFIG_TMPFS_ARGS[@]+"${RUNTIME_CONFIG_TMPFS_ARGS[@]}"} \
         ${TRUSTED_ORACLE_MOUNT_ARGS[@]+"${TRUSTED_ORACLE_MOUNT_ARGS[@]}"} \
         ${PLUGIN_MOUNT_ARGS[@]+"${PLUGIN_MOUNT_ARGS[@]}"} \
         ${LANGFUSE_PLUGIN_MOUNT_ARGS[@]+"${LANGFUSE_PLUGIN_MOUNT_ARGS[@]}"} \
         -w //workspace \
-        "${ENV_ARGS[@]}" \
+        ${ENV_ARGS[@]+"${ENV_ARGS[@]}"} \
         "$image_id" \
         bash //opt/scaffold-shell/run-claude-loop.sh "$prompt" \
             --agent "$agent" \
             ${PLUGIN_CLI_ARGS[@]+"${PLUGIN_CLI_ARGS[@]}"} \
             ${LANGFUSE_PLUGIN_CLI_ARGS[@]+"${LANGFUSE_PLUGIN_CLI_ARGS[@]}"} \
-            "${loop_args[@]}"
+            ${loop_args[@]+"${loop_args[@]}"}
 }
 
 cleanup_claude_loop() {
@@ -973,6 +1121,10 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     shift || true
 
     case "$cmd" in
+    cleanup-runtime-data)
+        dir="${1:?Missing Eval workspace}"
+        cleanup_eval_runtime_data "$(realpath "$dir")"
+        ;;
     check)
         if check_docker; then
             echo "OK"
@@ -1095,6 +1247,9 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
             die "Usage: $0 cleanup-agent-loop <directory>"
         fi
         cleanup_agent_loop "$(realpath "$dir")"
+        ;;
+    cleanup-agent-turn)
+        cleanup_agent_turn "${1:-}"
         ;;
     help|*)
         cat <<EOF

@@ -1,7 +1,7 @@
 import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
   applyNativeArchiveTransactionV2,
@@ -92,6 +92,51 @@ describe('Native Archive transaction V2 public lifecycle', () => {
     const committed = await finalizeNativeArchiveTransactionV2(paths, finalized, 'commit');
     expect(committed.status).toBe('committed');
     expect(nativeArchiveTransactionPaths(paths, initial.id).journal).toContain(initial.id);
+  });
+
+  it('publishes same-volume candidates when user data is on another volume and cleans staging', async () => {
+    const initial = await journal('52345678-abcd', 'cross-volume-change');
+    const tx = nativeArchiveTransactionPaths(paths, initial.id);
+    const staged = path.join(tx.staged, 'specs', 'sample', 'spec.md');
+    await fs.mkdir(path.dirname(staged), { recursive: true });
+    await fs.writeFile(staged, 'new spec\n');
+    const content = await inspectNativeArchiveContent(staged);
+    const target = path.join(paths.specsDir, 'sample', 'spec.md');
+    await fs.mkdir(path.dirname(target), { recursive: true });
+    initial.operations.unshift({
+      id: 'write-spec',
+      type: 'write',
+      target: 'specs/sample/spec.md',
+      staged: `runtime/transactions/${initial.id}/staged/specs/sample/spec.md`,
+      expectedTargetHash: null,
+      stagedHash: content!.hash,
+    });
+    await createNativeArchiveTransactionV2(paths, initial);
+    const originalLink = fs.link.bind(fs);
+    const linked: string[] = [];
+    const link = vi.spyOn(fs, 'link').mockImplementation(async (source, destination) => {
+      const fromRuntime = String(source).startsWith(paths.runtimeDir + path.sep);
+      const toRuntime = String(destination).startsWith(paths.runtimeDir + path.sep);
+      if (fromRuntime !== toRuntime) {
+        throw Object.assign(new Error('cross-device link'), { code: 'EXDEV' });
+      }
+      if (String(destination) === target) linked.push(String(source));
+      await originalLink(source, destination);
+    });
+    try {
+      const applying = await applyNativeArchiveTransactionV2(paths, initial);
+      expect(await fs.readFile(target, 'utf8')).toBe('new spec\n');
+      expect(linked).toHaveLength(1);
+      expect(linked[0]).toContain(path.join(path.dirname(target), '.comet-archive-staging'));
+      await finalizeNativeArchiveTransactionV2(paths, applying, 'archive-finalization-started');
+      await finalizeNativeArchiveTransactionV2(paths, applying, 'archive-finalized');
+      await finalizeNativeArchiveTransactionV2(paths, applying, 'commit');
+      await expect(
+        fs.access(path.join(path.dirname(target), '.comet-archive-staging')),
+      ).rejects.toMatchObject({ code: 'ENOENT' });
+    } finally {
+      link.mockRestore();
+    }
   });
 
   it('rejects invalid lifecycle transitions and finalization rollback', async () => {

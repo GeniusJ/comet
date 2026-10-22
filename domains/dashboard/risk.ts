@@ -31,8 +31,8 @@ export function buildChangeRisks(input: ChangeRiskInput): DashboardRisk[] {
     risks.push({
       level: 'warning',
       code: 'MISSING_COMET_YAML',
-      message: '该 change 缺少 .comet.yaml，无法判定准确状态。',
-      suggestion: '运行 /comet-open 或手动补齐 .comet.yaml。',
+      message: '该 change 缺少 Classic 状态文件，无法判定准确状态。',
+      suggestion: '运行 /comet-open 或手动补齐 Classic 状态文件。',
     });
   }
 
@@ -41,7 +41,7 @@ export function buildChangeRisks(input: ChangeRiskInput): DashboardRisk[] {
       level: 'warning',
       code: 'UNKNOWN_PHASE',
       message: '当前 change 的 phase 未知。',
-      suggestion: '检查 .comet.yaml 的 phase 字段，或重新运行对应阶段命令。',
+      suggestion: '检查 Classic 状态文件的 phase 字段，或重新运行对应阶段命令。',
     });
   }
 
@@ -98,7 +98,7 @@ export function buildChangeRisks(input: ChangeRiskInput): DashboardRisk[] {
       level: 'info',
       code: 'ARCHIVE_METADATA_MISSING',
       message: '归档目录名不符合 YYYY-MM-DD-<name> 规范，无法推断 archivedAt。',
-      suggestion: '后续归档时遵守标准命名，或在 .comet.yaml 中记录 archived_at。',
+      suggestion: '后续归档时遵守标准命名，或在 Classic 状态文件中记录 archived_at。',
     });
   }
 
@@ -113,7 +113,14 @@ interface ProjectRiskInput {
 export function buildProjectRisks(input: ProjectRiskInput): DashboardRisk[] {
   const risks: DashboardRisk[] = [];
 
-  if (input.git.dirtyFiles > 0) {
+  if (input.git.dirtyFiles === null) {
+    risks.push({
+      level: 'warning',
+      code: 'GIT_STATUS_UNAVAILABLE',
+      message: '无法读取 Git 工作区状态，未提交文件数未知。',
+      suggestion: '检查仓库是否可用，并运行 git status 后重试。',
+    });
+  } else if (input.git.dirtyFiles > 0) {
     risks.push({
       level: 'warning',
       code: 'GIT_DIRTY',

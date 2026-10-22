@@ -1,3 +1,5 @@
+import { resolveClassicStateFile } from './classic-state-file.js';
+import { CLASSIC_CHANGE_ID_PATTERN } from './classic-state.js';
 import path from 'path';
 import { isMap, parseDocument } from 'yaml';
 import type { ClassicCommandHandler } from './classic-cli.js';
@@ -73,8 +75,8 @@ export const classicValidateCommand: ClassicCommandHandler = withProjectContext(
 
   const projectRoot = classicCommandProjectRoot();
   const { directory, label } = await resolveClassicChangeDirectory(name, projectRoot);
-  const yamlFile = path.join(directory, '.comet.yaml');
-  const lines = [`[VALIDATE] ${label}/.comet.yaml`];
+  const yamlFile = await resolveClassicStateFile(directory);
+  const lines = [`[VALIDATE] ${label}/${path.basename(yamlFile)}`];
   let errors = 0;
   let warnings = 0;
   const fail = (message: string) => {
@@ -89,11 +91,11 @@ export const classicValidateCommand: ClassicCommandHandler = withProjectContext(
   let source: string;
   try {
     source = await readClassicProjectFile(projectRoot, yamlFile, {
-      label: `Classic state ${label}/.comet.yaml`,
+      label: `Classic state ${label}/${path.basename(yamlFile)}`,
     });
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-      fail('.comet.yaml does not exist');
+      fail(`${path.basename(yamlFile)} does not exist`);
       lines.push('', color(RED, `${errors} error(s), ${warnings} warning(s) — validation FAILED`));
       return { exitCode: 1, stderr: lines.join('\n') };
     }
@@ -133,6 +135,11 @@ export const classicValidateCommand: ClassicCommandHandler = withProjectContext(
       fail(`bound_branch='${text(value)}' is not a string or null`);
     }
   }
+  if (
+    record.change_id !== undefined &&
+    (typeof record.change_id !== 'string' || !CLASSIC_CHANGE_ID_PATTERN.test(record.change_id))
+  )
+    fail('change_id must be an immutable UUID');
   for (const field of ['verify_failures', 'check_epoch']) {
     if (!Object.prototype.hasOwnProperty.call(record, field)) continue;
     const value = record[field];

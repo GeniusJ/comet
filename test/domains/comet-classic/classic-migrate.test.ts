@@ -1,3 +1,4 @@
+import { resolveClassicRunDirectory } from '../../../domains/comet-classic/classic-runtime-paths.js';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { promises as fs } from 'fs';
 import os from 'os';
@@ -13,7 +14,7 @@ import {
   readCheckpoint,
   readContext,
   readTrajectory,
-} from '../../../domains/engine/run-store.js';
+} from '../../../domains/comet-classic/classic-run-store.js';
 import type { SkillPackage } from '../../../domains/skill/types.js';
 
 const stableSteps = [
@@ -315,7 +316,7 @@ describe('Classic legacy migration', () => {
     const first = await ensureClassicRun(changeDir, options);
     const yamlBefore = await fs.readFile(path.join(changeDir, '.comet.yaml'), 'utf8');
     const trajectoryBefore = await fs.readFile(
-      path.join(changeDir, first.run.trajectoryRef),
+      path.join(await resolveClassicRunDirectory(changeDir), first.run.trajectoryRef),
       'utf8',
     );
     const second = await ensureClassicRun(changeDir, options);
@@ -323,9 +324,12 @@ describe('Classic legacy migration', () => {
     expect(second.migrated).toBe(false);
     expect(second.run.runId).toBe('run-stable');
     expect(await fs.readFile(path.join(changeDir, '.comet.yaml'), 'utf8')).toBe(yamlBefore);
-    expect(await fs.readFile(path.join(changeDir, first.run.trajectoryRef), 'utf8')).toBe(
-      trajectoryBefore,
-    );
+    expect(
+      await fs.readFile(
+        path.join(await resolveClassicRunDirectory(changeDir), first.run.trajectoryRef),
+        'utf8',
+      ),
+    ).toBe(trajectoryBefore);
     expect(await readTrajectory(changeDir, first.run.trajectoryRef)).toHaveLength(2);
   });
 
@@ -426,7 +430,12 @@ handoff_hash: null
     expect(second.run.runId).toBe(first.run.runId);
     expect(second.run.skillHash).toBe(first.run.skillHash);
     expect(second.snapshotDir).toBe(
-      path.join(changeDir, '.comet', 'skill-snapshots', first.run.skillHash),
+      path.join(
+        await resolveClassicRunDirectory(changeDir),
+        '.comet',
+        'skill-snapshots',
+        first.run.skillHash,
+      ),
     );
   });
 

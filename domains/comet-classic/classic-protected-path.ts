@@ -1,9 +1,11 @@
 import path from 'path';
+import { resolveClassicLocalTarget } from './classic-runtime-paths.js';
 
 import { atomicWriteContainedText } from '../workflow-contract/contained-atomic-write.js';
 import { normalizeWorkflowRelativePath } from '../workflow-contract/project-config.js';
 import {
   ensureProtectedProjectDirectory,
+  hashProtectedProjectFile,
   inspectProtectedProjectPath,
   readProtectedProjectFile,
   type ProtectedProjectPathInspection,
@@ -11,13 +13,19 @@ import {
 
 export const CLASSIC_PROJECT_FILE_MAX_BYTES = Number.MAX_SAFE_INTEGER;
 
-function projectTarget(
+async function projectTarget(
   projectRoot: string,
   target: string,
   label: string,
-): { root: string; relative: string; target: string } {
-  const root = path.resolve(projectRoot);
-  const absolute = path.isAbsolute(target) ? path.resolve(target) : path.resolve(root, target);
+  migrate = false,
+): Promise<{ root: string; relative: string; target: string }> {
+  let root = path.resolve(projectRoot);
+  let absolute = path.isAbsolute(target) ? path.resolve(target) : path.resolve(root, target);
+  const local = await resolveClassicLocalTarget(root, absolute, { migrate });
+  if (local) {
+    root = local.root;
+    absolute = local.target;
+  }
   const relative = path.relative(root, absolute).replaceAll('\\', '/');
   return {
     root,
@@ -29,9 +37,9 @@ function projectTarget(
 export async function inspectClassicProjectTarget(
   projectRoot: string,
   target: string,
-  options: { label: string; expected: 'file' | 'directory' | 'any' },
+  options: { label: string; expected: 'file' | 'directory' | 'any'; migrate?: boolean },
 ): Promise<ProtectedProjectPathInspection> {
-  const resolved = projectTarget(projectRoot, target, options.label);
+  const resolved = await projectTarget(projectRoot, target, options.label, options.migrate);
   return inspectProtectedProjectPath(resolved.root, resolved.relative, options);
 }
 
@@ -102,7 +110,7 @@ export async function readClassicProjectBytes(
     };
   },
 ): Promise<Buffer> {
-  const resolved = projectTarget(projectRoot, target, options.label);
+  const resolved = await projectTarget(projectRoot, target, options.label);
   return (
     await readProtectedProjectFile(
       resolved.root,
@@ -118,7 +126,7 @@ export async function ensureClassicProjectDirectory(
   target: string,
   label: string,
 ): Promise<string> {
-  const resolved = projectTarget(projectRoot, target, label);
+  const resolved = await projectTarget(projectRoot, target, label, true);
   return ensureProtectedProjectDirectory(resolved.root, resolved.relative, { label });
 }
 
@@ -130,6 +138,7 @@ export async function assertClassicProjectFileWriteTarget(
   const inspection = await inspectClassicProjectTarget(projectRoot, target, {
     label,
     expected: 'file',
+    migrate: true,
   });
   return inspection.target;
 }
@@ -145,7 +154,7 @@ export async function writeClassicProjectText(
     exclusive?: boolean;
   },
 ): Promise<void> {
-  const resolved = projectTarget(projectRoot, target, options.label);
+  const resolved = await projectTarget(projectRoot, target, options.label, true);
   await inspectProtectedProjectPath(resolved.root, resolved.relative, {
     label: options.label,
     expected: 'file',
@@ -156,4 +165,13 @@ export async function writeClassicProjectText(
     beforeCommit: options.beforeCommit,
     exclusive: options.exclusive,
   });
+}
+
+export async function hashClassicProjectFile(
+  projectRoot: string,
+  target: string,
+  options: Parameters<typeof hashProtectedProjectFile>[2],
+) {
+  const resolved = await projectTarget(projectRoot, target, options.label);
+  return hashProtectedProjectFile(resolved.root, resolved.relative, options);
 }

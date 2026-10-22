@@ -1,5 +1,11 @@
 import { assertNativeInputKeys as exactKeys } from './native-input-error.js';
 import {
+  NATIVE_BUILDER_CHECK_RESULTS,
+  NATIVE_RUNNER_INPUT_KINDS,
+  NATIVE_VERIFIER_VERDICTS,
+  nativeEnumText,
+} from './native-input-enum.js';
+import {
   assertNativeBuilderAcceptanceComplete,
   parseNativeBuilderAcceptanceReview,
   type NativeBuilderAcceptanceReview,
@@ -67,6 +73,12 @@ import {
 import { withNativeMutationLock } from './native-mutation-lock.js';
 import { inspectNativeSupervisorOverlay } from './native-supervisor-overlay.js';
 import { createNativeRunnerChannel, NATIVE_SKILL_COORDINATION } from './native-runner-protocol.js';
+import {
+  activeNativeVerifierAction,
+  isDuplicateNativeVerifierResponse,
+  nativeVerifierActionExecutionRef,
+  nativeVerifierActionInput,
+} from './native-verifier-action.js';
 import type {
   NativeBuilderHandoff,
   NativeLocalExecutionState,
@@ -238,15 +250,17 @@ function builderChecks(value: unknown): RunnerBuilderInput['checks'] {
       `Native Builder check ${index}`,
       `/checks/${index}`,
     );
-    if (!['passed', 'failed', 'not-run'].includes(String(input.result))) {
-      throw new Error(`Native Builder check ${index} result is invalid`);
-    }
+    const result = nativeEnumText(
+      input.result,
+      NATIVE_BUILDER_CHECK_RESULTS,
+      `Native Builder check ${index} result`,
+    );
     if (input.note !== null && typeof input.note !== 'string') {
       throw new Error(`Native Builder check ${index} note is invalid`);
     }
     return {
       name: text(input.name, `Native Builder check ${index} name`),
-      result: input.result as RunnerBuilderInput['checks'][number]['result'],
+      result,
       note: input.note as string | null,
     };
   });
@@ -504,14 +518,16 @@ export function parseNativeRunnerInput(value: unknown): NativeRunnerInput {
       ['kind', 'child', 'runId', 'verdict', 'evidence'],
       'Native Supervisor Verifier input',
     );
-    if (!['pass', 'fail', 'blocked'].includes(String(input.verdict))) {
-      throw new Error('Native Supervisor Verifier verdict is invalid');
-    }
+    const verdict = nativeEnumText(
+      input.verdict,
+      NATIVE_VERIFIER_VERDICTS,
+      'Native Supervisor Verifier verdict',
+    );
     return {
       kind: 'supervisor-verifier-result',
       child: text(input.child, 'Native Supervisor child'),
       runId: text(input.runId, 'Native Supervisor runId'),
-      verdict: input.verdict as RunnerSupervisorVerifierInput['verdict'],
+      verdict,
       evidence: supervisorEvidence(input.evidence),
     };
   }
@@ -563,7 +579,9 @@ export function parseNativeRunnerInput(value: unknown): NativeRunnerInput {
         : { retry_check_ids: strings(input.retry_check_ids, 'Native Supervisor retry IDs') }),
     };
   }
-  throw new Error('Native Runner input kind is invalid');
+  throw new Error(
+    `Native Runner input kind must be one of: ${NATIVE_RUNNER_INPUT_KINDS.join(', ')}`,
+  );
 }
 
 export async function readNativeRunnerInput(
@@ -677,6 +695,25 @@ async function currentVerifierExecution(options: {
   const local = await readNativeLocalExecution(
     nativeLocalExecutionFile(options.paths, options.state.name),
   );
+  if (
+    local?.execution?.stage === 'checking' &&
+    local.execution.status === 'running' &&
+    local.basedOnStateVersion === options.state.state_version
+  ) {
+    throw new Error('Native Runner input must wait for the active Runtime checks');
+  }
+  const action = activeNativeVerifierAction(options.state);
+  const executionRef = action ? nativeVerifierActionExecutionRef(action) : null;
+  if (action && executionRef)
+    return {
+      operationId: action.id,
+      stage: 'verifying',
+      actor: 'verifier',
+      executionId: executionRef,
+      status: 'running',
+      startedAt: nativeVerifierActionInput(action).registeredAt,
+      requestCheckRounds: 0,
+    };
   const execution = local?.execution;
   if (
     local === null ||
@@ -703,6 +740,18 @@ export async function validateNativeRunnerInputBoundary(options: {
   input: NativeRunnerInput;
   projectRoot: string;
 }): Promise<void> {
+  if (
+    options.input.kind === 'verifier-response' &&
+    isDuplicateNativeVerifierResponse({
+      state: options.state,
+      candidateId: options.input.candidateId,
+      executionRef: options.input.verifierExecutionRef,
+      response: options.input.response,
+    })
+  ) {
+    assertSkillCoordinatedCandidate(options.state);
+    return;
+  }
   const overlay = await inspectNativeSupervisorOverlay({
     paths: options.paths,
     state: options.state,
@@ -1112,6 +1161,11 @@ async function currentSkillVerifierExecutionRef(options: {
   state: NativePortableState;
 }): Promise<string> {
   assertSkillCoordinatedCandidate(options.state);
+  const action = activeNativeVerifierAction(options.state);
+  if (action) {
+    const ref = nativeVerifierActionExecutionRef(action);
+    if (ref) return ref;
+  }
   const local = await readNativeLocalExecution(
     nativeLocalExecutionFile(options.paths, options.state.name),
   );
@@ -1146,6 +1200,24 @@ export async function applyNativeRunnerInput(options: {
     });
   }
   const portableBeforeInput = await readNativePortableChange(options.paths, options.name);
+  if (
+    input.kind === 'verifier-response' &&
+    isDuplicateNativeVerifierResponse({
+      state: portableBeforeInput,
+      candidateId: input.candidateId,
+      executionRef: input.verifierExecutionRef,
+      response: input.response,
+    })
+  ) {
+    assertSkillCoordinatedCandidate(portableBeforeInput);
+    return {
+      state: portableBeforeInput,
+      checks: portableBeforeInput.verification?.checks ?? [],
+      requestChecks: null,
+      verifierDispatch: null,
+      continuation: nativePortableContinuation(portableBeforeInput),
+    };
+  }
   const supervisorOverlay = await inspectNativeSupervisorOverlay({
     paths: options.paths,
     state: portableBeforeInput,

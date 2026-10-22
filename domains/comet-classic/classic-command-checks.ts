@@ -1,17 +1,29 @@
 import path from 'path';
 import { createHash, randomUUID } from 'node:crypto';
 import { promises as fs } from 'node:fs';
-import { appendTrajectory } from '../engine/run-store.js';
+import { appendTrajectory } from './classic-run-store.js';
+import type { RuntimeAction } from '../engine/runtime-action.js';
 import type { RunState, TrajectoryEvent } from '../engine/types.js';
 import { terminateProcessTree } from '../../platform/process/terminate-process-tree.js';
 import { spawnCommand } from '../../platform/process/spawn-command.js';
+import { reportCometRuntimeProgress } from '../../platform/process/runtime-metrics.js';
 import {
   checkEnvironmentFingerprint,
   collectCheckSnapshot,
   legacyCheckInputFingerprint,
 } from './classic-check-snapshot.js';
-import { readClassicProjectFile, writeClassicProjectText } from './classic-protected-path.js';
+import {
+  inspectClassicProjectTarget,
+  readClassicProjectFile,
+  writeClassicProjectText,
+} from './classic-protected-path.js';
 import { readClassicState, withClassicStateLock } from './classic-store.js';
+import {
+  completeClassicCheckAction,
+  completedClassicCheckAction,
+  runningClassicCheckAction,
+  startClassicCheckAction,
+} from './classic-check-action.js';
 import { readCheckIndex } from './classic-check-index.js';
 import { readCheckPolicy } from './classic-check-policy.js';
 import {
@@ -60,6 +72,7 @@ export interface RecordedCommandCheck {
   reusable?: boolean;
   reused?: boolean;
   checkEpoch?: number;
+  action?: RuntimeAction;
 }
 
 /**
@@ -77,6 +90,7 @@ export interface RecordedCommandCheckAttempt {
   timeoutMs: number;
   reusable: boolean;
   tier: 'full' | 'incremental';
+  action?: RuntimeAction;
 }
 
 export interface RecordCommandCheckInput {
@@ -123,6 +137,24 @@ function validRecord(projectRoot: string, event: TrajectoryEvent): RecordedComma
   } catch {
     return null;
   }
+  const action =
+    (data as Record<string, unknown>).action === undefined
+      ? undefined
+      : completedClassicCheckAction((data as Record<string, unknown>).action, {
+          runId: event.runId,
+          scope,
+          argv: (data as RecordedCommandCheck).argv,
+          cwd: normalized,
+          timeoutMs: (data as RecordedCommandCheck).timeoutMs,
+          tier: (data as RecordedCommandCheck).tier,
+          checkEpoch: (data as RecordedCommandCheck).checkEpoch,
+          exitCode: exitCode as number,
+          inputBefore: (data as RecordedCommandCheck).inputBefore,
+          inputAfter: (data as RecordedCommandCheck).inputAfter,
+          logHash: (data as RecordedCommandCheck).logHash,
+          manifestHash: (data as RecordedCommandCheck).manifestHash,
+        });
+  if ((data as Record<string, unknown>).action !== undefined && !action) return null;
   return {
     sequence: event.sequence,
     timestamp: event.timestamp,
@@ -170,6 +202,7 @@ function validRecord(projectRoot: string, event: TrajectoryEvent): RecordedComma
           tier: (data as RecordedCommandCheck).tier === 'incremental' ? 'incremental' : undefined,
           reusable: (data as RecordedCommandCheck).reusable,
           checkEpoch: (data as RecordedCommandCheck).checkEpoch,
+          ...(action ? { action } : {}),
         }
       : {}),
   };
@@ -234,9 +267,57 @@ export async function latestCommandCheck(
     if (event.type === 'command_check_started' && event.data?.scope === scope) return null;
     if (event.type === 'command_check_consumed' && event.data?.scope === scope) return null;
     const record = validRecord(projectRoot, event);
-    if (record?.scope === scope) return record;
+    if (record?.scope === scope) {
+      if (record.action && !hasMatchingCheckStart(projectRoot, trajectory, index, record))
+        return null;
+      if (path.basename(path.dirname(changeDir)) === 'archive') {
+        const name = path.basename(changeDir).replace(/^\d{4}-\d{2}-\d{2}-/u, '');
+        const archivedRef = path.relative(projectRoot, changeDir).replaceAll('\\', '/');
+        const relocate = (ref: string | undefined) => {
+          if (!ref) return ref;
+          const match = /^(?:docs\/)?openspec\/changes\/([^/]+)\/\.comet\/(checks\/.*)$/u.exec(ref);
+          return match?.[1] === name ? `${archivedRef}/.comet/${match[2]}` : ref;
+        };
+        return {
+          ...record,
+          logRef: relocate(record.logRef),
+          manifestRef: relocate(record.manifestRef),
+        };
+      }
+      return record;
+    }
+    if (
+      event.type === 'command_check_executed' &&
+      event.data?.scope === scope &&
+      event.data.action !== undefined
+    )
+      return null;
   }
   return null;
+}
+
+function hasMatchingCheckStart(
+  projectRoot: string,
+  events: readonly TrajectoryEvent[],
+  completedIndex: number,
+  record: RecordedCommandCheck,
+): boolean {
+  for (let index = completedIndex - 1; index >= 0; index -= 1) {
+    const event = events[index];
+    if (event.runId !== record.runId || event.data?.scope !== record.scope) continue;
+    if (event.type !== 'command_check_started') return false;
+    const started = validStartedAttempt(projectRoot, event);
+    const startedAction = started?.action;
+    const completedAction = record.action;
+    return (
+      !!startedAction &&
+      !!completedAction &&
+      startedAction.id === completedAction.id &&
+      startedAction.inputHash === completedAction.inputHash &&
+      startedAction.attempt === completedAction.attempt
+    );
+  }
+  return false;
 }
 
 function validStartedAttempt(
@@ -266,6 +347,19 @@ function validStartedAttempt(
   } catch {
     return null;
   }
+  const action =
+    (data as Record<string, unknown>).action === undefined
+      ? undefined
+      : runningClassicCheckAction((data as Record<string, unknown>).action, {
+          runId: event.runId,
+          scope,
+          argv: argv as string[],
+          cwd: normalized,
+          timeoutMs: Number(timeoutMs),
+          tier,
+          checkEpoch: (data as Record<string, unknown>).checkEpoch,
+        });
+  if ((data as Record<string, unknown>).action !== undefined && !action) return null;
   return {
     sequence: event.sequence,
     timestamp: event.timestamp,
@@ -276,6 +370,7 @@ function validStartedAttempt(
     timeoutMs: Number(timeoutMs),
     reusable,
     tier,
+    ...(action ? { action } : {}),
   };
 }
 
@@ -477,20 +572,62 @@ export async function executeCommandCheck(
           runId: _runId,
           scope: _scope,
           reused: _reused,
+          action: _sourceAction,
           ...evidence
         } = other;
-        void [_sequence, _timestamp, _runId, _scope, _reused];
-        const checkEpoch =
-          (await readClassicState(changeDir, { migrate: false })).classic?.checkEpoch ?? 0;
-        const event = await checkEvent(changeDir, run, 'command_check_executed', {
-          ...evidence,
-          scope: input.scope,
-          checkEpoch,
+        void [_sequence, _timestamp, _runId, _scope, _reused, _sourceAction];
+        const { event, checkEpoch, action } = await withClassicStateLock(changeDir, async () => {
+          const projection = await readClassicState(changeDir, { migrate: false });
+          if (
+            (projection.run || projection.classic) &&
+            (projection.run?.runId !== run.runId ||
+              projection.run?.iteration !== run.iteration ||
+              !projection.classic)
+          )
+            throw new Error('Classic check Run changed before reuse; reload the current state');
+          const checkEpoch = projection.classic?.checkEpoch ?? 0;
+          const startedAction = startClassicCheckAction({
+            run,
+            id: randomUUID(),
+            scope: input.scope,
+            argv: [...input.argv],
+            cwd,
+            timeoutMs: other.timeoutMs ?? 300_000,
+            tier,
+            checkEpoch,
+          });
+          await checkEvent(changeDir, run, 'command_check_started', {
+            scope: input.scope,
+            argv: [...input.argv],
+            cwd,
+            timeoutMs: other.timeoutMs ?? 300_000,
+            reusable: true,
+            tier,
+            checkEpoch,
+            action: startedAction,
+          });
+          const action = completeClassicCheckAction(startedAction, {
+            exitCode: other.exitCode,
+            inputBefore: other.inputBefore!,
+            inputAfter: other.inputAfter!,
+            logHash: other.logHash!,
+            manifestHash: other.manifestHash ?? null,
+          });
+          const event = await checkEvent(changeDir, run, 'command_check_executed', {
+            ...evidence,
+            scope: input.scope,
+            checkEpoch,
+            timeoutMs: other.timeoutMs ?? 300_000,
+            action,
+          });
+          return { event, checkEpoch, action };
         });
         return {
           ...evidence,
           scope: input.scope,
           checkEpoch,
+          timeoutMs: other.timeoutMs ?? 300_000,
+          action,
           sequence: event.sequence,
           timestamp: event.timestamp,
           runId: run.runId,
@@ -501,16 +638,38 @@ export async function executeCommandCheck(
   }
   // A failed launch, snapshot, or log write must not expose an older success.
   const timeoutMs = input.timeoutMs ?? 300_000;
-  const started = await checkEvent(changeDir, run, 'command_check_started', {
-    scope: input.scope,
-    argv: [...input.argv],
-    cwd,
-    timeoutMs,
-    reusable: input.reusable === true,
-    tier,
+  const { started, checkEpoch, action } = await withClassicStateLock(changeDir, async () => {
+    const projection = await readClassicState(changeDir, { migrate: false });
+    if (
+      (projection.run || projection.classic) &&
+      (projection.run?.runId !== run.runId ||
+        projection.run?.iteration !== run.iteration ||
+        !projection.classic)
+    )
+      throw new Error('Classic check Run changed before launch; reload the current state');
+    const checkEpoch = projection.classic?.checkEpoch ?? 0;
+    const action = startClassicCheckAction({
+      run,
+      id: randomUUID(),
+      scope: input.scope,
+      argv: [...input.argv],
+      cwd,
+      timeoutMs,
+      tier,
+      checkEpoch,
+    });
+    const started = await checkEvent(changeDir, run, 'command_check_started', {
+      scope: input.scope,
+      argv: [...input.argv],
+      cwd,
+      timeoutMs,
+      reusable: input.reusable === true,
+      tier,
+      checkEpoch,
+      action,
+    });
+    return { started, checkEpoch, action };
   });
-  const checkEpoch =
-    (await readClassicState(changeDir, { migrate: false })).classic?.checkEpoch ?? 0;
   const identity = { argv: input.argv, cwd };
   // The previous execution's manifest lets unchanged files skip rereading, so a
   // rerun only reads what actually changed since the last recorded check.
@@ -532,6 +691,7 @@ export async function executeCommandCheck(
   const logPath = path.join(changeDir, '.comet', 'checks', `${randomUUID()}.log`);
   // The platform adapter preserves argv and rejects unsafe Windows batch arguments.
   const result = await new Promise<{ exitCode: number; output: string }>((resolve) => {
+    reportCometRuntimeProgress(`执行 ${input.scope} 检查：${input.argv[0]}`);
     const child = spawnCommand(input.argv[0], input.argv.slice(1), {
       cwd: path.resolve(root, cwd),
     });
@@ -594,7 +754,11 @@ export async function executeCommandCheck(
   )
     inputAfter = 'environment-changed';
   await writeClassicProjectText(root, logPath, result.output, { label: 'Classic check log' });
-  const logStat = await fs.stat(logPath, { bigint: true }).catch(() => null);
+  const logTarget = await inspectClassicProjectTarget(root, logPath, {
+    label: 'Classic check log',
+    expected: 'file',
+  });
+  const logStat = await fs.lstat(logTarget.target, { bigint: true }).catch(() => null);
   const data = {
     scope: input.scope,
     command: JSON.stringify(input.argv),
@@ -627,9 +791,22 @@ export async function executeCommandCheck(
           event.data?.scope === input.scope),
     );
     if (newer) throw new Error('Check superseded by a newer check or invalidation; rerun required');
-    return checkEvent(changeDir, run, 'command_check_executed', data);
+    const completed = completeClassicCheckAction(action, {
+      exitCode: result.exitCode,
+      inputBefore,
+      inputAfter,
+      logHash: data.logHash,
+      manifestHash: manifestHash ?? null,
+    });
+    return checkEvent(changeDir, run, 'command_check_executed', { ...data, action: completed });
   });
-  return { ...data, sequence: event.sequence, timestamp: event.timestamp, runId: run.runId };
+  return {
+    ...data,
+    action: event.data.action as RuntimeAction,
+    sequence: event.sequence,
+    timestamp: event.timestamp,
+    runId: run.runId,
+  };
 }
 
 async function recordManifestEntries(
@@ -766,9 +943,11 @@ export async function evaluateCommandCheck(
     // An unchanged size+mtime proves the log was not rewritten since the
     // check wrote it, so rereading (up to 8 MB per scope) is skipped. Records
     // without the stat, or a changed stat, keep the full content-hash check.
-    const logStat = await fs
-      .stat(path.resolve(root, record.logRef), { bigint: true })
-      .catch(() => null);
+    const logTarget = await inspectClassicProjectTarget(root, record.logRef, {
+      label: 'Classic check log',
+      expected: 'file',
+    });
+    const logStat = await fs.lstat(logTarget.target, { bigint: true }).catch(() => null);
     const statMatches =
       typeof record.logSize === 'number' &&
       typeof record.logMtimeNs === 'string' &&

@@ -1,3 +1,4 @@
+import { readNodeHookArguments } from '../../platform/process/hook-command.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { execFileSync } from 'child_process';
 import { mkdirSync, readFileSync, writeFileSync } from 'fs';
@@ -56,9 +57,11 @@ async function readManifest() {
 function isNativeInstallSkillPath(skillPath: string): boolean {
   return (
     skillPath === 'comet/SKILL.md' ||
+    skillPath.startsWith('comet/reference/') ||
     skillPath.startsWith('comet-review/') ||
     skillPath === 'comet/scripts/comet-entry-runtime.mjs' ||
     skillPath === 'comet/scripts/comet-hook-router.mjs' ||
+    skillPath === 'comet/scripts/comet-hook-router-guard.mjs' ||
     skillPath.startsWith('comet-native/') ||
     skillPath.startsWith('comet-any/') ||
     skillPath.startsWith('comet-memory/')
@@ -174,6 +177,91 @@ describe('comet init E2E', () => {
   afterEach(async () => {
     vi.restoreAllMocks();
     await fs.rm(tmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  });
+
+  it.each(['native', 'classic'] as const)(
+    'installs Prime Agent %s in both scopes without unsupported host configuration',
+    async (workflow) => {
+      mockExternalSuccess();
+      const { initCommand } = await import('../../app/commands/init.js');
+      for (const scope of ['project', 'global'] as const) {
+        const result = await captureJsonOutput(() =>
+          initCommand(tmpDir, {
+            yes: true,
+            json: true,
+            scope,
+            workflow,
+            platform: 'prime-agent',
+            language: 'zh',
+          }),
+        );
+        expect(result.status).toBe('complete');
+        expect(result.selectedPlatforms).toEqual(['prime-agent']);
+        const root = scope === 'project' ? tmpDir : os.homedir();
+        await expect(
+          fs.access(path.join(root, '.prime/agent/skills/comet/SKILL.md')),
+        ).resolves.toBeUndefined();
+        if (workflow === 'classic')
+          await expect(
+            fs.access(path.join(root, '.prime/agent/skills/openspec-propose/SKILL.md')),
+          ).resolves.toBeUndefined();
+        for (const unwanted of [
+          '.prime-agent',
+          '.claude',
+          '.prime/agent/rules',
+          '.prime/agent/settings.local.json',
+        ]) {
+          await expect(fs.access(path.join(root, unwanted))).rejects.toMatchObject({
+            code: 'ENOENT',
+          });
+        }
+      }
+    },
+    INIT_E2E_TIMEOUT_MS,
+  );
+
+  it(
+    'preserves Chinese configuration and instructions when adding Prime Agent without a language option',
+    async () => {
+      mockExternalSuccess();
+      const { initCommand } = await import('../../app/commands/init.js');
+      await captureJsonOutput(() =>
+        initCommand(tmpDir, {
+          yes: true,
+          json: true,
+          scope: 'project',
+          platform: 'codex',
+          workflow: 'classic',
+          language: 'zh',
+        }),
+      );
+      const instructions = await fs.readFile(path.join(tmpDir, 'AGENTS.md'), 'utf8');
+      const result = await captureJsonOutput(() =>
+        initCommand(tmpDir, { yes: true, json: true, scope: 'project', platform: 'prime-agent' }),
+      );
+      expect(result.language).toBe('zh');
+      expect(
+        parse(await fs.readFile(path.join(tmpDir, '.comet/config.yaml'), 'utf8')).classic.language,
+      ).toBe('zh-CN');
+      expect(await fs.readFile(path.join(tmpDir, 'AGENTS.md'), 'utf8')).toBe(instructions);
+    },
+    INIT_E2E_TIMEOUT_MS,
+  );
+
+  it('rejects an unknown init platform before touching configuration or instructions', async () => {
+    mockExternalSuccess();
+    await fs.writeFile(path.join(tmpDir, 'AGENTS.md'), 'Keep my instructions.\n');
+    const { initCommand } = await import('../../app/commands/init.js');
+    await expect(
+      initCommand(tmpDir, { yes: true, json: true, platform: 'prime-agnet' }),
+    ).rejects.toThrow('Unknown platform');
+    expect(await fs.readFile(path.join(tmpDir, 'AGENTS.md'), 'utf8')).toBe(
+      'Keep my instructions.\n',
+    );
+    await expect(fs.access(path.join(tmpDir, '.comet'))).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(fs.access(path.join(tmpDir, '.prime-agnet'))).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
   });
 
   it('offers Native, Classic, and Both with fixed detail rows', async () => {
@@ -779,7 +867,7 @@ describe('comet init E2E', () => {
     });
   });
 
-  it('removes the working directories created by a fresh Native init', async () => {
+  it('removes fresh Native config and artifacts while preserving its Runtime write fence', async () => {
     mockExternalSuccess();
     await fs.mkdir(path.join(tmpDir, '.claude'), { recursive: true });
     const { initCommand } = await import('../../app/commands/init.js');
@@ -794,8 +882,23 @@ describe('comet init E2E', () => {
       }),
     );
     expect(result.status).toBe('complete');
-    await expect(removeWorkingDirs(tmpDir)).resolves.toEqual({ removed: 1, failed: 0 });
-    await expect(fs.stat(path.join(tmpDir, '.comet'))).rejects.toMatchObject({ code: 'ENOENT' });
+    const runtimeFence = path.join(tmpDir, '.comet/runtime');
+    const fence = await fs.readFile(runtimeFence, 'utf8');
+    await expect(removeWorkingDirs(tmpDir)).resolves.toEqual({
+      removed: 1,
+      failed: 0,
+      preserved: [runtimeFence],
+    });
+    await expect(fs.stat(path.join(tmpDir, '.comet/config.yaml'))).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
+    await expect(fs.stat(path.join(tmpDir, 'docs/comet'))).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
+    await expect(fs.readFile(runtimeFence, 'utf8')).resolves.toBe(fence);
+    await expect(
+      fs.mkdir(path.join(runtimeFence, 'native'), { recursive: true }),
+    ).rejects.toThrow();
   });
 
   it('preserves global workflows and policy settings when init does not explicitly replace them', async () => {
@@ -1548,6 +1651,35 @@ describe('comet init E2E', () => {
     await expect(fs.access(path.join(tmpDir, 'comet'))).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
+  it.each(['missing', 'changed'] as const)(
+    'does not activate Native while skipping a %s Router Guard',
+    async (kind) => {
+      mockExternalSuccess();
+      await fs.mkdir(path.join(tmpDir, '.claude'));
+      const { initCommand } = await import('../../app/commands/init.js');
+      await captureJsonOutput(() =>
+        initCommand(tmpDir, { yes: true, json: true, scope: 'project', workflow: 'native' }),
+      );
+      const guard = path.join(tmpDir, '.claude/skills/comet/scripts/comet-hook-router-guard.mjs');
+      if (kind === 'missing') await fs.rm(guard);
+      else await fs.writeFile(guard, '// user-pinned Guard\n');
+      const config = path.join(tmpDir, '.comet/config.yaml');
+      await fs.rm(config);
+      await expect(
+        initCommand(tmpDir, {
+          yes: true,
+          json: true,
+          scope: 'project',
+          workflow: 'native',
+          skipExisting: true,
+        }),
+      ).rejects.toThrow(/comet-hook-router-guard[.]mjs/u);
+      await expect(fs.access(config)).rejects.toMatchObject({ code: 'ENOENT' });
+      if (kind === 'changed')
+        await expect(fs.readFile(guard, 'utf8')).resolves.toBe('// user-pinned Guard\n');
+    },
+  );
+
   it('does not activate Native over a mismatched existing /comet entry without overwrite', async () => {
     mockExternalSuccess();
     const existingSkill = path.join(tmpDir, '.claude', 'skills', 'comet', 'SKILL.md');
@@ -1658,6 +1790,7 @@ describe('comet init E2E', () => {
         yes: true,
         json: true,
         platform: 'test',
+        customPlatform: true,
       }),
     );
 
@@ -1678,7 +1811,9 @@ describe('comet init E2E', () => {
     const settings = JSON.parse(
       await fs.readFile(path.join(tmpDir, '.test', 'settings.local.json'), 'utf8'),
     ) as { hooks: { PreToolUse: Array<{ hooks: Array<{ command: string }> }> } };
-    expect(JSON.stringify(settings.hooks)).toContain('comet-hook-router.mjs');
+    expect(readNodeHookArguments(settings.hooks.PreToolUse[0].hooks[0].command)?.[0]).toContain(
+      'comet-hook-router.mjs',
+    );
   });
 
   it('applies workflow selection to an explicit custom platform target', async () => {
@@ -1691,6 +1826,7 @@ describe('comet init E2E', () => {
         yes: true,
         json: true,
         platform: 'test',
+        customPlatform: true,
         workflow: 'native',
       }),
     );
@@ -1720,6 +1856,7 @@ describe('comet init E2E', () => {
         json: true,
         scope: 'global',
         platform: 'test',
+        customPlatform: true,
       }),
     ).rejects.toThrow('custom --platform targets are only supported with project scope');
   });
@@ -2169,7 +2306,7 @@ describe('comet init E2E', () => {
         await fs.readFile(path.join(tmpDir, '.codex', 'hooks.json'), 'utf8'),
       );
       const hookCommand = hooks.hooks.PreToolUse[0].hooks[0].command as string;
-      expect(hookCommand.replaceAll('\\', '/')).toContain(
+      expect(readNodeHookArguments(hookCommand)![0].replaceAll('\\', '/')).toContain(
         '/.agents/skills/comet/scripts/comet-hook-router.mjs',
       );
       await expect(
@@ -2577,7 +2714,11 @@ describe('comet init E2E', () => {
     const globalHooks = JSON.parse(await fs.readFile(globalHooksPath, 'utf8'));
     expect(globalHooks.hooks.PreToolUse[0].hooks).toEqual([userHook]);
     const projectHooks = await fs.readFile(path.join(tmpDir, '.codex', 'hooks.json'), 'utf8');
-    expect(projectHooks.replaceAll('\\', '/')).toContain(
+    expect(
+      readNodeHookArguments(
+        JSON.parse(projectHooks).hooks.PreToolUse[0].hooks[0].command,
+      )![0].replaceAll('\\', '/'),
+    ).toContain(
       `${tmpDir.replaceAll('\\', '/')}/.agents/skills/comet/scripts/comet-hook-router.mjs`,
     );
   });

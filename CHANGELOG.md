@@ -2,6 +2,42 @@
 
 All notable changes to @rpamis/comet will be documented in this file.
 
+## What's Changed [0.5.0] - 2026-10-23
+
+Comet v0.5.0 is now available. This release focuses on the following capabilities.
+
+### Added
+
+- **Comet Any**: Combine any Skills and dynamically generate workflow Skills with accompanying Hooks, Rules, state machines, and Guards to suit different user preferences. Add stages to Native and Classic or create independent workflows. Hooks are enabled on supported platforms. Generated workflows support evaluation, export, installation, and upgrades.
+- **Comet Dashboard**: Visualize the Comet Any creation process and view stages, branches, parallel execution, child workflows, and execution records for its custom workflows, just as you do for Native and Classic. Use Comet Eval to visually evaluate any Skill or complete workflow, inspect cases, logs, reports, and baselines, and rerun failed cases.
+- **Comet SDK**: Reuse the underlying capabilities that support reliable Native and Classic execution through the SDK. It exposes 14 general-purpose capabilities for custom workflows, including Skill and tool execution, parallel branches and joins, child workflows, user approvals, and persistence. See the [SDK guide](docs/architecture/sdk-getting-started.md).
+- **Observability**: Visually inspect key data on Runtime performance, change execution traces, Personal Memory, and Project Knowledge. View command durations, execution results, and retrieval and usage feedback, and trace the original records over a selected time range.
+- **More platform support**: Initialize Prime Agent and install, update, and manage Native and Classic Skills in project and user directories.
+
+### Changed
+
+- **Dashboard terminology**: Clarify Chinese labels for Agent review, workflow execution, and verification evidence, distinguishing the Agent, its platform, and the executor.
+- **Comet Skill**: Upgrade the Native and Classic Runtimes to execute new tasks using shared SDK capabilities while retaining their respective phases, user confirmations, independent verification, and archive requirements. Resume interrupted tasks from persisted state. Complete and archive active tasks using 0.4.5 before upgrading.
+- **Runtime directory**: Local Runtime data moves to `~/.comet/workspaces/<workspace-id>/runtime/`, isolated by checkout and Git worktree, reducing the impact of execution records on the current project directory. Formal documents, state files that support cross-device recovery, and project configuration remain in the project.
+- **Classic state filename**: New Classic tasks use `<change>/comet-state.yaml` instead of `<change>/.comet.yaml`, matching Native's filename. Existing `.comet.yaml` files remain supported and are not automatically renamed.
+- **Task status queries**: `comet status` and `comet status --json` no longer list fully cancelled or archived built-in Native tasks by default. Use `--include-history` to view history. Scripts that rely on historical records must add this flag.
+
+### Fixed
+
+- **Native Shape validation**: Fix false requirement-change reports during Doctor or Archive caused by automatic links in briefs and Specs. Changes to actual content, structure, or link destinations still require renewed confirmation ([#494](https://github.com/rpamis/comet/issues/494)).
+- **Native Supervisor recovery**: After a legacy compatibility task loses its session, confirm that the original execution and its child tasks have stopped before redispatching, preventing concurrent changes to the same workspace.
+- **Memory and knowledge retrieval**: Preserve applicable preferences, precise project matches, source freshness, and valid results when index updates or remote retrieval are delayed or unavailable. Load large histories in batches to avoid long waits on record management pages.
+- **Project initialization and workspaces**: Show the initialization hint after installation, respect the selected language, distinguish missing CodeGraph configuration from an unavailable service, and retain the correct workspace when continuing a Classic change or before the first Git commit.
+- **Classic project discovery**: Report corrupted project configuration or unsafe paths instead of falling back to a parent project, and distinguish user-level configuration from project configuration.
+- **Skill evaluation reliability**: Preserve complete task input, stop timed-out execution and its owned containers, and save generated cases, partial results, and failure details for diagnosis and retry.
+- **Website language**: Open the embedded Dashboard in the homepage language while preserving the user's saved language preference. Use English examples, interaction hints, and accessibility descriptions on the English homepage while retaining Chinese examples and original project content.
+
+### Security
+
+- **Development server security**: Upgrade Vite to 8.2.4 to fix editor-launch command injection and path validation vulnerabilities on Windows and WSL.
+- **Hook command arguments**: Preserve special characters in project paths to prevent shell expansion, and retain the user's other Hook commands during updates.
+- **Eval artifact collection**: Collect only regular files within the evaluation workspace, skipping symbolic links and Windows reparse points. Report an environment error when files cannot be read safely, and do not score incomplete artifacts.
+
 ## What's Changed [0.4.5] - 2026-10-10
 
 ### Added

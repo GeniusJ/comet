@@ -1,3 +1,4 @@
+import { readClassicProjectFile } from '../../../domains/comet-classic/classic-protected-path.js';
 import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -20,7 +21,7 @@ describe('Classic compact recovery and task reconciliation', () => {
   beforeEach(async () => {
     root = await fs.mkdtemp(path.join(os.tmpdir(), 'classic-recovery-contract-'));
     await prepareClassicLegacyProject(root);
-    expect((await cli('state', 'init', 'demo', 'hotfix')).exitCode).toBe(0);
+    expect((await cli('state', 'init', 'demo', 'hotfix', '--runtime', 'compat')).exitCode).toBe(0);
     change = path.join(root, 'openspec/changes/demo');
     await fs.writeFile(path.join(change, 'tasks.md'), tasks);
     await fs.writeFile(path.join(change, 'proposal.md'), 'Repair implementation\n');
@@ -47,6 +48,15 @@ describe('Classic compact recovery and task reconciliation', () => {
     expect(data.nextAction).toMatchObject({ kind: 'reconcile-task', taskId: 'a' });
     expect(data.taskState).toMatchObject({ total: 1, completed: 0, next: { id: 'a' } });
     expect(data.taskState.tasks).toBeUndefined();
+    expect(data.continuation.contextRequest).toMatchObject({
+      phase: 'build',
+      contextMode: 'snapshot',
+    });
+    expect(data.continuation.contextRequest.commandArgs).toContain(root);
+    expect(data.continuation.contextRequest.commandArgs).toContain('<receiving-session-id>');
+    expect(JSON.parse(result.stdout!).agent.continuation.contextRequest).toEqual(
+      data.continuation.contextRequest,
+    );
   });
 
   it.each(['drift', 'unbound-detached'] as const)(
@@ -209,9 +219,11 @@ describe('Classic compact recovery and task reconciliation', () => {
     });
     expect(data.coordination.checkpoint).toBeUndefined();
     expect(data.checkpoint.content).toBeUndefined();
-    expect(await fs.readFile(path.join(change, '.comet/subagent-progress.md'), 'utf8')).toContain(
-      'task-review',
-    );
+    expect(
+      await readClassicProjectFile(root, path.join(change, '.comet/subagent-progress.md'), {
+        label: 'Recovery checkpoint',
+      }),
+    ).toContain('task-review');
     const changed = tasks.replace('existing implementation', 'new requirements');
     await fs.writeFile(path.join(change, 'tasks.md'), changed);
     const stale = JSON.parse(
@@ -303,9 +315,20 @@ describe('Classic compact recovery and task reconciliation', () => {
     git('add', '--', '.');
     git('commit', '-m', 'chore: archive demo');
     const commit = git('rev-parse', 'HEAD');
-    expect((await cli('state', 'init', 'other', 'hotfix', '--isolation', 'current')).exitCode).toBe(
-      0,
-    );
+    expect(
+      (
+        await cli(
+          'state',
+          'init',
+          'other',
+          'hotfix',
+          '--isolation',
+          'current',
+          '--runtime',
+          'compat',
+        )
+      ).exitCode,
+    ).toBe(0);
     expect((await cli('state', 'select', 'other')).exitCode).toBe(0);
     await fs.writeFile(
       inputPath,

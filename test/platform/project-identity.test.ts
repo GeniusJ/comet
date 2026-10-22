@@ -1,9 +1,14 @@
+import { promises as fs } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { execFileSync } from 'node:child_process';
 import { describe, expect, it, vi } from 'vitest';
 
 import {
   resolveProjectName,
   resolveProjectIdentity,
   resolveStableProjectId,
+  resolveStableProjectIdAsync,
   stableProjectId,
   withProjectIdentityScope,
 } from '../../platform/paths/project-identity.js';
@@ -92,5 +97,53 @@ describe('project identity', () => {
     expect(stableProjectId('https://example.com/team/My.Comet.git')).toMatch(
       /^my\.comet-[a-f0-9]{8}$/u,
     );
+  });
+
+  it('handles long runs of boundary separators in names and paths', () => {
+    const dashes = '-'.repeat(50_000);
+    const slashes = '/'.repeat(50_000);
+    expect(stableProjectId(`https://example.com/team/${dashes}project${dashes}`)).toMatch(
+      /^project-[a-f0-9]{8}$/u,
+    );
+    const runGit = () => `https://example.com/team/project${slashes}`;
+    expect(resolveProjectIdentity('D:/repo', { runGit })).toBe('https://example.com/team/project');
+    expect(resolveProjectName('D:/repo', { runGit })).toBe('project');
+  });
+});
+
+describe('bounded asynchronous project identity', () => {
+  it('matches path, shared Git directory, and changed origin identities', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'comet-identity-async-'));
+    const options = { signal: new AbortController().signal, timeoutMs: 1_000 };
+    try {
+      expect(await resolveStableProjectIdAsync(root, options)).toBe(resolveStableProjectId(root));
+      execFileSync('git', ['init', '-q', root]);
+      expect(await resolveStableProjectIdAsync(root, options)).toBe(resolveStableProjectId(root));
+      execFileSync('git', [
+        '-C',
+        root,
+        'remote',
+        'add',
+        'origin',
+        'https://example.invalid/first.git',
+      ]);
+      const first = await resolveStableProjectIdAsync(root, options);
+      expect(first).toBe(resolveStableProjectId(root));
+      execFileSync('git', [
+        '-C',
+        root,
+        'remote',
+        'set-url',
+        'origin',
+        'https://example.invalid/second.git',
+      ]);
+      expect(await resolveStableProjectIdAsync(root, options)).toBe(resolveStableProjectId(root));
+      expect(await resolveStableProjectIdAsync(root, options)).not.toBe(first);
+      await expect(
+        resolveStableProjectIdAsync(root, { signal: AbortSignal.abort(), timeoutMs: 100 }),
+      ).rejects.toThrow();
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
   });
 });

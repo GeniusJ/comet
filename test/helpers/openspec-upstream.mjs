@@ -42,6 +42,8 @@ try {
         USERPROFILE: home,
         XDG_CONFIG_HOME: path.join(home, '.config'),
         OPENSPEC_TELEMETRY: '0',
+        DO_NOT_TRACK: '1',
+        OPENSPEC_NO_UPDATE_CHECK: '1',
         npm_config_cache: path.join(home, '.npm-cache'),
         npm_config_userconfig: userConfig,
         npm_config_globalconfig: globalConfig,
@@ -57,7 +59,13 @@ try {
       'test/domains/comet-classic/classic-openspec-upstream.test.ts',
     ],
     {
-      env: { ...process.env, COMET_TEST_OPENSPEC_PACKAGE: packageRoot },
+      env: {
+        ...process.env,
+        COMET_TEST_OPENSPEC_PACKAGE: packageRoot,
+        OPENSPEC_TELEMETRY: '0',
+        DO_NOT_TRACK: '1',
+        OPENSPEC_NO_UPDATE_CHECK: '1',
+      },
     },
   );
 } finally {

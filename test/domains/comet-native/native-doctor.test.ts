@@ -1,3 +1,4 @@
+import { isWorkspaceRuntimeMigrationFence } from '../../../domains/workflow-contract/workspace-runtime.js';
 import { promises as fs } from 'fs';
 import { execFileSync } from 'node:child_process';
 import os from 'os';
@@ -279,7 +280,7 @@ Run focused tests.
     );
   });
 
-  it('migrates an explicit legacy change-local Runtime into project-local storage', async () => {
+  it('migrates an explicit legacy change-local Runtime into user-local storage', async () => {
     const state = await createNativeChange({
       paths,
       name: 'legacy-layout',
@@ -300,7 +301,7 @@ Run focused tests.
       expect.objectContaining({ code: 'runtime-layout-migrated', severity: 'info' }),
     );
     await expect(fs.stat(preferred)).resolves.toBeDefined();
-    await expect(fs.access(legacy)).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(await isWorkspaceRuntimeMigrationFence(legacy, preferred)).toBe(true);
   });
 
   it('diagnoses live and stale locks and only removes a proven stale lock', async () => {

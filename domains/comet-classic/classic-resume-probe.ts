@@ -1,3 +1,5 @@
+import { resolveClassicStateFile } from './classic-state-file.js';
+import { resolveWorkspaceRuntimeRoot } from '../workflow-contract/workspace-runtime.js';
 import { measureCometGitCommandAsync } from '../../platform/process/runtime-metrics.js';
 import path from 'node:path';
 
@@ -6,7 +8,19 @@ import { execFile } from 'child_process';
 import { readDir } from '../../platform/fs/file-system.js';
 import type { ClassicDiagnostic } from './classic-diagnostics.js';
 import { readClassicState } from './classic-store.js';
-import type { ClassicStateProjection } from './classic-state.js';
+import { hasClassicManagedRunMarker } from './classic-sdk-state-store.js';
+import { PORTABLE_RUN_CHECKPOINT_KEY, readPortableRunCheckpoint } from '../engine/runtime.js';
+import { parseDocument } from 'yaml';
+import { inspectPristineClassicSdkState } from './classic-runtime-ownership.js';
+import { isClassicSdkCancellationComplete } from './classic-sdk-run-lifecycle.js';
+import {
+  classicStateToDocument,
+  parseClassicStateDocument,
+  type ClassicState,
+  type ClassicStateProjection,
+} from './classic-state.js';
+import { readSdkChangeOwner } from '../workflow-contract/change-runtime-owner.js';
+import { createFileRuntimeStore, type WorkflowRun } from '../engine/runtime.js';
 import { readClassicDelivery } from './classic-progress.js';
 import { inspectClassicActiveChangeDirectory, openSpecChangeNameError } from './classic-paths.js';
 import {
@@ -59,6 +73,7 @@ interface ActiveProbeChange {
   archived: boolean;
   text: string;
   missingCometState: boolean;
+  cancellationPending?: boolean;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -140,14 +155,14 @@ async function changeSearchText(
   return parts.join('\n').toLowerCase();
 }
 
-function nextCommandForPhase(phase: string): string | null {
+function nextCommandForPhase(phase: string, workflow: string): string | null {
   switch (phase) {
     case 'open':
       return '/comet-open';
     case 'design':
       return '/comet-design';
     case 'build':
-      return '/comet-build';
+      return workflow === 'hotfix' || workflow === 'tweak' ? `/comet-${workflow}` : '/comet-build';
     case 'verify':
       return '/comet-verify';
     case 'archive':
@@ -198,7 +213,7 @@ function diagnosticFromProjection(
     workflow: classic.workflow,
     phase: classic.phase,
     currentStep: null,
-    nextCommand: nextCommandForPhase(classic.phase),
+    nextCommand: nextCommandForPhase(classic.phase, classic.workflow),
     runtimeMode: 'engine-projection',
     runtimeEval: null,
     evidence: [],
@@ -220,6 +235,80 @@ async function hasOpenSpecChangeFiles(projectRoot: string, changeDir: string): P
       expected: 'file',
     }))
   );
+}
+
+async function inspectManagedRun(
+  projectRoot: string,
+  name: string,
+  stateFile: string,
+): Promise<{
+  state: ClassicState | null;
+  lostRun: boolean;
+  cancellation?: 'complete' | 'pending';
+}> {
+  const source = await readClassicProjectFile(projectRoot, stateFile, {
+    label: 'Classic change state',
+  });
+  const owner = await readSdkChangeOwner(projectRoot, 'classic', name);
+  if (!hasClassicManagedRunMarker(source) && !owner) return { state: null, lostRun: false };
+  const observe = (run: WorkflowRun, state: ClassicState) => ({
+    state,
+    lostRun: false,
+    ...(run.status === 'cancelled'
+      ? {
+          cancellation: isClassicSdkCancellationComplete(run)
+            ? ('complete' as const)
+            : ('pending' as const),
+        }
+      : {}),
+  });
+  const checkpointState = () => {
+    const document = parseDocument(source, { uniqueKeys: true });
+    if (document.errors.length > 0) return null;
+    const data = document.toJS() as Record<string, unknown>;
+    const checkpoint = readPortableRunCheckpoint(data[PORTABLE_RUN_CHECKPOINT_KEY], name);
+    if (!checkpoint) return null;
+    const state = parseClassicStateDocument(data).classic;
+    return state &&
+      checkpoint.input &&
+      typeof checkpoint.input === 'object' &&
+      !Array.isArray(checkpoint.input) &&
+      checkpoint.input.change === name &&
+      (checkpoint.state as unknown as ClassicState).phase === state.phase
+      ? observe(checkpoint, state)
+      : null;
+  };
+  if (!owner) {
+    const saved = checkpointState();
+    if (saved) return saved;
+    const initial = await inspectPristineClassicSdkState(path.dirname(stateFile), source);
+    return initial ? { state: initial, lostRun: false } : { state: null, lostRun: true };
+  }
+  try {
+    const store = createFileRuntimeStore<WorkflowRun>({
+      rootDir: path.join(await resolveWorkspaceRuntimeRoot(projectRoot), 'sdk-runs', 'classic'),
+    });
+    const run = await store.read(owner.runId);
+    if (!run) {
+      const saved = checkpointState();
+      return saved ?? { state: null, lostRun: true };
+    }
+    if (
+      run.workflow.id !== `comet-${owner.application}` ||
+      !run.input ||
+      typeof run.input !== 'object' ||
+      Array.isArray(run.input) ||
+      run.input.change !== name
+    ) {
+      return { state: null, lostRun: true };
+    }
+    const state = parseClassicStateDocument(
+      classicStateToDocument(run.state as unknown as ClassicState),
+    ).classic;
+    return state ? observe(run, state) : { state: null, lostRun: true };
+  } catch {
+    return { state: null, lostRun: true };
+  }
 }
 
 async function discoverActiveChanges(projectRoot: string): Promise<ActiveProbeChange[]> {
@@ -270,19 +359,34 @@ async function discoverActiveChanges(projectRoot: string): Promise<ActiveProbeCh
       continue;
     }
 
+    const managed = await inspectManagedRun(
+      projectRoot,
+      entry,
+      await resolveClassicStateFile(changeDir),
+    );
+    if (managed.cancellation === 'complete') continue;
     const projection = await readClassicState(changeDir, { migrate: false });
+    if (managed.state) projection.classic = managed.state;
     const classic = projection.classic;
-    const diagnostic = diagnosticFromProjection(changeDir, entry, projection);
+    const baseDiagnostic = diagnosticFromProjection(changeDir, entry, projection);
+    const diagnostic = managed.lostRun
+      ? {
+          ...baseDiagnostic,
+          valid: false,
+          nextCommand: null,
+          error: `Classic change ${entry} has a state file but lost its local Run history`,
+        }
+      : baseDiagnostic;
     const hasClassicProjection = Boolean(classic);
     const phase = classic?.phase ?? diagnostic.phase;
     const workflow = classic?.workflow ?? diagnostic.workflow;
-    if (phase === 'archive' || classic?.archived) continue;
+    if ((phase === 'archive' || classic?.archived) && managed.cancellation !== 'pending') continue;
 
     const change: ActiveProbeChange = {
       name: entry,
       workflow,
       phase,
-      nextCommand: diagnostic.nextCommand,
+      nextCommand: managed.cancellation === 'pending' ? null : diagnostic.nextCommand,
       diagnostic,
       buildPause: classic?.buildPause ?? null,
       hasClassicProjection,
@@ -290,6 +394,7 @@ async function discoverActiveChanges(projectRoot: string): Promise<ActiveProbeCh
       archived: classic?.archived ?? false,
       text: '',
       missingCometState: false,
+      ...(managed.cancellation === 'pending' ? { cancellationPending: true } : {}),
     };
     change.text = await changeSearchText(projectRoot, changeDir, change);
     changes.push(change);
@@ -310,39 +415,65 @@ async function discoverPendingArchivedChanges(projectRoot: string): Promise<Acti
   });
   if (!archiveInspection.exists) return [];
 
+  // 批量并发只重叠每个归档目录的只读 IO 等待；任何目录失败仍按整体失败处理。
+  const entries = (await readDir(layout.archiveDir))
+    .map((entry) => ({ entry, name: archivedChangeName(entry) }))
+    .filter((item): item is { entry: string; name: string } => item.name !== null);
   const changes: ActiveProbeChange[] = [];
-  for (const entry of await readDir(layout.archiveDir)) {
-    const name = archivedChangeName(entry);
-    if (!name) continue;
-    const directory = path.join(layout.archiveDir, entry);
-    const inspection = await inspectClassicProjectTarget(projectRoot, directory, {
-      label: `Classic archived change ${entry}`,
-      expected: 'directory',
-    });
-    if (!inspection.exists) continue;
+  const CONCURRENCY = 8;
+  for (let offset = 0; offset < entries.length; offset += CONCURRENCY) {
+    const results = await Promise.all(
+      entries.slice(offset, offset + CONCURRENCY).map(async ({ entry, name }) => {
+        const directory = path.join(layout.archiveDir, entry);
+        const inspection = await inspectClassicProjectTarget(projectRoot, directory, {
+          label: `Classic archived change ${entry}`,
+          expected: 'directory',
+        });
+        if (!inspection.exists) return null;
 
-    const projection = await readClassicState(inspection.target, { migrate: false });
-    const classic = projection.classic;
-    if (!classic?.archived || classic.phase !== 'archive') continue;
-    const delivery = await readClassicDelivery(projectRoot, inspection.target);
-    if (['complete', 'local-verified'].includes(delivery.verification.status)) continue;
+        const projection = await readClassicState(inspection.target, { migrate: false });
+        const managed = await inspectManagedRun(
+          projectRoot,
+          name,
+          await resolveClassicStateFile(inspection.target),
+        );
+        if (managed.cancellation === 'complete') return null;
+        if (managed.state) projection.classic = managed.state;
+        const classic = projection.classic;
+        if (!classic?.archived || classic.phase !== 'archive') return null;
+        const delivery = await readClassicDelivery(projectRoot, inspection.target, {
+          evidence: false,
+        });
+        if (['complete', 'local-verified'].includes(delivery.verification.status)) return null;
 
-    const diagnostic = diagnosticFromProjection(inspection.target, name, projection);
-    const change: ActiveProbeChange = {
-      name,
-      workflow: classic.workflow,
-      phase: 'archive',
-      nextCommand: '/comet-archive',
-      diagnostic,
-      buildPause: null,
-      hasClassicProjection: true,
-      verifyResult: classic.verifyResult,
-      archived: true,
-      text: '',
-      missingCometState: false,
-    };
-    change.text = await changeSearchText(projectRoot, inspection.target, change);
-    changes.push(change);
+        const baseDiagnostic = diagnosticFromProjection(inspection.target, name, projection);
+        const diagnostic = managed.lostRun
+          ? {
+              ...baseDiagnostic,
+              valid: false,
+              nextCommand: null,
+              error: `Classic change ${name} has a state file but lost its local Run history`,
+            }
+          : baseDiagnostic;
+        const change: ActiveProbeChange = {
+          name,
+          workflow: classic.workflow,
+          phase: 'archive',
+          nextCommand: managed.cancellation === 'pending' ? null : diagnostic.nextCommand,
+          diagnostic,
+          buildPause: null,
+          hasClassicProjection: true,
+          verifyResult: classic.verifyResult,
+          archived: true,
+          text: '',
+          missingCometState: false,
+          ...(managed.cancellation === 'pending' ? { cancellationPending: true } : {}),
+        };
+        change.text = await changeSearchText(projectRoot, inspection.target, change);
+        return change;
+      }),
+    );
+    for (const change of results) if (change) changes.push(change);
   }
   return changes;
 }
@@ -436,6 +567,16 @@ function hasDecisionPoint(change: ActiveProbeChange): boolean {
   return false;
 }
 
+function cancellationDecision(change: ActiveProbeChange): CometResumeProbeResult {
+  return result(
+    'ask_user',
+    change,
+    'low',
+    'Classic Run is cancelled; the original host must confirm its execution and child tasks stopped, then submit the original claim and stop evidence through runtime dispatch cancel stoppedActions before releasing the workspace',
+    [{ source: 'state', quote: 'Run cancelled; original execution stop is not confirmed' }],
+  );
+}
+
 function relatedEvidence(utterance: string, change: ActiveProbeChange): CometResumeProbeEvidence[] {
   const text = utterance.toLowerCase();
   const evidence: CometResumeProbeEvidence[] = [];
@@ -515,6 +656,7 @@ export async function resolveCometResumeProbe(
     if (!named) {
       return result('ask_user', null, 'low', 'multiple active changes require a change name');
     }
+    if (named.cancellationPending) return cancellationDecision(named);
     if (dirtyFiles.length > 0) {
       return result('ask_user', named, 'low', 'uncommitted worktree changes require attribution', [
         { source: 'repo', quote: `${dirtyFiles.length} dirty file(s)` },
@@ -528,6 +670,7 @@ export async function resolveCometResumeProbe(
   }
 
   const [change] = changes;
+  if (change.cancellationPending) return cancellationDecision(change);
   if (dirtyFiles.length > 0) {
     return result('ask_user', change, 'low', 'uncommitted worktree changes require attribution', [
       { source: 'repo', quote: `${dirtyFiles.length} dirty file(s)` },
@@ -536,10 +679,18 @@ export async function resolveCometResumeProbe(
 
   if (hasDecisionPoint(change)) {
     if (change.archived) {
-      return result('ask_user', change, 'low', 'archived change has pending delivery', [
-        { source: 'state', quote: 'archived: true' },
-        { source: 'state', quote: 'delivery is not complete' },
-      ]);
+      return result(
+        'ask_user',
+        change,
+        'low',
+        change.diagnostic.valid
+          ? 'archived change has pending delivery'
+          : 'archived change execution history is unavailable',
+        [
+          { source: 'state', quote: 'archived: true' },
+          { source: 'state', quote: 'delivery is not complete' },
+        ],
+      );
     }
     if (change.missingCometState) {
       return result('ask_user', change, 'low', 'active OpenSpec change is missing Comet state');

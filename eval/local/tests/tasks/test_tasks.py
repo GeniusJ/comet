@@ -24,6 +24,11 @@ from conftest import get_fixtures
 from scaffold import Treatment
 from scaffold.python import extract_events, parse_output
 from scaffold.python.aligned_comparison import build_case_manifest, case_manifest_payload
+from scaffold.python.case_selection import (
+    read_case_selection,
+    select_case_params,
+    assert_selected_case_identity,
+)
 from scaffold.python.native_eval import (
     adapt_checks_for_native,
     adapt_prompt_for_native,
@@ -45,7 +50,7 @@ from scaffold.python.validation import run_validators
 
 # Timeouts
 CLAUDE_TIMEOUT = 1500  # Default floor for Claude to complete a multi-turn task
-PYTEST_TIMEOUT = 3000  # 50 minutes total including task-specific runtime and teardown
+PYTEST_TIMEOUT = 4200  # Include long full-cycle task runtime, image setup, and teardown
 MANIFEST_DYNAMIC_ONLY_TASKS = {"workflow-overlay-contract"}
 
 
@@ -154,7 +159,9 @@ def generate_test_params(task_filter: str | None, treatment_filter: str | None, 
     authored_tasks = {}
     manifest_baseline_treatments = []
     frozen_selected = False
-    if config is not None and (config.getoption("--eval-manifest") or config.getoption("--skill-path")):
+    if config is not None and (
+        config.getoption("--eval-manifest") or config.getoption("--skill-path")
+    ):
         resolved = _resolve_frozen_task_set(config, task_filter)
         frozen_selected = True
         manifest = config._comet_resolution_manifest
@@ -413,16 +420,17 @@ def pytest_generate_tests(metafunc):
         # The explicit marker is the controller-owned repetition identity used
         # to persist a complete matrix before any model run begins.
         params = []
-        for rep in range(count):
-            for task_name, treatment_name in base_params:
-                params.append(
-                    pytest.param(
-                        task_name,
-                        treatment_name,
-                        id=f"{task_name}-{treatment_name}-r{rep + 1}",
-                        marks=pytest.mark.eval_case(repetition=rep + 1),
-                    )
+        for task_name, treatment_name, rep in select_case_params(
+            base_params, count, read_case_selection()
+        ):
+            params.append(
+                pytest.param(
+                    task_name,
+                    treatment_name,
+                    id=f"{task_name}-{treatment_name}-r{rep}",
+                    marks=pytest.mark.eval_case(repetition=rep),
                 )
+            )
         metafunc.parametrize("task_name,treatment_name", params)
 
 
@@ -435,6 +443,14 @@ def pytest_generate_tests(metafunc):
 def test_task_treatment(task_name, treatment_name):
     """Run a task with a treatment and validate results."""
     fixtures = get_fixtures()
+    from scaffold.python.progress import publish_eval_progress
+
+    publish_eval_progress(
+        "preparing",
+        task=task_name,
+        treatment=treatment_name,
+        repetition=getattr(fixtures, "repetition", 1),
+    )
     task = _load_eval_task(task_name, fixtures.request_config)
     treatments = load_treatments()
     dynamic = conftest._get_dynamic_treatment_config(fixtures.request_config)
@@ -526,13 +542,29 @@ def test_task_treatment(task_name, treatment_name):
             environment_dir=task.environment_dir if task.manifest_path else None,
         )
     )
+    assert_selected_case_identity(task.name, treatment_name, case_manifest)
     skill_package_path = conftest._snapshot_dynamic_skill_package(
         fixtures.test_dir, skill_hints
     ) or skill_hints.get("path")
+    from scaffold.python.application_eval import (
+        application_eval_context,
+        application_execution_prompt,
+        install_application_for_case,
+    )
+
+    if application_eval_context() is not None:
+        installed_file = install_application_for_case(
+            fixtures.test_dir, skill_package_path, selected_agent
+        )
+        prompt = application_execution_prompt(prompt, skill_package_path, installed_file)
 
     result = fixtures.run_claude(
         prompt,
-        timeout=max(CLAUDE_TIMEOUT, task.config.timeout_sec),
+        timeout=conftest._resolve_agent_timeout(
+            fixtures.request_config,
+            task_timeout=task.config.timeout_sec,
+            floor=CLAUDE_TIMEOUT,
+        ),
         model=selected_model,
         interaction=interaction,
         image_id=captured_execution.runtime_image_id,
@@ -652,6 +684,11 @@ def test_task_treatment(task_name, treatment_name):
     # These fields are local evidence as well; Langfuse applies its own bounded
     # capture policy before sending them remotely.
     events["task"] = task.name
+    if "application_coverage" in outputs:
+        events["application_coverage"] = outputs["application_coverage"]
+        events["application_executed_steps"] = outputs["application_executed_steps"]
+        events["application_choices"] = outputs["application_choices"]
+        events["application_recovery"] = outputs["application_recovery"]
     events["treatment"] = treatment_name
     events["prompt"] = prompt
     events["skill"] = skill_hints.get("name") or skill_hints.get("path")
