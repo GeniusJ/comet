@@ -5,6 +5,8 @@ import { promises as fs } from 'fs';
 import net from 'net';
 import os from 'os';
 import path from 'path';
+import * as kubernetes from '../../../platform/process/kubernetes.js';
+import { maintainDashboardRepository } from '../../../domains/dashboard/project-repositories.js';
 import { startDashboardServer } from '../../../domains/dashboard/server.js';
 import { resolveDashboardStaticPath } from '../../../domains/dashboard/server.js';
 import { upsertProjectInstallation } from '../../../platform/install/project-registry.js';
@@ -60,7 +62,7 @@ describe('startDashboardServer', () => {
 
   beforeEach(async () => {
     projectDir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'comet-srv-proj-')));
-    webDir = await fs.mkdtemp(path.join(os.tmpdir(), 'comet-srv-web-'));
+    webDir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'comet-srv-web-')));
     vi.spyOn(os, 'homedir').mockReturnValue(path.join(webDir, 'home'));
     await fs.writeFile(
       path.join(webDir, 'index.html'),
@@ -73,8 +75,542 @@ describe('startDashboardServer', () => {
     await Promise.all(handles.map((h) => h.close().catch(() => undefined)));
     handles = [];
     vi.restoreAllMocks();
+    vi.unstubAllEnvs();
     await fs.rm(projectDir, { recursive: true, force: true });
     await fs.rm(webDir, { recursive: true, force: true });
+  });
+
+  it('streams AI analysis only for registered projects and bound repositories with bounded snapshots', async () => {
+    const analyzeLogs = vi.fn(async (_prompt, options) => {
+      options.onMessage('L1: 合成异常');
+    });
+    const server = await startDashboardServer({
+      projectPath: projectDir,
+      webRoot: webDir,
+      port: 0,
+      analyzeLogs,
+    });
+    handles.push(server);
+    const directory = JSON.parse((await request(server.port, '/api/dashboard/projects')).body);
+    const bound = await maintainDashboardRepository(projectDir, {
+      action: 'bind',
+      repository: {
+        remote: 'https://example.invalid/core.git',
+        name: 'core',
+        kind: 'backend',
+      },
+    });
+    const endpoint = `/api/dashboard/projects/${directory.currentProjectId}/log-analysis`;
+    const body = {
+      repositoryId: bound.repositories[0].id,
+      question: '为什么失败？',
+      logs: 'ERROR fixture',
+      source: 'container',
+    };
+    const post = { method: 'POST', headers: { 'content-type': 'application/json' } };
+    expect((await request(server.port, endpoint)).status).toBe(405);
+    expect((await request(server.port, endpoint, { method: 'POST' }, body)).status).toBe(415);
+    expect(
+      (
+        await request(
+          server.port,
+          endpoint,
+          { ...post, headers: { ...post.headers, origin: 'https://external.invalid' } },
+          body,
+        )
+      ).status,
+    ).toBe(403);
+    expect(
+      (await request(server.port, '/api/dashboard/projects/unknown/log-analysis', post, body))
+        .status,
+    ).toBe(404);
+    expect(
+      (await request(server.port, endpoint, post, { ...body, repositoryId: 'unknown' })).status,
+    ).toBe(404);
+    expect(
+      (await request(server.port, endpoint, post, { ...body, logs: 'x'.repeat(128 * 1024 + 1) }))
+        .status,
+    ).toBe(400);
+    expect(analyzeLogs).not.toHaveBeenCalled();
+    const response = await request(server.port, endpoint, post, {
+      ...body,
+      logs: '"'.repeat(128 * 1024),
+    });
+    expect(response.status).toBe(200);
+    expect(response.headers['content-type']).toContain('application/x-ndjson');
+    expect(response.headers['cache-control']).toBe('no-store');
+    expect(
+      response.body
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line).type),
+    ).toEqual(['status', 'message', 'complete']);
+    expect(JSON.parse(analyzeLogs.mock.calls[0][0]).snapshot).toBe(`L1: ${'"'.repeat(128 * 1024)}`);
+    expect(
+      (await request(server.port, endpoint, post, { ...body, extra: 'x'.repeat(1024 * 1024) }))
+        .status,
+    ).toBe(413);
+  });
+
+  it('cancels CLI analysis when its browser connection closes and conceals unexpected errors', async () => {
+    const cancelled = vi.fn();
+    let waiting = true;
+    const analyzeLogs = vi.fn(async (_prompt, options) => {
+      if (!waiting) throw new Error('private-fixture-secret');
+      await new Promise<void>((resolve) =>
+        options.signal.addEventListener(
+          'abort',
+          () => {
+            cancelled();
+            resolve();
+          },
+          { once: true },
+        ),
+      );
+    });
+    const server = await startDashboardServer({
+      projectPath: projectDir,
+      webRoot: webDir,
+      port: 0,
+      analyzeLogs,
+    });
+    handles.push(server);
+    const directory = JSON.parse((await request(server.port, '/api/dashboard/projects')).body);
+    const bound = await maintainDashboardRepository(projectDir, {
+      action: 'bind',
+      repository: {
+        remote: 'https://example.invalid/core.git',
+        name: 'core',
+        kind: 'backend',
+      },
+    });
+    const endpoint = `/api/dashboard/projects/${directory.currentProjectId}/log-analysis`;
+    const body = {
+      repositoryId: bound.repositories[0].id,
+      question: '分析',
+      logs: 'ERROR fixture',
+      source: 'pipeline',
+    };
+    await new Promise<void>((resolve, reject) => {
+      const req = http.request(
+        {
+          host: '127.0.0.1',
+          port: server.port,
+          path: endpoint,
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+        },
+        (res) => {
+          res.once('data', () => {
+            res.destroy();
+            req.destroy();
+            resolve();
+          });
+        },
+      );
+      req.on('error', reject);
+      req.end(JSON.stringify(body));
+    });
+    await vi.waitFor(() => expect(cancelled).toHaveBeenCalledOnce());
+    waiting = false;
+    const result = await request(
+      server.port,
+      endpoint,
+      { method: 'POST', headers: { 'content-type': 'application/json' } },
+      body,
+    );
+    const events = result.body
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line));
+    expect(events.at(-1)).toMatchObject({ type: 'error' });
+    expect(result.body).not.toContain('private-fixture-secret');
+  });
+
+  it('initializes only the registered selected project through the bounded JSON endpoint', async () => {
+    const initializeProject = vi.fn().mockResolvedValue({ status: 'complete', failures: [] });
+    const server = await startDashboardServer({
+      projectPath: projectDir,
+      webRoot: webDir,
+      port: 0,
+      initializeProject,
+    });
+    handles.push(server);
+    const directory = JSON.parse((await request(server.port, '/api/dashboard/projects')).body);
+    const endpoint = `/api/dashboard/projects/${directory.currentProjectId}/initialization`;
+    expect(JSON.parse((await request(server.port, endpoint)).body)).toMatchObject({
+      available: true,
+      config: null,
+    });
+    const post = { method: 'POST', headers: { 'content-type': 'application/json' } };
+    const options = {
+      platform: 'codex',
+      workflow: 'native',
+      language: 'zh',
+      artifactRoot: 'docs',
+      overwrite: false,
+      codegraph: 'skip',
+    };
+    expect((await request(server.port, endpoint, { method: 'POST' }, options)).status).toBe(415);
+    expect(
+      (
+        await request(
+          server.port,
+          endpoint,
+          { ...post, headers: { ...post.headers, origin: 'https://external.invalid' } },
+          options,
+        )
+      ).status,
+    ).toBe(403);
+    expect(
+      (await request(server.port, '/api/dashboard/projects/unknown/initialization', post, options))
+        .status,
+    ).toBe(404);
+    expect(
+      (await request(server.port, endpoint, post, { ...options, path: '/elsewhere' })).status,
+    ).toBe(400);
+    expect(initializeProject).not.toHaveBeenCalled();
+    const response = await request(server.port, endpoint, post, options);
+    expect(response.status).toBe(200);
+    expect(JSON.parse(response.body)).toMatchObject({ status: 'complete' });
+    expect(initializeProject).toHaveBeenCalledExactlyOnceWith(projectDir, options);
+  });
+
+  it('queries only saved Kubernetes targets with project isolation and normal API protections', async () => {
+    const status = vi.spyOn(kubernetes, 'inspectKubernetesDeployment').mockResolvedValue({
+      context: 'saved',
+      namespace: 'test',
+      deployment: 'core',
+      desiredReplicas: 1,
+      readyReplicas: 1,
+      updatedReplicas: 1,
+      containers: [],
+      pods: [],
+      checkedAt: 'now',
+    });
+    const logs = vi.spyOn(kubernetes, 'readKubernetesLogs').mockResolvedValue({
+      logs: 'test output',
+      pod: 'core-abc',
+      container: 'core',
+      checkedAt: 'now',
+    });
+    const contexts = vi.spyOn(kubernetes, 'listKubernetesContexts').mockResolvedValue(['saved']);
+    const server = await startDashboardServer({
+      projectPath: projectDir,
+      webRoot: webDir,
+      port: 0,
+    });
+    handles.push(server);
+    const directory = JSON.parse((await request(server.port, '/api/dashboard/projects')).body);
+    const endpoint = `/api/dashboard/projects/${directory.currentProjectId}/kubernetes`;
+    const headers = { 'content-type': 'application/json' };
+    const post = (body: unknown, url = endpoint) =>
+      request(server.port, url, { method: 'POST', headers }, body);
+    const bound = await maintainDashboardRepository(projectDir, {
+      action: 'bind',
+      repository: { remote: 'https://example.invalid/core.git', name: 'core', kind: 'backend' },
+    });
+    const repositoryId = bound.repositories[0].id;
+    expect((await request(server.port, endpoint)).status).toBe(405);
+    expect((await request(server.port, endpoint, { method: 'HEAD' })).status).toBe(405);
+    expect((await post({ action: 'run', repositoryId })).status).toBe(400);
+    expect((await post({ action: 'status', repositoryId: 'missing' })).status).toBe(404);
+    expect((await post({ action: 'status', repositoryId })).status).toBe(409);
+    expect(status).not.toHaveBeenCalled();
+    const target = { context: 'saved', namespace: 'test', deployment: 'core', container: '' };
+    await maintainDashboardRepository(projectDir, {
+      action: 'edit',
+      id: repositoryId,
+      repository: { ...bound.repositories[0], kubernetes: target },
+    });
+    expect(
+      (await request(server.port, endpoint, { method: 'POST' }, { action: 'status', repositoryId }))
+        .status,
+    ).toBe(415);
+    for (const unsafeHeaders of [
+      { ...headers, origin: 'https://external.invalid' },
+      { ...headers, host: 'external.invalid' },
+    ])
+      expect(
+        (
+          await request(
+            server.port,
+            endpoint,
+            { method: 'POST', headers: unsafeHeaders },
+            { action: 'status', repositoryId },
+          )
+        ).status,
+      ).toBe(403);
+    expect(
+      (await post({ action: 'status', repositoryId, context: 'other', namespace: 'other' })).status,
+    ).toBe(200);
+    expect(status).toHaveBeenCalledWith(target, expect.any(AbortSignal));
+    expect(
+      JSON.parse(
+        (await post({ action: 'logs', repositoryId, pod: 'core-abc', container: 'core' })).body,
+      ),
+    ).toMatchObject({ logs: 'test output' });
+    expect(logs).toHaveBeenCalledWith(
+      target,
+      expect.objectContaining({ pod: 'core-abc' }),
+      expect.any(AbortSignal),
+    );
+    expect(JSON.parse((await request(server.port, `${endpoint}/contexts`)).body)).toEqual({
+      contexts: ['saved'],
+    });
+    expect((await post({}, `${endpoint}/contexts`)).status).toBe(405);
+    expect(contexts).toHaveBeenCalledTimes(1);
+    const other = path.join(webDir, 'other-project');
+    await fs.mkdir(other);
+    const added = JSON.parse(
+      (
+        await request(
+          server.port,
+          '/api/dashboard/projects',
+          { method: 'POST', headers },
+          { path: other },
+        )
+      ).body,
+    );
+    expect(
+      (
+        await post(
+          { action: 'status', repositoryId },
+          `/api/dashboard/projects/${added.projectId}/kubernetes`,
+        )
+      ).status,
+    ).toBe(404);
+    status.mockRejectedValueOnce(new kubernetes.KubectlError('kubectl unavailable'));
+    expect((await post({ action: 'status', repositoryId })).status).toBe(502);
+    expect((await post({}, `${endpoint}/publish`)).status).toBe(405);
+  });
+
+  it('adds readable paths without installing files, deduplicates aliases and preserves installation metadata', async () => {
+    const target = path.join(webDir, '中文 project');
+    const alias = path.join(webDir, 'alias');
+    await fs.mkdir(target);
+    await fs.symlink(target, alias, process.platform === 'win32' ? 'junction' : 'dir');
+    const handle = await startDashboardServer({
+      projectPath: projectDir,
+      webRoot: webDir,
+      port: 0,
+    });
+    handles.push(handle);
+    const add = (projectPath: unknown) =>
+      request(
+        handle.port,
+        '/api/dashboard/projects',
+        {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+        },
+        { path: projectPath },
+      );
+    const added = await add(target);
+    expect(added.status).toBe(200);
+    const result = JSON.parse(added.body);
+    expect(result.directory.projects).toHaveLength(2);
+    expect(
+      result.directory.projects.find((entry: { id: string }) => entry.id === result.projectId).path,
+    ).toBe(await fs.realpath(target));
+    expect(await fs.readdir(target)).toEqual([]);
+    expect(JSON.parse((await add(alias)).body).directory.projects).toHaveLength(2);
+    const installed = await upsertProjectInstallation(
+      await fs.realpath(target),
+      [{ platform: 'codex', language: 'zh' }],
+      'update',
+    );
+    await add(target);
+    const { readProjectRegistry } = await import('../../../platform/install/project-registry.js');
+    expect(
+      (await readProjectRegistry()).projects.find(
+        (entry) => entry.canonicalPath === installed.canonicalPath,
+      ),
+    ).toEqual(installed);
+    for (const invalid of [
+      'relative',
+      '',
+      path.join(webDir, 'missing'),
+      path.join(webDir, 'index.html'),
+      null,
+    ]) {
+      expect((await add(invalid)).status).toBe(400);
+    }
+    expect(
+      (await request(handle.port, '/api/dashboard/projects', { method: 'POST' }, { path: target }))
+        .status,
+    ).toBe(415);
+    expect(
+      (
+        await request(
+          handle.port,
+          '/api/dashboard/projects',
+          {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', origin: 'https://example.com' },
+          },
+          { path: target },
+        )
+      ).status,
+    ).toBe(403);
+    const reopened = await startDashboardServer({
+      projectPath: projectDir,
+      webRoot: webDir,
+      port: 0,
+    });
+    handles.push(reopened);
+    expect(
+      JSON.parse((await request(reopened.port, '/api/dashboard/projects')).body).projects,
+    ).toHaveLength(2);
+    expect(
+      (await request(reopened.port, `/api/dashboard/projects/${result.projectId}/overview`)).status,
+    ).toBe(200);
+  });
+
+  it('maintains project repository bindings through trusted JSON requests and clones into the workspace', async () => {
+    vi.stubEnv('GIT_CONFIG_GLOBAL', path.join(webDir, 'empty-gitconfig'));
+    vi.stubEnv('GIT_CONFIG_NOSYSTEM', '1');
+    const remote = path.join(webDir, 'repository');
+    await fs.mkdir(remote);
+    const git = (...args: string[]) =>
+      execFileSync(
+        'git',
+        ['-C', remote, '-c', 'user.name=Test', '-c', 'user.email=test@example.com', ...args],
+        { stdio: 'pipe' },
+      );
+    git('init', '-b', 'main');
+    await fs.writeFile(path.join(remote, 'README.md'), 'remote code');
+    git('add', '.');
+    git('commit', '-m', 'fixture');
+    const server = await startDashboardServer({
+      projectPath: projectDir,
+      webRoot: webDir,
+      port: 0,
+    });
+    handles.push(server);
+    const directory = JSON.parse((await request(server.port, '/api/dashboard/projects')).body);
+    const endpoint = `/api/dashboard/projects/${directory.currentProjectId}/repositories`;
+    expect(JSON.parse((await request(server.port, endpoint)).body)).toMatchObject({
+      repositories: [],
+      initialized: false,
+    });
+    const body = {
+      action: 'bind',
+      repository: {
+        remote,
+        name: 'web-app',
+        kind: 'frontend',
+        branch: 'main',
+        tags: ['用户端', '票务'],
+      },
+    };
+    expect((await request(server.port, endpoint, { method: 'POST' }, body)).status).toBe(415);
+    expect(
+      (
+        await request(
+          server.port,
+          endpoint,
+          {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', origin: 'https://example.com' },
+          },
+          body,
+        )
+      ).status,
+    ).toBe(403);
+    const post = (value: unknown) =>
+      request(
+        server.port,
+        endpoint,
+        { method: 'POST', headers: { 'content-type': 'application/json' } },
+        value,
+      );
+    expect((await post({ action: 'invalid' })).status).toBe(400);
+    const bound = await post(body);
+    expect(bound.status).toBe(200);
+    const id = JSON.parse(bound.body).repositories[0].id;
+    expect(JSON.parse((await request(server.port, endpoint)).body).repositories[0].tags).toEqual([
+      '用户端',
+      '票务',
+    ]);
+    expect((await post(body)).status).toBe(409);
+    expect((await post({ action: 'sync', id: 'unknown' })).status).toBe(404);
+    const synced = await post({ action: 'sync', id });
+    expect(synced.status).toBe(200);
+    expect(JSON.parse(synced.body).result.action).toBe('cloned');
+    const file = path.join(projectDir, 'engineering/frontend/web-app/README.md');
+    expect(await fs.readFile(file, 'utf8')).toBe('remote code');
+    expect((await post({ action: 'unbind', id })).status).toBe(200);
+    expect(await fs.readFile(file, 'utf8')).toBe('remote code');
+    expect(JSON.parse((await request(server.port, endpoint)).body).repositories).toEqual([]);
+    const discovery = JSON.parse((await request(server.port, `${endpoint}/discovery`)).body);
+    expect(discovery.candidates).toMatchObject([
+      { name: 'web-app', kind: 'frontend', branch: 'main' },
+    ]);
+    expect(
+      (
+        await request(
+          server.port,
+          `${endpoint}/discovery`,
+          { method: 'POST', headers: { 'content-type': 'application/json' } },
+          {},
+        )
+      ).status,
+    ).toBe(405);
+    const imported = await post({ action: 'initialize', paths: ['engineering/frontend/web-app'] });
+    expect(imported.status).toBe(200);
+    expect(JSON.parse(imported.body)).toMatchObject({
+      initialized: true,
+      repositories: [{ name: 'web-app', lastSyncedAt: null }],
+    });
+    expect(
+      JSON.parse((await request(server.port, `${endpoint}/discovery`)).body).candidates,
+    ).toEqual([]);
+  });
+
+  it('opens the directory picker only through trusted JSON POST and does not register a selection', async () => {
+    const chooseDirectory = vi
+      .fn()
+      .mockResolvedValueOnce(projectDir)
+      .mockResolvedValueOnce(null)
+      .mockRejectedValueOnce(new Error('没有桌面，请手动输入'));
+    const handle = await startDashboardServer({
+      projectPath: projectDir,
+      webRoot: webDir,
+      port: 0,
+      chooseDirectory,
+    });
+    handles.push(handle);
+    const endpoint = '/api/dashboard/projects/choose-directory';
+    expect((await request(handle.port, endpoint)).status).toBe(405);
+    expect(
+      (
+        await request(
+          handle.port,
+          endpoint,
+          {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', origin: 'https://example.com' },
+          },
+          {},
+        )
+      ).status,
+    ).toBe(403);
+    const choose = () =>
+      request(
+        handle.port,
+        endpoint,
+        { method: 'POST', headers: { 'content-type': 'application/json' } },
+        {},
+      );
+    expect(JSON.parse((await choose()).body)).toEqual({ path: projectDir });
+    expect(JSON.parse((await choose()).body)).toEqual({ path: null });
+    const failed = await choose();
+    expect(failed.status).toBe(503);
+    expect(JSON.parse(failed.body).error).toContain('手动输入');
+    expect(
+      JSON.parse((await request(handle.port, '/api/dashboard/projects')).body).projects,
+    ).toHaveLength(1);
   });
 
   it('removes a missing project only through a trusted JSON POST without deleting files', async () => {

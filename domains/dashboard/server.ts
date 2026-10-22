@@ -21,6 +21,7 @@ import {
   updateDashboardProjectConfigSettings,
 } from './project-config-settings.js';
 import {
+  addDashboardProject,
   collectDashboardProjectDirectory,
   DashboardProjectDirectoryError,
   findDashboardProject,
@@ -28,12 +29,36 @@ import {
 } from './project-directory.js';
 import { DashboardPluginHostError, type DashboardPluginHostFactory } from './plugin-host.js';
 import type { DashboardChangeTab } from './types.js';
+import {
+  collectDashboardRepositories,
+  discoverDashboardRepositories,
+  maintainDashboardRepository,
+} from './project-repositories.js';
+import { ManagedRepositoryError } from '../../platform/process/managed-repository.js';
+import { chooseLocalDirectory } from '../../platform/process/directory-picker.js';
+
+import { KubeEaseError } from '../../platform/http/kubeease.js';
+import { queryDashboardKubernetes } from './project-kubernetes.js';
+import { KubectlError, listKubernetesContexts } from '../../platform/process/kubernetes.js';
+import { CodexLogAnalysisError } from '../../platform/process/codex-log-analysis.js';
+import {
+  createDashboardLogAnalyzer,
+  type DashboardLogAnalysisRunner,
+  type DashboardLogAnalysisEvent,
+} from './log-analysis.js';
+import {
+  createDashboardProjectInitializer,
+  type DashboardProjectInitRunner,
+} from './project-initialization.js';
 
 export interface DashboardServerOptions {
   projectPath: string;
   port?: number;
   webRoot?: string;
   pluginHost?: DashboardPluginHostFactory;
+  chooseDirectory?: () => Promise<string | null>;
+  initializeProject?: DashboardProjectInitRunner;
+  analyzeLogs?: DashboardLogAnalysisRunner;
 }
 
 export interface DashboardServerHandle {
@@ -115,12 +140,35 @@ export async function startDashboardServer(
   const requestedPort = options.port ?? DEFAULT_PORT;
   const port = requestedPort === 0 ? 0 : await findAvailablePort(requestedPort);
   const pluginHostAccess = createDashboardPluginHostAccess(options.pluginHost);
+  const initializer = createDashboardProjectInitializer(options.initializeProject);
+  const logAnalyzer = createDashboardLogAnalyzer(options.analyzeLogs);
   const currentProjectPath = await fs
     .realpath(options.projectPath)
     .catch(() => path.resolve(options.projectPath));
 
+  let choosingDirectory = false;
+  const chooseDirectory = async () => {
+    if (choosingDirectory) throw new DashboardProjectDirectoryError('文件夹选择器已打开。');
+    choosingDirectory = true;
+    try {
+      return await (options.chooseDirectory ?? chooseLocalDirectory)();
+    } catch (error) {
+      throw new DashboardProjectDirectoryError((error as Error).message, 503);
+    } finally {
+      choosingDirectory = false;
+    }
+  };
   const server = http.createServer((req, res) => {
-    handleRequest(req, res, currentProjectPath, webRoot, pluginHostAccess).catch((error) => {
+    handleRequest(
+      req,
+      res,
+      currentProjectPath,
+      webRoot,
+      chooseDirectory,
+      pluginHostAccess,
+      initializer,
+      logAnalyzer,
+    ).catch((error) => {
       if (
         error instanceof DashboardChangeQueryError ||
         error instanceof NativeDashboardQueryError
@@ -133,6 +181,16 @@ export async function startDashboardServer(
           error: error.message,
           ...(error.pluginId ? { pluginId: error.pluginId } : {}),
         });
+        return;
+      }
+      if (
+        error instanceof DashboardProjectDirectoryError ||
+        error instanceof ManagedRepositoryError ||
+        error instanceof KubectlError ||
+        error instanceof KubeEaseError ||
+        error instanceof CodexLogAnalysisError
+      ) {
+        respondJson(res, req.method ?? 'GET', error.status, { error: error.message });
         return;
       }
       if (error instanceof DashboardProjectConfigError) {
@@ -169,7 +227,10 @@ async function handleRequest(
   res: http.ServerResponse,
   projectPath: string,
   webRoot: string,
+  chooseDirectory: () => Promise<string | null>,
   pluginHostAccess?: DashboardPluginHostAccess,
+  initializer = createDashboardProjectInitializer(),
+  logAnalyzer = createDashboardLogAnalyzer(),
 ): Promise<void> {
   const authority = req.headers.host;
   const localPort = req.socket.localPort;
@@ -205,13 +266,27 @@ async function handleRequest(
 
   const isPluginRequest = pathname.includes('/plugins');
   const isProjectConfigRequest = pathname.endsWith('/config');
+  const isProjectInitRequest = pathname.endsWith('/initialization');
   const isProjectForgetRequest = pathname.endsWith('/forget');
+  const isProjectRepositoriesRequest = pathname.endsWith('/repositories');
+  const isKubernetesRequest = /^\/api\/dashboard\/projects\/[^/]+\/kubernetes$/u.test(pathname);
+  const isLogAnalysisRequest = /^\/api\/dashboard\/projects\/[^/]+\/log-analysis$/u.test(pathname);
+  const isProjectAddRequest = pathname === '/api/dashboard/projects';
+  const isDirectoryPickerRequest = pathname === '/api/dashboard/projects/choose-directory';
   if (
     req.method !== 'GET' &&
     req.method !== 'HEAD' &&
     !(
       req.method === 'POST' &&
-      (isPluginRequest || isProjectConfigRequest || isProjectForgetRequest)
+      (isPluginRequest ||
+        isProjectConfigRequest ||
+        isProjectInitRequest ||
+        isProjectForgetRequest ||
+        isProjectRepositoriesRequest ||
+        isKubernetesRequest ||
+        isLogAnalysisRequest ||
+        isProjectAddRequest ||
+        isDirectoryPickerRequest)
     )
   ) {
     respondError(res, 405, 'Method not allowed');
@@ -224,7 +299,22 @@ async function handleRequest(
     return;
   }
 
+  if (isDirectoryPickerRequest) {
+    if (req.method !== 'POST') {
+      respondError(res, 405, 'Method not allowed');
+      return;
+    }
+    asObject(await readJsonBody(req), 'Directory picker request');
+    respondJson(res, req.method, 200, { path: await chooseDirectory() });
+    return;
+  }
+
   if (pathname === '/api/dashboard/projects') {
+    if (req.method === 'POST') {
+      const body = asObject(await readJsonBody(req), 'Project request');
+      respondJson(res, req.method, 200, await addDashboardProject(projectPath, body.path));
+      return;
+    }
     const directory = await collectDashboardProjectDirectory(projectPath);
     respondJson(res, req.method, 200, directory);
     return;
@@ -276,6 +366,89 @@ async function handleRequest(
         error: 'Dashboard project is unavailable',
         availability: project.availability,
       });
+      return;
+    }
+
+    if (subpath === '/log-analysis') {
+      if (req.method !== 'POST') {
+        respondError(res, 405, 'Method not allowed');
+        return;
+      }
+      const controller = new AbortController();
+      const cancel = () => {
+        if (!res.writableEnded) controller.abort();
+      };
+      res.once('close', cancel);
+      const send = (event: DashboardLogAnalysisEvent) => {
+        if (controller.signal.aborted || res.destroyed) return;
+        if (!res.headersSent)
+          res.writeHead(200, {
+            'Content-Type': 'application/x-ndjson; charset=utf-8',
+            'Cache-Control': 'no-store',
+            'X-Content-Type-Options': 'nosniff',
+          });
+        res.write(`${JSON.stringify(event)}\n`);
+      };
+      try {
+        await logAnalyzer(
+          project.path,
+          await readJsonBody(req, 1024 * 1024),
+          send,
+          controller.signal,
+        );
+        res.end();
+      } catch (error) {
+        if (!res.headersSent) throw error;
+        send({
+          type: 'error',
+          message:
+            error instanceof CodexLogAnalysisError ? error.message : '日志分析失败，请稍后重试。',
+        });
+        res.end();
+      } finally {
+        res.removeListener('close', cancel);
+      }
+      return;
+    }
+
+    if (subpath === '/kubernetes/contexts') {
+      respondJson(res, req.method, 200, { contexts: await listKubernetesContexts() });
+      return;
+    }
+    if (subpath === '/kubernetes') {
+      if (req.method !== 'POST') {
+        respondError(res, 405, 'Method not allowed');
+        return;
+      }
+      const controller = new AbortController();
+      const cancel = () => {
+        if (!res.writableEnded) controller.abort();
+      };
+      res.once('close', cancel);
+      try {
+        const data = await queryDashboardKubernetes(
+          project.path,
+          await readJsonBody(req),
+          controller.signal,
+        );
+        respondJson(res, req.method, 200, data);
+      } finally {
+        res.removeListener('close', cancel);
+      }
+      return;
+    }
+
+    if (subpath === '/repositories/discovery') {
+      respondJson(res, req.method, 200, await discoverDashboardRepositories(project.path));
+      return;
+    }
+
+    if (subpath === '/repositories') {
+      const data =
+        req.method === 'POST'
+          ? await maintainDashboardRepository(project.path, await readJsonBody(req))
+          : await collectDashboardRepositories(project.path);
+      respondJson(res, req.method, 200, data);
       return;
     }
 
@@ -345,6 +518,17 @@ async function handleRequest(
         return;
       }
       respondJson(res, req.method, 200, detail);
+      return;
+    }
+
+    if (subpath === '/initialization') {
+      if (req.method === 'POST') {
+        const result = await initializer.run(project.path, await readJsonBody(req));
+        pluginHostAccess?.invalidate(projectId);
+        respondJson(res, req.method, 200, result);
+      } else {
+        respondJson(res, req.method, 200, await initializer.collect(project.path));
+      }
       return;
     }
 
@@ -462,9 +646,12 @@ async function handlePluginRequest(
 
 const MAX_PLUGIN_BODY_BYTES = 128 * 1024;
 
-async function readJsonBody(req: http.IncomingMessage): Promise<unknown> {
+async function readJsonBody(
+  req: http.IncomingMessage,
+  maxBytes = MAX_PLUGIN_BODY_BYTES,
+): Promise<unknown> {
   const contentLength = Number(req.headers['content-length'] ?? 0);
-  if (Number.isFinite(contentLength) && contentLength > MAX_PLUGIN_BODY_BYTES) {
+  if (Number.isFinite(contentLength) && contentLength > maxBytes) {
     throw new DashboardPluginHostError('Plugin request body is too large', 413);
   }
   const chunks: Buffer[] = [];
@@ -472,7 +659,7 @@ async function readJsonBody(req: http.IncomingMessage): Promise<unknown> {
   for await (const chunk of req) {
     const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
     size += buffer.length;
-    if (size > MAX_PLUGIN_BODY_BYTES) {
+    if (size > maxBytes) {
       throw new DashboardPluginHostError('Plugin request body is too large', 413);
     }
     chunks.push(buffer);

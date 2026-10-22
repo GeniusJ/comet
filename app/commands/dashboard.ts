@@ -3,6 +3,7 @@ import { collectDashboardSnapshot } from '../../domains/dashboard/collector.js';
 import { openInBrowser } from '../../domains/dashboard/open-browser.js';
 import { startDashboardServer } from '../../domains/dashboard/server.js';
 import { createDefaultDashboardPluginHostFactory } from '../../domains/dashboard/default-plugin-host.js';
+import { initializeDashboardProject } from './dashboard-init.js';
 
 import { discoverDashboardProjectRoot } from '../../domains/dashboard/project-root.js';
 export interface DashboardOptions {
@@ -37,6 +38,7 @@ export async function dashboardCommand(
     projectPath,
     port,
     pluginHost: createDefaultDashboardPluginHostFactory(),
+    initializeProject: initializeDashboardProject,
   });
 
   console.log(`Comet Dashboard running at ${handle.url}`);

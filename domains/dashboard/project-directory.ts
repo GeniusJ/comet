@@ -6,6 +6,7 @@ import {
   ProjectRegistryError,
   ProjectDirectoryReappearedError,
   readProjectRegistry,
+  registerProjectDirectory,
   removeProjectInstallation,
   type ProjectRegistryEntry,
 } from '../../platform/install/project-registry.js';
@@ -38,7 +39,12 @@ export interface DashboardProjectDirectoryOptions {
 }
 
 export class DashboardProjectDirectoryError extends Error {
-  readonly status = 409;
+  constructor(
+    message: string,
+    readonly status = 409,
+  ) {
+    super(message);
+  }
 }
 
 function canonicalKey(projectPath: string): string {
@@ -192,4 +198,31 @@ export async function forgetMissingDashboardProject(
     }
   }
   return collectDashboardProjectDirectory(currentProjectPath, options);
+}
+
+export async function addDashboardProject(
+  currentProjectPath: string,
+  requestedPath: unknown,
+  options: DashboardProjectDirectoryOptions = {},
+): Promise<{ projectId: string; directory: DashboardProjectDirectory }> {
+  if (
+    typeof requestedPath !== 'string' ||
+    !path.isAbsolute(requestedPath) ||
+    requestedPath.includes('\0')
+  ) {
+    throw new DashboardProjectDirectoryError('请输入项目的绝对路径。', 400);
+  }
+  let canonicalPath: string;
+  try {
+    canonicalPath = await fs.realpath(requestedPath);
+    if (!(await fs.stat(canonicalPath)).isDirectory()) throw new Error('Not a directory');
+    await fs.readdir(canonicalPath);
+  } catch {
+    throw new DashboardProjectDirectoryError('项目路径不存在、不是文件夹或无法读取。', 400);
+  }
+  await registerProjectDirectory(canonicalPath, options);
+  return {
+    projectId: projectId(canonicalKey(canonicalPath)),
+    directory: await collectDashboardProjectDirectory(currentProjectPath, options),
+  };
 }

@@ -2,6 +2,16 @@
 
 All notable changes to @rpamis/comet will be documented in this file.
 
+## What's Changed [0.4.6] - 2026-10-21
+
+### Added
+
+- **Dashboard project paths**: Add projects by entering an absolute path or choosing a local folder, then switch to them immediately using the existing project selector. Saved projects remain available after restart without installing Skills or changing project files; manual entry remains available when a native folder picker cannot run.
+- **Dashboard project settings**: Initialize the selected working directory with the existing `comet init` workflow from the Project Management menu. Choose the Agent platform, workflow, language, artifact root, overwrite behavior and CodeGraph indexing, inspect completion or partial failures, and edit the project's Comet configuration on the same page.
+- **Dashboard repository maintenance**: Manage frontend and backend Git repositories for the selected working directory in a searchable list with type and custom tag filters. Add or edit bindings in dialogs, select existing local repositories during initialization, and clone or fast-forward code into `engineering/frontend/<name>` and `engineering/backed/<name>`. Row actions use compact icons with hover labels. Removing bindings keeps local code.
+- **Dashboard Kubernetes view**: Configure KubeEase per bound repository, review editable pipeline parameters before releasing, and inspect specific runs and stage logs. Choose a connected KE environment to view application replicas, images and current or previous container logs without local `kubectl`; optional kubeconfig targets remain supported. Container and pipeline logs support optional line wrapping and instant text search with match counts, highlights and keyboard navigation. Credentials stay on the local server, common token-bearing URLs in logs are redacted, and each release confirmation can be submitted only once.
+- **Dashboard AI log analysis**: Ask questions about loaded container and pipeline logs through the locally configured Codex CLI, with cited log lines and follow-up questions against a fixed snapshot. Start a fresh conversation with updated logs or stop an active analysis. Runs use temporary read-only sessions with external tools disabled, and common credential fields are redacted before analysis.
+
 ## What's Changed [0.4.5] - 2026-10-10
 
 ### Added

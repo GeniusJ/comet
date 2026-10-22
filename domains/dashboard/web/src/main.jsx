@@ -38,6 +38,7 @@ import {
   EditOutlined,
   FileTextOutlined,
   FlagOutlined,
+  FolderOpenOutlined,
   InfoCircleOutlined,
   MenuFoldOutlined,
   MenuOutlined,
@@ -52,6 +53,7 @@ import {
   SyncOutlined,
   UndoOutlined,
   UserOutlined,
+  CloudServerOutlined,
 } from '@ant-design/icons';
 import 'antd/dist/reset.css';
 import { createPortal } from 'react-dom';
@@ -63,6 +65,10 @@ import {
   renderYamlTable,
   runMermaid,
 } from './markdown-preview.js';
+import { AddProjectButton } from './project-picker.jsx';
+import { ProjectRepositoriesPage } from './project-repositories.jsx';
+import { ProjectSettingsPage } from './project-settings.jsx';
+import { KubernetesPage } from './kubernetes-page.jsx';
 import { NativeWorkflowPanel } from './native-workflow-panel.jsx';
 import { WorkflowPhaseTrack } from './phase-progress-indicator.jsx';
 import {
@@ -468,10 +474,13 @@ function DashboardApp({
   const useDemo = forceDemo || new URLSearchParams(window.location.search).has('demo');
   const [snapshot, setSnapshot] = useState(null);
   const [activeProjectId, setActiveProjectId] = useState(null);
+  const activeProjectIdRef = useRef(activeProjectId);
+  activeProjectIdRef.current = activeProjectId;
   const [workflow, setWorkflow] = useState(() => (useDemo ? 'classic' : null));
   const [workflowSource, setWorkflowSource] = useState(null);
   const [pluginSelection, setPluginSelection] = useState(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [managementPage, setManagementPage] = useState(null);
   const [settingsSection, setSettingsSection] = useState('comet.personal-memory');
   const [settingsPage, setSettingsPage] = useState(null);
   const [settingsConfig, setSettingsConfig] = useState(null);
@@ -1419,6 +1428,40 @@ function DashboardApp({
 
   const selectTab = useCallback((nextTab) => setTab(nextTab), []);
 
+  function selectProject(nextProjectId, directoryProjects = projects) {
+    if (nextProjectId === activeProjectId) return;
+    snapshotRequestRef.current?.abort();
+    pageRequestRef.current?.abort();
+    nativePageRequestRef.current?.abort();
+    nativeDetailRequestRef.current?.abort();
+    detailRequestRef.current?.abort();
+    setActiveProjectId(nextProjectId);
+    setSnapshot(null);
+    setPages({ active: null, archived: null, all: null });
+    pagesRef.current = { active: null, archived: null, all: null };
+    setNativePages({ active: null, archived: null, all: null });
+    nativePagesRef.current = { active: null, archived: null, all: null };
+    setNativeSelectedDetail(null);
+    nativeSelectedDetailRef.current = null;
+    setNativeDetailError(null);
+    setSelectedId(null);
+    selectedIdRef.current = null;
+    setSelectedDetail(null);
+    setDetailError(null);
+    setQuery('');
+    setSettingsOpen(false);
+    setPluginSelection(null);
+    setPluginPages(DASHBOARD_PLUGIN_NAV_PLACEHOLDERS);
+    setPluginPage(null);
+    setPluginError(null);
+    setSettingsConfig(null);
+    setRailOpen(false);
+    const nextProject = directoryProjects.find((project) => project.id === nextProjectId) ?? null;
+    const nextWorkflow = resolveDashboardProjectWorkflow(nextProject);
+    setWorkflow(nextWorkflow.workflow);
+    setWorkflowSource(nextWorkflow.source);
+  }
+
   return (
     <main
       className={`dashboard-workbench min-h-screen bg-surface text-fg antialiased lg:grid lg:grid-cols-[var(--rail-w)_1fr]${
@@ -1431,6 +1474,7 @@ function DashboardApp({
         collapsed={sidebarCollapsed}
         workflow={workflow}
         onWorkflow={(nextWorkflow) => {
+          setManagementPage(null);
           setSettingsOpen(false);
           if (nextWorkflow !== workflow) setTab('active');
           setWorkflow(nextWorkflow);
@@ -1464,6 +1508,7 @@ function DashboardApp({
           setSettingsError(null);
         }}
         onPluginSelect={(pluginId) => {
+          setManagementPage(null);
           setSettingsOpen(false);
           setPluginSelection(pluginId);
           setPluginPage(
@@ -1475,6 +1520,17 @@ function DashboardApp({
           );
           setPluginError(null);
         }}
+        managementPage={managementPage}
+        repositoriesDisabled={!activeProjectId}
+        onManagementSelect={
+          embedded || useDemo
+            ? undefined
+            : (page) => {
+                setSettingsOpen(false);
+                setPluginSelection(null);
+                setManagementPage(page);
+              }
+        }
         onCollapse={() => setSidebarCollapsed(true)}
         onExpand={() => setSidebarCollapsed(false)}
         onClose={() => setRailOpen(false)}
@@ -1487,7 +1543,7 @@ function DashboardApp({
         />
       )}
       <section
-        className={`min-w-0${pluginSelection ? ' dashboard-main-section-plugin-center' : ''}`}
+        className={`min-w-0${pluginSelection ? ' dashboard-main-section-plugin-center' : ''}${managementPage ? ' dashboard-main-section-repositories' : ''}`}
       >
         <Topbar
           project={snapshot?.project}
@@ -1507,38 +1563,24 @@ function DashboardApp({
             setProjects(directory.projects ?? []);
             toast('已从索引移除缺失项目');
           }}
-          onProjectSelect={(nextProjectId) => {
-            snapshotRequestRef.current?.abort();
-            pageRequestRef.current?.abort();
-            nativePageRequestRef.current?.abort();
-            nativeDetailRequestRef.current?.abort();
-            detailRequestRef.current?.abort();
-            setActiveProjectId(nextProjectId);
-            setSnapshot(null);
-            setPages({ active: null, archived: null, all: null });
-            pagesRef.current = { active: null, archived: null, all: null };
-            setNativePages({ active: null, archived: null, all: null });
-            nativePagesRef.current = { active: null, archived: null, all: null };
-            setNativeSelectedDetail(null);
-            nativeSelectedDetailRef.current = null;
-            setNativeDetailError(null);
-            setSelectedId(null);
-            selectedIdRef.current = null;
-            setSelectedDetail(null);
-            setDetailError(null);
-            setQuery('');
-            setSettingsOpen(false);
-            setPluginSelection(null);
-            setPluginPages(DASHBOARD_PLUGIN_NAV_PLACEHOLDERS);
-            setPluginPage(null);
-            setPluginError(null);
-            setSettingsConfig(null);
-            setRailOpen(false);
-            const nextProject = projects.find((project) => project.id === nextProjectId) ?? null;
-            const nextWorkflow = resolveDashboardProjectWorkflow(nextProject);
-            setWorkflow(nextWorkflow.workflow);
-            setWorkflowSource(nextWorkflow.source);
-          }}
+          onProjectAdd={
+            embedded || useDemo
+              ? undefined
+              : async (projectPath) => {
+                  const res = await fetch('/api/dashboard/projects', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ path: projectPath }),
+                  });
+                  if (!res.ok) throw await dashboardResponseError(res);
+                  const result = await res.json();
+                  const nextProjects = result.directory.projects ?? [];
+                  setProjects(nextProjects);
+                  selectProject(result.projectId, nextProjects);
+                  toast('已添加项目');
+                }
+          }
+          onProjectSelect={(nextProjectId) => selectProject(nextProjectId)}
           loading={loading}
           query={query}
           onQuery={setQuery}
@@ -1568,6 +1610,49 @@ function DashboardApp({
           >
             {!useDemo && projectsReady && !activeProjectId ? (
               <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无可用项目" />
+            ) : managementPage === 'settings' && !embedded && !useDemo ? (
+              <ProjectSettingsPage
+                key={activeProjectId}
+                projectId={activeProjectId}
+                project={
+                  projects.find((entry) => entry.id === activeProjectId) ?? snapshot?.project
+                }
+                ConfigEditor={CometConfigSettings}
+                onChanged={async (config) => {
+                  if (config) {
+                    projectConfigCacheRef.current.set(activeProjectId, config);
+                    projectConfigCoordinatorRef.current.set(activeProjectId, config);
+                    writeDashboardCache(projectConfigStorageKey(activeProjectId), config);
+                    setSettingsConfig(config);
+                  }
+                  const directory = await fetchDashboardProjects();
+                  if (activeProjectIdRef.current !== activeProjectId) return;
+                  setProjects(directory.projects ?? []);
+                  const nextWorkflow = resolveDashboardProjectWorkflow(
+                    directory.projects.find((entry) => entry.id === activeProjectId),
+                  );
+                  setWorkflow(nextWorkflow.workflow);
+                  setWorkflowSource(nextWorkflow.source);
+                  setPluginRefreshToken((value) => value + 1);
+                  await refresh(false);
+                }}
+              />
+            ) : managementPage === 'kubernetes' && !embedded && !useDemo ? (
+              <KubernetesPage
+                key={activeProjectId}
+                projectId={activeProjectId}
+                project={
+                  projects.find((entry) => entry.id === activeProjectId) ?? snapshot?.project
+                }
+              />
+            ) : managementPage === 'repositories' && !embedded && !useDemo ? (
+              <ProjectRepositoriesPage
+                key={activeProjectId}
+                projectId={activeProjectId}
+                project={
+                  projects.find((entry) => entry.id === activeProjectId) ?? snapshot?.project
+                }
+              />
             ) : !snapshot ? (
               <LoadingState />
             ) : pluginSelection ? (
@@ -1766,6 +1851,7 @@ function Topbar({
   activeProjectId,
   onProjectSelect,
   onProjectForget,
+  onProjectAdd,
   onMenu,
   onRefresh,
   theme,
@@ -1826,6 +1912,7 @@ function Topbar({
             ),
           }))}
         />
+        {onProjectAdd && <AddProjectButton onAdd={onProjectAdd} />}
         {projects.some((entry) => entry.availability === 'missing' && !entry.isCurrent) && (
           <Popover
             trigger="click"
@@ -4097,6 +4184,9 @@ function AntSidebar({
   settingsOpen,
   onSettings,
   onPluginSelect,
+  managementPage,
+  repositoriesDisabled,
+  onManagementSelect,
   onCollapse,
   onExpand,
   onClose,
@@ -4120,7 +4210,7 @@ function AntSidebar({
           mode="inline"
           inlineCollapsed={collapsed}
           inlineIndent={12}
-          selectedKeys={pluginSelection || !workflow ? [] : [workflow]}
+          selectedKeys={managementPage || pluginSelection || !workflow ? [] : [workflow]}
           items={[
             { key: 'classic', icon: <BranchesOutlined />, label: 'Classic 工作流' },
             { key: 'native', icon: <FileTextOutlined />, label: 'Native 工作流' },
@@ -4139,7 +4229,7 @@ function AntSidebar({
           mode="inline"
           inlineCollapsed={collapsed}
           inlineIndent={12}
-          selectedKeys={pluginSelection ? [pluginSelection] : []}
+          selectedKeys={!managementPage && pluginSelection ? [pluginSelection] : []}
           items={pluginPages.map((page) => {
             const statusLabel = page.globallyDisabled
               ? '停用'
@@ -4173,6 +4263,42 @@ function AntSidebar({
           }}
         />
       </div>
+      {onManagementSelect && (
+        <div className="dashboard-sidebar-group">
+          <div className="dashboard-sidebar-label">项目管理</div>
+          <Menu
+            className="dashboard-sidebar-menu dashboard-project-menu"
+            mode="inline"
+            inlineCollapsed={collapsed}
+            inlineIndent={12}
+            selectedKeys={managementPage ? [managementPage] : []}
+            items={[
+              {
+                key: 'settings',
+                icon: <SettingOutlined />,
+                label: '项目配置',
+                disabled: repositoriesDisabled,
+              },
+              {
+                key: 'repositories',
+                icon: <FolderOpenOutlined />,
+                label: '仓库管理',
+                disabled: repositoriesDisabled,
+              },
+              {
+                key: 'kubernetes',
+                icon: <CloudServerOutlined />,
+                label: 'Kubernetes',
+                disabled: repositoriesDisabled,
+              },
+            ]}
+            onClick={({ key }) => {
+              onManagementSelect(key);
+              onClose();
+            }}
+          />
+        </div>
+      )}
     </>
   );
   const settingsButton = (

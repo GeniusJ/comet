@@ -551,7 +551,7 @@ describe('dashboard web source contracts', () => {
       /useEffect\(\(\) => \{\s*if \(!useDemo\) return undefined;[\s\S]*?\}, \[demoPluginPages, pluginSelection, useDemo\]\);/,
     );
     const pluginSelectHandler = source.match(
-      /onPluginSelect=\{\(pluginId\) => \{[\s\S]*?\}\}\s*onCollapse=/,
+      /onPluginSelect=\{\(pluginId\) => \{[\s\S]*?\}\}(?=\s+\w+=)/,
     );
 
     expect(pluginSelectHandler?.[0]).toMatch(

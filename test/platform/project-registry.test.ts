@@ -10,6 +10,7 @@ import {
   findProjectRegistryEntry,
   listProjectRegistryEntries,
   readProjectRegistry,
+  registerProjectDirectory,
   repairProjectRegistry,
   removeProjectInstallation,
   upsertProjectInstallation,
@@ -30,6 +31,47 @@ describe('project installation registry', () => {
 
   afterEach(async () => {
     await fs.rm(tmpDir, { recursive: true, force: true });
+  });
+
+  it('registers concurrent Dashboard directories without losing installations or duplicating paths', async () => {
+    const projects = ['installed', 'first', 'second'].map((name) => path.join(tmpDir, name));
+    await Promise.all(projects.map((project) => fs.mkdir(project)));
+    const installed = await upsertProjectInstallation(
+      projects[0],
+      [{ platform: 'codex', language: 'zh' }],
+      'init',
+      { homeDir },
+    );
+    await Promise.all(
+      [...projects, projects[1]].map((project) => registerProjectDirectory(project, { homeDir })),
+    );
+    const registry = await readProjectRegistry({ homeDir, strict: true });
+    expect(registry.projects).toHaveLength(3);
+    expect(
+      registry.projects.find((entry) => entry.canonicalPath === installed.canonicalPath),
+    ).toEqual(installed);
+    expect(registry.projects.filter((entry) => entry.lastSource === 'dashboard')).toHaveLength(2);
+    expect(await fs.readdir(projects[1])).toEqual([]);
+  });
+
+  it('restores a project registered through a deleted alias when its actual directory is added', async () => {
+    const target = path.join(tmpDir, 'actual-project');
+    const alias = path.join(tmpDir, 'deleted-alias');
+    await fs.mkdir(target);
+    await fs.symlink(target, alias, process.platform === 'win32' ? 'junction' : 'dir');
+    const installed = await upsertProjectInstallation(
+      alias,
+      [{ platform: 'codex', language: 'zh' }],
+      'init',
+      { homeDir },
+    );
+    await fs.unlink(alias);
+    const restored = await registerProjectDirectory(await fs.realpath(target), { homeDir });
+    expect(restored.path).toBe(await fs.realpath(target));
+    expect(restored.lastTargets).toEqual(installed.lastTargets);
+    expect(restored.lastSource).toBe(installed.lastSource);
+    expect(restored.addedAt).toBe(installed.addedAt);
+    expect((await readProjectRegistry({ homeDir })).projects).toHaveLength(1);
   });
 
   it('finds a missing project through an existing parent alias even when registered by its real path', async () => {

@@ -54,6 +54,1090 @@ test.describe('Dashboard project selection', () => {
     });
   });
 
+  test('opens project settings in the main area, retries initialization and edits its config', async ({
+    page,
+  }) => {
+    const config = {
+      path: '.comet/config.yaml',
+      revision: 'initialized',
+      schema: 'comet.project.v1',
+      defaultWorkflow: 'native',
+      workflows: ['native'],
+      ambientResume: true,
+      hookAllowPaths: [],
+      knowledge: { provider: 'local', localInclude: [], maxFileMb: 1, maxTotalMb: 32 },
+      native: {
+        artifactRoot: 'docs',
+        language: 'zh-CN',
+        clarificationMode: 'sequential',
+        archiveConfirmation: 'required',
+        maxVerifyFailures: 3,
+      },
+      classic: {
+        artifactLayout: 'docs',
+        language: 'zh-CN',
+        contextCompression: 'off',
+        reviewMode: 'standard',
+        autoTransition: false,
+      },
+    };
+    let attempts = 0;
+    let saved = false;
+    await page.route('**/api/dashboard/projects/*/initialization', async (route) => {
+      expect(route.request().url()).toContain('/path-0/');
+      if (route.request().method() === 'POST') {
+        attempts++;
+        expect(route.request().postDataJSON()).toEqual({
+          platform: 'codex',
+          workflow: 'native',
+          language: 'zh',
+          artifactRoot: 'docs',
+          overwrite: false,
+          codegraph: 'skip',
+        });
+        await route.fulfill({
+          json:
+            attempts === 1
+              ? {
+                  status: 'incomplete',
+                  failures: [{ component: 'Hook', reason: '请检查本地设置' }],
+                }
+              : { status: 'complete', failures: [] },
+        });
+      } else
+        await route.fulfill({
+          json: {
+            available: true,
+            busy: false,
+            running: false,
+            config: attempts >= 2 ? config : null,
+            platforms: [{ id: 'codex', name: 'Codex' }],
+          },
+        });
+    });
+    await page.route('**/api/dashboard/projects/*/config', async (route) => {
+      if (route.request().method() === 'POST') {
+        expect(route.request().postDataJSON().expectedRevision).toBe('initialized');
+        saved = true;
+      }
+      await route.fulfill({ json: config });
+    });
+    await page.goto('/');
+    await page.getByRole('menuitem', { name: '项目配置' }).click();
+    const settings = page.getByRole('region', { name: '项目配置', exact: true });
+    await expect(settings).toBeVisible();
+    await expect(page.getByRole('dialog')).toHaveCount(0);
+    await expect(settings.getByText(projects[0].path, { exact: false })).toBeVisible();
+    await settings.getByRole('button', { name: '初始化 Comet', exact: true }).click();
+    await expect(settings.getByText('Comet 初始化未完成', { exact: true })).toBeVisible();
+    await expect(settings.getByText('Hook：请检查本地设置', { exact: true })).toBeVisible();
+    await settings.getByRole('button', { name: '初始化 Comet', exact: true }).click();
+    await expect(settings.getByText('Comet 初始化完成', { exact: true })).toBeVisible();
+    await settings.getByRole('tab', { name: 'Comet 配置', exact: true }).click();
+    await settings.getByRole('button', { name: '保存 Comet 配置' }).click();
+    await expect.poll(() => saved).toBe(true);
+    expect(attempts).toBe(2);
+  });
+
+  test('project settings remain usable on narrow screens', async ({ page }) => {
+    await page.route('**/api/dashboard/projects/*/initialization', async (route) => {
+      await route.fulfill({
+        json: {
+          available: true,
+          config: null,
+          busy: false,
+          running: false,
+          platforms: [{ id: 'codex', name: 'Codex' }],
+        },
+      });
+    });
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.goto('/');
+    await page.getByRole('button', { name: '打开导航', exact: true }).click();
+    await page.getByRole('menuitem', { name: '项目配置' }).click();
+    const settings = page.getByRole('region', { name: '项目配置', exact: true });
+    await expect(settings).toBeVisible();
+    await settings.getByRole('textbox', { name: 'Native 文档根目录' }).fill('design');
+    await expect(settings.getByRole('textbox', { name: 'Native 文档根目录' })).toHaveValue(
+      'design',
+    );
+    await expect(settings.getByRole('button', { name: '初始化 Comet', exact: true })).toBeEnabled();
+    expect(
+      await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth),
+    ).toBe(true);
+  });
+
+  test('adds a manually entered path and switches through the existing workflow', async ({
+    page,
+  }) => {
+    await page.route('**/api/dashboard/projects', async (route) => {
+      if (route.request().method() === 'POST') {
+        expect(route.request().postDataJSON()).toEqual({ path: projects[1].path });
+        await route.fulfill({
+          json: { projectId: 'path-1', directory: { currentProjectId: 'path-0', projects } },
+        });
+      } else await route.fulfill({ json: { currentProjectId: 'path-0', projects } });
+    });
+    await page.goto('/');
+    await expect(page.getByRole('button', { name: /^Git 未提交 0 / })).toBeVisible();
+    await page.getByRole('button', { name: '添加项目', exact: true }).click();
+    const dialog = page.getByRole('dialog', { name: '添加项目' });
+    await dialog.getByRole('textbox', { name: '项目绝对路径' }).fill(projects[1].path);
+    await dialog.getByRole('button', { name: '添加并切换' }).click();
+    await expect(dialog).toHaveCount(0);
+    await expect(page.getByRole('button', { name: /^Git 未提交 1 / })).toBeVisible();
+    await page.getByRole('button', { name: '添加项目', exact: true }).click();
+    await dialog.getByRole('textbox', { name: '项目绝对路径' }).fill(projects[1].path);
+    await dialog.getByRole('button', { name: '添加并切换' }).click();
+    await expect(dialog).toHaveCount(0);
+    await expect(page.getByRole('button', { name: /^Git 未提交 1 / })).toBeVisible();
+  });
+
+  test('keeps manual entry after picker cancellation or failure and accepts a selected folder', async ({
+    page,
+  }) => {
+    let attempt = 0;
+    await page.route('**/api/dashboard/projects/choose-directory', async (route) => {
+      attempt++;
+      await route.fulfill(
+        attempt === 2
+          ? { status: 503, json: { error: '无法打开，请手动输入路径。' } }
+          : { json: { path: attempt === 1 ? null : projects[1].path } },
+      );
+    });
+    await page.goto('/');
+    await page.getByRole('button', { name: '添加项目', exact: true }).click();
+    const dialog = page.getByRole('dialog', { name: '添加项目' });
+    const input = dialog.getByRole('textbox', { name: '项目绝对路径' });
+    await input.fill('/manual/path');
+    await dialog.getByRole('button', { name: '选择文件夹' }).click();
+    await expect(dialog.getByRole('button', { name: '选择文件夹' })).toBeEnabled();
+    await expect(input).toHaveValue('/manual/path');
+    await dialog.getByRole('button', { name: '选择文件夹' }).click();
+    await expect(dialog.getByRole('alert')).toContainText('手动输入');
+    await expect(input).toBeEditable();
+    await dialog.getByRole('button', { name: '选择文件夹' }).click();
+    await expect(input).toHaveValue(projects[1].path);
+    await dialog.getByRole('button', { name: '取消', exact: true }).click();
+    await expect(dialog).toHaveCount(0);
+  });
+
+  test('maintains multiple Git bindings, clones code, edits a branch and unbinds while preserving files', async ({
+    page,
+  }) => {
+    let repositories: Array<Record<string, unknown>> = [];
+    const actions: string[] = [];
+    await page.route('**/api/dashboard/projects/path-0/repositories', async (route) => {
+      if (route.request().method() === 'GET') {
+        await route.fulfill({ json: { workspace: '/worktrees/project-0', repositories } });
+        return;
+      }
+      const body = route.request().postDataJSON();
+      actions.push(body.action);
+      let result;
+      if (body.action === 'bind') {
+        repositories.push({
+          ...body.repository,
+          id: `repo-${repositories.length + 1}`,
+          relativePath: `engineering/${body.repository.kind === 'backend' ? 'backed' : 'frontend'}/${body.repository.name}`,
+          lastSyncedAt: null,
+        });
+      } else if (body.action === 'sync') {
+        repositories = repositories.map((entry) => ({
+          ...entry,
+          lastSyncedAt: '2026-10-21T00:00:00Z',
+        }));
+        result = { action: 'cloned', branch: 'main', head: '123abcd' };
+      } else if (body.action === 'edit') {
+        repositories = repositories.map((entry) =>
+          entry.id === body.id ? { ...entry, ...body.repository } : entry,
+        );
+      } else if (body.action === 'unbind')
+        repositories = repositories.filter((entry) => entry.id !== body.id);
+      await route.fulfill({
+        json: { workspace: '/worktrees/project-0', repositories, ...(result ? { result } : {}) },
+      });
+    });
+    await page.route('**/api/dashboard/projects/path-1/repositories', (route) =>
+      route.fulfill({ json: { workspace: '/worktrees/project-1', repositories: [] } }),
+    );
+    await page.goto('/');
+    await expect(
+      page.locator('header').getByRole('button', { name: '项目维护', exact: true }),
+    ).toHaveCount(0);
+    await expect(
+      page.locator('.dashboard-sidebar-navigation').getByText('项目管理', { exact: true }),
+    ).toBeVisible();
+    await page.getByRole('menuitem', { name: '仓库管理' }).click();
+    const dialog = page.getByRole('region', { name: '仓库管理', exact: true });
+    await expect(page.getByRole('dialog')).toHaveCount(0);
+    await expect(dialog.getByText('尚未绑定 Git 仓库', { exact: true })).toBeVisible();
+    await dialog.getByRole('button', { name: '新增仓库', exact: true }).click();
+    const editor = page.getByRole('dialog', { name: /^新增仓库绑定/ });
+    await editor
+      .getByLabel('Git 仓库地址', { exact: true })
+      .fill('git@example.com:team/service.git');
+    await editor.getByLabel('工程名', { exact: true }).fill('service');
+    await editor.getByLabel('分支（选填）', { exact: true }).fill('main');
+    await editor.getByRole('combobox', { name: '标签', exact: true }).fill('核心服务');
+    await editor.getByRole('combobox', { name: '标签', exact: true }).press('Enter');
+    await expect(
+      editor.getByText('代码目录：engineering/backed/service', { exact: true }),
+    ).toBeVisible();
+    await editor.getByRole('button', { name: '保存并拉取', exact: true }).click();
+    const entry = dialog.getByRole('row', { name: '仓库 service', exact: true });
+    await expect(entry).toContainText('engineering/backed/service');
+    await expect(entry).toContainText('核心服务');
+    for (const label of ['拉取代码', '编辑绑定', '解除绑定']) {
+      const button = entry.getByRole('button', { name: label, exact: true });
+      await expect(button).toHaveText('');
+      await button.hover();
+      await expect(page.getByRole('tooltip', { name: label, exact: true })).toBeVisible();
+    }
+    await dialog.getByText('仓库管理', { exact: true }).hover();
+    await expect(dialog.getByText(/代码已克隆到/)).toBeVisible();
+    await dialog.getByRole('button', { name: '新增仓库', exact: true }).click();
+    await editor
+      .getByLabel('Git 仓库地址', { exact: true })
+      .fill('https://example.com/team/web.git');
+    await editor.getByLabel('工程名', { exact: true }).fill('web');
+    await editor.getByRole('combobox', { name: '工程类型' }).click();
+    await page.locator('.ant-select-item-option').filter({ hasText: '前端' }).click();
+    await editor.getByRole('button', { name: '仅保存绑定', exact: true }).click();
+    await expect(dialog.getByRole('row', { name: '仓库 web', exact: true })).toContainText(
+      'engineering/frontend/web',
+    );
+    await expect(dialog.getByRole('row', { name: /^仓库 / })).toHaveCount(2);
+    await expect(dialog.getByRole('row', { name: '仓库 web', exact: true })).not.toContainText(
+      '核心服务',
+    );
+    await dialog
+      .getByRole('row', { name: '仓库 web', exact: true })
+      .getByRole('button', { name: '拉取代码', exact: true })
+      .scrollIntoViewIfNeeded();
+    await expect(dialog.getByText('仓库管理', { exact: true })).toBeInViewport();
+    await expect(dialog.locator('.dashboard-repositories-body')).toHaveCSS('overflow-y', 'auto');
+
+    await entry.getByRole('button', { name: '编辑绑定', exact: true }).click();
+    const editDialog = page.getByRole('dialog', { name: /^编辑仓库绑定/ });
+    await editDialog.getByLabel('分支（选填）', { exact: true }).fill('develop');
+    await editDialog.getByRole('button', { name: '仅保存绑定', exact: true }).click();
+    await expect(entry).toContainText('develop');
+    await entry.getByRole('button', { name: '解除绑定', exact: true }).click();
+    const confirm = page.getByRole('dialog', { name: '解除仓库绑定？' });
+    await expect(confirm).toContainText('本地代码会保留');
+    await confirm.getByRole('button', { name: '解除绑定', exact: true }).click();
+    await expect(entry).toHaveCount(0);
+    expect(actions).toEqual(['bind', 'sync', 'bind', 'edit', 'unbind']);
+    await page.getByRole('menuitem', { name: 'Classic 工作流' }).click();
+    await expect(dialog).toHaveCount(0);
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.getByRole('button', { name: '打开导航', exact: true }).click();
+    await page
+      .getByRole('dialog', { name: 'Comet 工作台' })
+      .getByRole('menuitem', { name: '仓库管理' })
+      .click();
+    await expect(dialog.getByRole('row', { name: '仓库 web', exact: true })).toBeVisible();
+    await expect(dialog.getByLabel('Git 仓库地址', { exact: true })).toHaveCount(0);
+    const pullButton = dialog
+      .getByRole('row', { name: '仓库 web', exact: true })
+      .getByRole('button', { name: '拉取代码', exact: true });
+    await pullButton.scrollIntoViewIfNeeded();
+    await expect(pullButton).toBeInViewport();
+    await expect(dialog.getByText('仓库管理', { exact: true })).toBeInViewport();
+
+    const bounds = await dialog.boundingBox();
+    expect(bounds!.x).toBeGreaterThanOrEqual(0);
+    expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(390);
+    await dialog.getByRole('button', { name: '新增仓库', exact: true }).click();
+    await expect(editor.getByLabel('工程名', { exact: true })).toHaveValue('');
+    await expect(editor.getByRole('button', { name: '仅保存绑定', exact: true })).toBeInViewport();
+    await expect(editor.locator('.ant-modal-body')).toHaveCSS('overflow-y', 'auto');
+    await editor.getByRole('button', { name: '取消', exact: true }).click();
+    await expect(editor).toHaveCount(0);
+    await page.setViewportSize({ width: 1440, height: 1000 });
+    await page.locator('.comet-project-select').click();
+    await page.getByText(projects[1].path, { exact: true }).click();
+    await expect(dialog).toContainText('/worktrees/project-1');
+    await expect(dialog.getByText('尚未绑定 Git 仓库', { exact: true })).toBeVisible();
+    await expect(dialog.getByRole('row', { name: /^仓库 / })).toHaveCount(0);
+  });
+
+  test('initializes selected local repositories on the main page and remembers skipping by project', async ({
+    page,
+  }) => {
+    const local = [
+      {
+        name: 'service',
+        kind: 'backend',
+        remote: 'git@example.com:team/service.git',
+        branch: 'develop',
+        relativePath: 'engineering/backed/service',
+      },
+      {
+        name: 'web',
+        kind: 'frontend',
+        remote: 'https://example.com/web.git',
+        branch: 'main',
+        relativePath: 'engineering/frontend/web',
+      },
+      {
+        name: 'missing',
+        kind: 'backend',
+        remote: '',
+        branch: '',
+        relativePath: 'engineering/backed/missing',
+        issue: 'origin 缺失，请在本地配置后重新扫描。',
+      },
+    ];
+    const states: Record<
+      string,
+      { initialized: boolean; repositories: Array<Record<string, unknown>> }
+    > = {
+      'path-0': { initialized: false, repositories: [] },
+      'path-1': { initialized: false, repositories: [] },
+    };
+    let scans = 0;
+    const mutations: unknown[] = [];
+    await page.route('**/api/dashboard/projects/*/repositories{,/discovery}', async (route) => {
+      const url = new URL(route.request().url());
+      const projectId = url.pathname.split('/')[4];
+      const state = states[projectId];
+      if (url.pathname.endsWith('/discovery')) {
+        scans++;
+        await route.fulfill({
+          json: {
+            candidates: local.filter(
+              (entry) =>
+                !state.repositories.some((bound) => bound.relativePath === entry.relativePath),
+            ),
+          },
+        });
+        return;
+      }
+      if (route.request().method() === 'POST') {
+        const body = route.request().postDataJSON();
+        mutations.push(body);
+        expect(body.action).toBe('initialize');
+        state.initialized = true;
+        state.repositories = local
+          .filter((entry) => body.paths.includes(entry.relativePath))
+          .map((entry) => ({ ...entry, id: entry.name, lastSyncedAt: null }));
+      }
+      await route.fulfill({ json: { ...state, workspace: `/worktrees/${projectId}` } });
+    });
+    await page.goto('/');
+    await page.getByRole('menuitem', { name: '仓库管理' }).click();
+    const workspace = page.getByRole('region', { name: '仓库管理', exact: true });
+    await expect(page.getByRole('dialog')).toHaveCount(0);
+    await expect(workspace.getByText('初始化本地仓库', { exact: true })).toBeVisible();
+    await expect(workspace.getByRole('checkbox', { name: 'missing（后端）' })).toBeDisabled();
+    await workspace.getByRole('checkbox', { name: 'service（后端）' }).check();
+    await workspace.getByRole('button', { name: '纳入所选仓库（1）', exact: true }).click();
+    await expect(workspace.getByRole('row', { name: '仓库 service', exact: true })).toBeVisible();
+    await expect(workspace.getByRole('row', { name: '仓库 web', exact: true })).toHaveCount(0);
+    await expect(workspace.getByText(/未执行代码拉取/)).toBeVisible();
+    await page.getByRole('menuitem', { name: 'Classic 工作流' }).click();
+    await expect(workspace).toHaveCount(0);
+    await page.getByRole('menuitem', { name: '仓库管理' }).click();
+    await expect(workspace.getByRole('row', { name: '仓库 service', exact: true })).toBeVisible();
+    expect(scans).toBe(1);
+    await workspace.getByRole('button', { name: '扫描本地仓库', exact: true }).click();
+    await expect(workspace.getByRole('checkbox', { name: 'web（前端）' })).toBeVisible();
+    expect(scans).toBe(2);
+    await page.locator('.comet-project-select').click();
+    await page.getByText(projects[1].path, { exact: true }).click();
+    await expect(workspace.getByText('初始化本地仓库', { exact: true })).toBeVisible();
+    await expect(workspace.getByRole('row', { name: /^仓库 / })).toHaveCount(0);
+    await workspace.getByRole('button', { name: '暂不添加', exact: true }).click();
+    await expect(workspace.getByText('初始化本地仓库', { exact: true })).toHaveCount(0);
+    await page.getByRole('menuitem', { name: 'Classic 工作流' }).click();
+    await page.getByRole('menuitem', { name: '仓库管理' }).click();
+    await expect(workspace.getByText('尚未绑定 Git 仓库', { exact: true })).toBeVisible();
+    expect(scans).toBe(3);
+    expect(mutations).toEqual([
+      { action: 'initialize', paths: ['engineering/backed/service'] },
+      { action: 'initialize', paths: [] },
+    ]);
+  });
+
+  test('filters repository rows by keyword, type and multiple persisted tags and edits bindings in a modal', async ({
+    page,
+  }) => {
+    let repositories = Array.from({ length: 13 }, (_, index) => ({
+      id: `repo-${index}`,
+      name: index === 0 ? 'ticket-service' : index === 1 ? 'ticket-web' : `service-${index}`,
+      remote: `https://example.com/team/repo-${index}.git`,
+      kind: index === 1 ? 'frontend' : 'backend',
+      branch: index === 0 ? 'develop' : 'main',
+      tags: index === 0 ? ['核心', '票务'] : index === 1 ? ['票务'] : [],
+      relativePath: `engineering/${index === 1 ? 'frontend' : 'backed'}/repo-${index}`,
+      lastSyncedAt: null,
+    }));
+    let failNext = true;
+    await page.route('**/api/dashboard/projects/path-0/repositories', async (route) => {
+      if (route.request().method() === 'POST') {
+        const body = route.request().postDataJSON();
+        expect(body.action).toBe('edit');
+        if (failNext) {
+          failNext = false;
+          await route.fulfill({ status: 409, json: { error: '保存失败，请重试' } });
+          return;
+        }
+        repositories = repositories.map((entry) =>
+          entry.id === body.id ? { ...entry, ...body.repository } : entry,
+        );
+      }
+      await route.fulfill({
+        json: { workspace: '/worktrees/project-0', initialized: true, repositories },
+      });
+    });
+    await page.goto('/');
+    await page.getByRole('menuitem', { name: '仓库管理' }).click();
+    const workspace = page.getByRole('region', { name: '仓库管理', exact: true });
+    const rows = workspace.getByRole('row', { name: /^仓库 / });
+    const query = workspace.getByRole('textbox', { name: '查找仓库', exact: true });
+    await expect(rows).toHaveCount(10);
+    await workspace.locator('.ant-pagination-item-2').click();
+    await expect(rows).toHaveCount(3);
+    await query.fill('TICKET');
+    await expect(rows).toHaveCount(2);
+    await workspace.getByRole('combobox', { name: '筛选工程类型', exact: true }).click();
+    await page.locator('.ant-select-item-option').filter({ hasText: '前端' }).click();
+    await expect(rows).toHaveCount(1);
+    await expect(rows).toHaveAttribute('aria-label', '仓库 ticket-web');
+    await workspace.getByRole('button', { name: '重置筛选', exact: true }).click();
+    await workspace.getByRole('combobox', { name: '筛选标签', exact: true }).click();
+    await page.locator('.ant-select-item-option').filter({ hasText: '票务' }).click();
+    await expect(rows).toHaveCount(2);
+    await page.locator('.ant-select-item-option').filter({ hasText: '核心' }).click();
+    await page.keyboard.press('Escape');
+    await expect(rows).toHaveCount(1);
+    await query.fill('develop');
+    await expect(rows).toHaveCount(1);
+    await query.fill('not-found');
+    await expect(workspace.getByText('没有符合条件的仓库', { exact: true })).toBeVisible();
+    await workspace.getByRole('button', { name: '重置筛选', exact: true }).click();
+    const entry = workspace.getByRole('row', { name: '仓库 ticket-service', exact: true });
+    await entry.getByRole('button', { name: '编辑绑定', exact: true }).click();
+    const editor = page.getByRole('dialog', { name: /^编辑仓库绑定/ });
+    await expect(editor.getByLabel('工程名', { exact: true })).toHaveValue('ticket-service');
+    const tags = editor.getByRole('combobox', { name: '标签', exact: true });
+    await tags.fill('支付');
+    await tags.press('Enter');
+    await editor.getByRole('button', { name: '仅保存绑定', exact: true }).click();
+    await expect(editor.getByRole('alert')).toContainText('保存失败');
+    await expect(editor.getByText('支付', { exact: true })).toBeVisible();
+    await editor.getByRole('button', { name: '仅保存绑定', exact: true }).click();
+    await expect(editor).toHaveCount(0);
+    await expect(entry).toContainText('支付');
+    await page.reload();
+    await page.getByRole('menuitem', { name: '仓库管理' }).click();
+    await workspace.getByRole('combobox', { name: '筛选标签', exact: true }).click();
+    await page.locator('.ant-select-item-option').filter({ hasText: '支付' }).click();
+    await page.keyboard.press('Escape');
+    await expect(rows).toHaveCount(1);
+    await entry.getByRole('button', { name: '编辑绑定', exact: true }).click();
+    await editor
+      .locator('.ant-select-selection-item')
+      .filter({ hasText: '票务' })
+      .locator('.ant-select-selection-item-remove')
+      .click();
+    await editor.getByRole('button', { name: '仅保存绑定', exact: true }).click();
+    await expect(entry).not.toContainText('票务');
+    await workspace.getByRole('button', { name: '新增仓库', exact: true }).click();
+    const add = page.getByRole('dialog', { name: /^新增仓库绑定/ });
+    await expect(add.getByLabel('工程名', { exact: true })).toHaveValue('');
+    await add.getByRole('button', { name: '取消', exact: true }).click();
+    expect(repositories).toHaveLength(13);
+  });
+
+  test('configures Kubernetes from the engineering list and keeps workspaces isolated', async ({
+    page,
+  }) => {
+    let repository: Record<string, unknown> = {
+      id: 'core',
+      name: 'core',
+      kind: 'backend',
+      remote: 'https://example.com/core.git',
+      branch: 'main',
+      tags: ['核心'],
+      relativePath: 'engineering/backed/core',
+      kubernetes: null,
+      ke_pipeline: null,
+    };
+    await page.route('**/api/dashboard/projects/path-0/repositories', async (route) => {
+      if (route.request().method() === 'POST') {
+        const body = route.request().postDataJSON();
+        expect(body.action).toBe('edit');
+        expect(body.id).toBe('core');
+        repository = { ...repository, ...body.repository };
+      }
+      await route.fulfill({
+        json: { workspace: '/worktrees/project-0', initialized: true, repositories: [repository] },
+      });
+    });
+    await page.route('**/api/dashboard/projects/path-1/repositories', (route) =>
+      route.fulfill({ json: { workspace: '/worktrees/project-1', repositories: [] } }),
+    );
+    await page.route('**/api/dashboard/projects/path-0/kubernetes', (route) =>
+      route.fulfill({ json: { runtimes: [] } }),
+    );
+    await page.route('**/kubernetes/contexts', (route) =>
+      route.fulfill({ json: { contexts: ['test-cluster'] } }),
+    );
+    await page.goto('/');
+    await page.getByRole('menuitem', { name: /Kubernetes$/ }).click();
+    const region = page.getByRole('region', { name: 'Kubernetes', exact: true });
+    const row = region.getByRole('row', { name: 'Kubernetes 工程 core', exact: true });
+    await expect(row).toBeVisible();
+    await expect(row.getByRole('button', { name: '发布', exact: true })).toBeDisabled();
+    await row.getByRole('button', { name: '配置', exact: true }).click();
+    const editor = page.getByRole('dialog', { name: /^编辑仓库绑定/ });
+    await expect(editor.getByRole('tab', { name: 'Kubernetes 发布', exact: true })).toHaveAttribute(
+      'aria-selected',
+      'true',
+    );
+    await editor.getByRole('switch', { name: '配置 KubeEase 发布流水线', exact: true }).click();
+    await editor.getByLabel('租户', { exact: true }).fill('jstest');
+    await editor.getByLabel('KubeEase 项目', { exact: true }).fill('jstytest');
+    await editor.getByLabel('应用', { exact: true }).fill('core');
+    await editor.getByLabel('流水线', { exact: true }).fill('coreceshiqianyi');
+    await editor.getByLabel('流水线参数（JSON）', { exact: true }).fill('[]');
+    await editor.getByRole('switch', { name: '配置 Kubernetes 运行环境', exact: true }).click();
+    await editor.getByRole('button', { name: '读取本机集群上下文', exact: true }).click();
+    await editor.getByRole('combobox', { name: /集群上下文$/ }).fill('test-cluster');
+    await editor.getByRole('button', { name: '保存配置', exact: true }).click();
+    await expect(editor.getByText('请输入 JSON 对象，例如 {}。', { exact: true })).toBeVisible();
+    await editor.getByLabel('流水线参数（JSON）', { exact: true }).fill('{"release":"test"}');
+    await editor.getByRole('button', { name: '保存配置', exact: true }).click();
+    await expect(editor).toHaveCount(0);
+    expect(repository.ke_pipeline).toEqual({
+      base_url: 'http://pro.kubeease.cn',
+      tenant: 'jstest',
+      project: 'jstytest',
+      application: 'core',
+      environment: '',
+      pipeline: 'coreceshiqianyi',
+      action: 'run',
+      arguments: { release: 'test' },
+    });
+    expect(repository.kubernetes).toEqual({
+      context: 'test-cluster',
+      namespace: 'default',
+      deployment: 'core',
+      container: '',
+    });
+    await expect(row).toContainText('coreceshiqianyi');
+    await row.getByRole('button', { name: '配置', exact: true }).click();
+    await expect(editor.getByLabel('租户', { exact: true })).toHaveValue('jstest');
+    await expect(editor.getByLabel('流水线参数（JSON）', { exact: true })).toHaveValue(
+      '{\n  "release": "test"\n}',
+    );
+    await editor.getByRole('button', { name: '取消', exact: true }).click();
+    await region
+      .getByRole('textbox', { name: '查找 Kubernetes 工程', exact: true })
+      .fill('missing');
+    await expect(region.getByText('没有符合条件的工程', { exact: true })).toBeVisible();
+    await region.getByRole('textbox', { name: '查找 Kubernetes 工程', exact: true }).fill('核心');
+    await expect(row).toBeVisible();
+    await row.getByRole('button', { name: '流水线日志', exact: true }).click();
+    const details = page.getByRole('dialog', { name: /^Kubernetes · core/ });
+    await expect(details.getByText('请选择需要查看的运行记录', { exact: true })).toBeVisible();
+    await details.getByRole('button', { name: '关闭', exact: true }).click();
+    await page.locator('.comet-project-select').click();
+    await page
+      .locator('.comet-project-select-dropdown .comet-project-option')
+      .filter({ hasText: '/worktrees/project-1' })
+      .first()
+      .click();
+    await expect(region.locator('.dashboard-repository-location').first()).toContainText(
+      '/worktrees/project-1',
+    );
+    await expect(region.getByRole('row', { name: /^Kubernetes 工程 / })).toHaveCount(0);
+  });
+
+  test('KE release confirms edited parameters and keeps exact runtime logs with environment selection', async ({
+    page,
+  }) => {
+    const calls: Record<string, unknown>[] = [];
+    const repository = {
+      id: 'core',
+      name: 'core',
+      kind: 'backend',
+      tags: [],
+      ke_pipeline: {
+        base_url: 'https://ke.example.invalid',
+        tenant: 'tenant',
+        project: 'project',
+        application: 'core',
+        pipeline: 'release',
+        environment: '',
+      },
+    };
+    await page.route('**/api/dashboard/projects/path-0/repositories', (route) =>
+      route.fulfill({ json: { repositories: [repository] } }),
+    );
+    await page.route('**/api/dashboard/projects/path-0/kubernetes', async (route) => {
+      const body = route.request().postDataJSON();
+      calls.push(body);
+      const results: Record<string, unknown> = {
+        'ke-prepare': {
+          confirmation: 'fixture',
+          parameters: [{ name: 'branch', label: '发布分支', value: 'online_test' }],
+        },
+        'ke-run': { submitted: true, runtime: 'run-exact' },
+        'ke-runtimes': {
+          runtimes: [
+            { name: 'run-newest', phase: 1 },
+            { name: 'run-exact', phase: 3 },
+          ],
+        },
+        'ke-runtime': {
+          runtime: body.runtime,
+          phase: 3,
+          stages: [{ displayName: '构建', phase: 3, podName: 'build-pod', message: 'exit code 1' }],
+        },
+        'ke-pipeline-logs': { logs: `build failure from ${body.runtime} <script>literal</script>` },
+        'ke-environments': { environments: ['dev', 'test'] },
+        'ke-status': {
+          desiredReplicas: 1,
+          readyReplicas: 1,
+          updatedReplicas: 1,
+          containers: [],
+          pods: [{ name: 'core-pod', phase: 'Running', restarts: 1, containers: ['main'] }],
+        },
+        'ke-logs': {
+          logs: `${body.environment} previous=${body.previous}`,
+          checkedAt: '2026-10-21T00:00:00Z',
+        },
+      };
+      await route.fulfill({ json: results[body.action] });
+    });
+    await page.goto('/');
+    await page.getByRole('menuitem', { name: /Kubernetes$/ }).click();
+    await page.getByRole('button', { name: '发布', exact: true }).click();
+    const release = page.getByRole('dialog', { name: /^发布 · core/ });
+    await expect(release.getByLabel('发布参数 branch')).toHaveValue('online_test');
+    expect(calls.some((r) => r.action === 'ke-run')).toBe(false);
+    await release.getByLabel('发布参数 branch').fill('release_test');
+    await release.getByRole('button', { name: '取消', exact: true }).click();
+    expect(calls.some((r) => r.action === 'ke-run')).toBe(false);
+    await page.getByRole('button', { name: '发布', exact: true }).click();
+    await release.getByLabel('发布参数 branch').fill('release_test');
+    await release.getByRole('button', { name: '确认发布', exact: true }).click();
+    const details = page.getByRole('dialog', { name: /^Kubernetes · core/ });
+    await expect(details.getByLabel('流水线节点日志', { exact: true })).toContainText('run-exact');
+    await expect(details.getByLabel('流水线节点日志', { exact: true })).toContainText(
+      '<script>literal</script>',
+    );
+    expect(calls.filter((r) => r.action === 'ke-run')).toEqual([
+      {
+        action: 'ke-run',
+        repositoryId: 'core',
+        confirmation: 'fixture',
+        confirmed: true,
+        arguments: { branch: 'release_test' },
+      },
+    ]);
+    expect(
+      calls.filter((r) => r.action === 'ke-runtime').every((r) => r.runtime === 'run-exact'),
+    ).toBe(true);
+    await details.getByRole('tab', { name: '状态与容器日志', exact: true }).click();
+    await expect(
+      details.getByText('请选择 KE 环境后查看容器状态与日志。', { exact: true }),
+    ).toBeVisible();
+    expect(calls.some((r) => r.action === 'ke-status')).toBe(false);
+    await details.getByRole('combobox', { name: 'KE 环境', exact: true }).click();
+    await page.locator('.ant-select-item-option').filter({ hasText: 'dev' }).click();
+    await expect(details.getByLabel('容器日志', { exact: true })).toContainText(
+      'dev previous=false',
+    );
+    await details.getByRole('switch', { name: '上次容器日志', exact: true }).click();
+    await expect(details.getByLabel('容器日志', { exact: true })).toContainText('previous=true');
+    await page.setViewportSize({ width: 390, height: 844 });
+    await expect(details).toBeVisible();
+    await expect
+      .poll(() => page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1))
+      .toBe(true);
+  });
+
+  test('KE logs search instantly, navigate literal matches and retain wrapping preferences on refresh', async ({
+    page,
+  }) => {
+    const repository = {
+      id: 'core',
+      name: 'core',
+      kind: 'backend',
+      tags: [],
+      ke_pipeline: {
+        base_url: 'https://ke.example.invalid',
+        tenant: 'tenant',
+        project: 'project',
+        application: 'core',
+        pipeline: 'release',
+        environment: 'dev',
+      },
+    };
+    let logText = `ERROR <script>literal</script> [x].*\n中文 error\n${'long line '.repeat(300)}`;
+    const actions: string[] = [];
+    await page.route('**/api/dashboard/projects/path-0/repositories', (route) =>
+      route.fulfill({ json: { repositories: [repository] } }),
+    );
+    await page.route('**/api/dashboard/projects/path-0/kubernetes', async (route) => {
+      const { action } = route.request().postDataJSON();
+      actions.push(action);
+      const results: Record<string, unknown> = {
+        'ke-environments': { environments: ['dev'] },
+        'ke-status': {
+          desiredReplicas: 1,
+          readyReplicas: 1,
+          updatedReplicas: 1,
+          containers: [],
+          pods: [{ name: 'core-pod', phase: 'Running', restarts: 0, containers: ['main'] }],
+        },
+        'ke-logs': { logs: logText, checkedAt: '2026-10-21T00:00:00Z' },
+        'ke-runtimes': { runtimes: [{ name: 'run-1', phase: 2 }] },
+        'ke-runtime': {
+          phase: 2,
+          stages: [{ displayName: '构建', phase: 2, podName: 'build-pod' }],
+        },
+        'ke-pipeline-logs': { logs: logText },
+      };
+      await route.fulfill({ json: results[action] });
+    });
+    await page.goto('/');
+    await page.getByRole('menuitem', { name: /Kubernetes$/ }).click();
+    await page.getByRole('button', { name: '状态与容器日志', exact: true }).click();
+    const details = page.getByRole('dialog', { name: /^Kubernetes · core/ });
+    async function checkViewer(label: string, action: string, refresh: string) {
+      const output = details.getByLabel(label, { exact: true });
+      const search = details.getByRole('textbox', { name: `${label}搜索`, exact: true });
+      const counter = details.getByRole('status', { name: '日志搜索结果' });
+      const wrap = details.getByRole('switch', { name: '自动换行', exact: true });
+      await expect(output).toHaveText(logText);
+      await expect(wrap).toBeChecked();
+      await expect(output).toHaveCSS('white-space', 'pre-wrap');
+      const count = actions.filter((value) => value === action).length;
+      await search.fill('error');
+      await expect(counter).toHaveText('1 / 2 处匹配');
+      await expect(output.locator('mark')).toHaveCount(2);
+      await expect(output.locator('mark[aria-current="true"]')).toHaveText('ERROR');
+      await search.press('Enter');
+      await expect(counter).toHaveText('2 / 2 处匹配');
+      await expect(output.locator('mark[aria-current="true"]')).toHaveText('error');
+      await search.press('Shift+Enter');
+      await expect(counter).toHaveText('1 / 2 处匹配');
+      await details.getByRole('button', { name: '上一个匹配', exact: true }).click();
+      await expect(counter).toHaveText('2 / 2 处匹配');
+      await details.getByRole('button', { name: '下一个匹配', exact: true }).click();
+      await expect(counter).toHaveText('1 / 2 处匹配');
+      await search.fill('[x].*');
+      await expect(counter).toHaveText('1 / 1 处匹配');
+      await expect(output.locator('mark')).toHaveText('[x].*');
+      await search.fill('<script>');
+      await expect(output.locator('mark')).toHaveText('<script>');
+      await expect(output.locator('script')).toHaveCount(0);
+      await search.fill('没有匹配');
+      await expect(counter).toHaveText('0 / 0 处匹配');
+      await expect(details.getByRole('button', { name: '下一个匹配' })).toBeDisabled();
+      await search.fill('');
+      await expect(output.locator('mark')).toHaveCount(0);
+      expect(await output.textContent()).toBe(logText);
+      await wrap.click();
+      await expect(output).toHaveCSS('white-space', 'pre');
+      expect(await output.evaluate((element) => element.scrollWidth > element.clientWidth)).toBe(
+        true,
+      );
+      await search.fill('error');
+      expect(actions.filter((value) => value === action)).toHaveLength(count);
+      logText += '\nnew ERROR';
+      await details.getByRole('button', { name: new RegExp(`${refresh}$`) }).click();
+      await expect(counter).toHaveText('1 / 3 处匹配');
+      await expect(search).toHaveValue('error');
+      await expect(wrap).not.toBeChecked();
+      expect(await output.textContent()).toBe(logText);
+      await page.setViewportSize({ width: 390, height: 844 });
+      await expect(search).toBeVisible();
+      await expect(details).toBeInViewport();
+      await expect(search).toBeInViewport();
+      expect(
+        await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1),
+      ).toBe(true);
+      await page.screenshot({
+        path: `/tmp/comet-${action}-search-mobile.png`,
+        animations: 'disabled',
+      });
+      await wrap.click();
+      await expect(output).toHaveCSS('white-space', 'pre-wrap');
+      expect(
+        await output.evaluate((element) => element.scrollWidth <= element.clientWidth + 1),
+      ).toBe(true);
+      await page.setViewportSize({ width: 1280, height: 900 });
+    }
+    await checkViewer('容器日志', 'ke-logs', '刷新日志');
+    logText = `ERROR <script>literal</script> [x].*\n中文 error\n${'long line '.repeat(300)}`;
+    await details.getByRole('tab', { name: '流水线日志', exact: true }).click();
+    await details.getByRole('combobox', { name: '流水线运行记录' }).click();
+    await page.locator('.ant-select-item-option').filter({ hasText: 'run-1' }).click();
+    await checkViewer('流水线节点日志', 'ke-pipeline-logs', '刷新节点日志');
+    expect(actions).not.toContain('ke-run');
+  });
+
+  for (const source of ['container', 'pipeline']) {
+    test(`AI ${source} logs use frozen snapshots, follow-up history and cancellable analysis`, async ({
+      page,
+    }) => {
+      const repository = {
+        id: 'core',
+        name: 'core',
+        kind: 'backend',
+        tags: [],
+        ke_pipeline: {
+          base_url: 'https://ke.example.invalid',
+          tenant: 'tenant',
+          project: 'project',
+          application: 'core',
+          pipeline: 'release',
+          environment: 'dev',
+        },
+      };
+      let logs = 'ERROR database timeout\nretry failed <script>literal</script>';
+      const requests: Array<Record<string, unknown>> = [];
+      await page.route('**/api/dashboard/projects/path-0/repositories', (route) =>
+        route.fulfill({ json: { repositories: [repository] } }),
+      );
+      await page.route('**/api/dashboard/projects/path-0/kubernetes', async (route) => {
+        const { action } = route.request().postDataJSON();
+        const results: Record<string, unknown> = {
+          'ke-environments': { environments: ['dev'] },
+          'ke-status': {
+            desiredReplicas: 1,
+            readyReplicas: 1,
+            updatedReplicas: 1,
+            containers: [],
+            pods: [{ name: 'core-pod', phase: 'Running', restarts: 0, containers: ['main'] }],
+          },
+          'ke-logs': { logs, checkedAt: '2026-10-22T00:00:00Z' },
+          'ke-runtimes': { runtimes: [{ name: 'run-1', phase: 2 }] },
+          'ke-runtime': {
+            phase: 2,
+            stages: [{ displayName: '构建', phase: 2, podName: 'build-pod' }],
+          },
+          'ke-pipeline-logs': { logs },
+        };
+        await route.fulfill({ json: results[action] });
+      });
+      let release!: () => void;
+      await page.route('**/api/dashboard/projects/path-0/log-analysis', async (route) => {
+        const body = route.request().postDataJSON();
+        requests.push(body);
+        if (body.question === '测试停止')
+          await new Promise<void>((resolve) => {
+            release = resolve;
+          });
+        if (body.question === '测试错误') {
+          await route.fulfill({ status: 503, json: { error: '请先登录 Codex CLI' } });
+          return;
+        }
+        await route
+          .fulfill({
+            contentType: 'application/x-ndjson',
+            body:
+              [
+                { type: 'status', message: '正在分析…' },
+                {
+                  type: 'message',
+                  text: 'L1: database timeout；可能是连接池耗尽，需核查。<script>literal</script>',
+                },
+                { type: 'complete' },
+              ]
+                .map((event) => JSON.stringify(event))
+                .join('\n') + '\n',
+          })
+          .catch(() => {});
+      });
+      await page.goto('/');
+      await page.getByRole('menuitem', { name: /Kubernetes$/ }).click();
+      await page.getByRole('button', { name: '状态与容器日志', exact: true }).click();
+      const details = page.getByRole('dialog', { name: /^Kubernetes · core/ });
+      if (source === 'pipeline') {
+        await details.getByRole('tab', { name: '流水线日志', exact: true }).click();
+        await details.getByRole('combobox', { name: '流水线运行记录' }).click();
+        await page.locator('.ant-select-item-option').filter({ hasText: 'run-1' }).click();
+      }
+      const output = details.getByLabel(source === 'container' ? '容器日志' : '流水线节点日志', {
+        exact: true,
+      });
+      await expect(output).toContainText('database timeout');
+      await details.getByRole('button', { name: 'AI 分析', exact: true }).click();
+      const panel = details.getByRole('complementary', { name: 'AI 日志分析' });
+      await expect(panel).toBeVisible();
+      expect(requests).toHaveLength(0);
+      const question = panel.getByRole('textbox', { name: '日志分析问题' });
+      await question.fill('找出超时原因');
+      await panel.getByRole('button', { name: /开始分析$/ }).click();
+      const conversation = panel.getByLabel('日志分析对话');
+      await expect(conversation).toContainText('L1: database timeout');
+      await expect(conversation.locator('script')).toHaveCount(0);
+      await expect(panel.getByRole('status', { name: 'AI 分析状态' })).toHaveText('分析完成');
+      expect(requests[0]).toMatchObject({
+        repositoryId: 'core',
+        source,
+        logs,
+        question: '找出超时原因',
+        history: [],
+      });
+      const original = logs;
+      logs += '\nnew log';
+      await details
+        .getByRole('button', { name: source === 'container' ? /刷新日志$/ : /刷新节点日志$/ })
+        .click();
+      await expect(output).toContainText('new log');
+      await expect(panel).toContainText('当前日志已更新，分析仍使用原快照。');
+      await question.fill('下一步如何核查？');
+      await panel.getByRole('button', { name: /继续提问$/ }).click();
+      await expect.poll(() => requests.length).toBe(2);
+      expect(requests[1].logs).toBe(original);
+      expect(requests[1].history).toEqual([
+        { role: 'user', text: '找出超时原因' },
+        { role: 'assistant', text: expect.stringContaining('L1: database timeout') },
+      ]);
+      await expect(panel.getByRole('status', { name: 'AI 分析状态' })).toHaveText('分析完成');
+      await panel.getByRole('button', { name: '使用最新日志并开始新对话' }).click();
+      await expect(conversation).toHaveText('');
+      await question.fill('分析新日志');
+      await question.press('Control+Enter');
+      await expect.poll(() => requests.length).toBe(3);
+      expect(requests[2]).toMatchObject({ logs, history: [] });
+      await expect(panel.getByRole('status', { name: 'AI 分析状态' })).toHaveText('分析完成');
+      await page.screenshot({
+        path: `/tmp/comet-ai-${source}-desktop.png`,
+        animations: 'disabled',
+      });
+      await question.fill('测试错误');
+      await question.press('Control+Enter');
+      await expect(panel.getByText('请先登录 Codex CLI', { exact: true })).toBeVisible();
+      await expect(question).toHaveValue('测试错误');
+      await question.fill('测试停止');
+      await question.press('Control+Enter');
+      await expect.poll(() => requests.length).toBe(5);
+      await panel.getByRole('button', { name: /停止分析$/ }).click();
+      release();
+      await expect(panel.getByRole('status', { name: 'AI 分析状态' })).toContainText('分析已停止');
+      await page.setViewportSize({ width: 390, height: 844 });
+      await question.scrollIntoViewIfNeeded();
+      await expect(question).toBeInViewport();
+      expect(
+        await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1),
+      ).toBe(true);
+      await page.screenshot({ path: `/tmp/comet-ai-${source}-mobile.png`, animations: 'disabled' });
+      await panel.getByRole('button', { name: '关闭 AI 分析', exact: true }).click();
+      await expect(panel).toHaveCount(0);
+      await expect(output).toContainText('new log');
+    });
+  }
+
+  test('Kubernetes container logs support selection, previous logs, refresh and errors on narrow screens', async ({
+    page,
+  }) => {
+    await page.route('**/api/dashboard/projects/path-0/repositories', (route) =>
+      route.fulfill({
+        json: {
+          workspace: '/worktrees/project-0',
+          initialized: true,
+          repositories: [
+            {
+              id: 'core',
+              name: 'core',
+              kind: 'backend',
+              tags: [],
+              kubernetes: {
+                context: 'test',
+                namespace: 'default',
+                deployment: 'core',
+                container: '',
+              },
+            },
+          ],
+        },
+      }),
+    );
+    const requests: Array<Record<string, unknown>> = [];
+    let failLogs = false;
+    await page.route('**/api/dashboard/projects/path-0/kubernetes', async (route) => {
+      const body = route.request().postDataJSON();
+      requests.push(body);
+      if (body.action === 'status')
+        await route.fulfill({
+          json: {
+            readyReplicas: 1,
+            desiredReplicas: 2,
+            updatedReplicas: 2,
+            containers: [{ name: 'app', image: 'core:v1' }],
+            pods: [
+              { name: 'core-abc', phase: 'Running', restarts: 0, containers: ['app', 'sidecar'] },
+              { name: 'core-def', phase: 'Running', restarts: 1, containers: ['worker'] },
+            ],
+          },
+        });
+      else if (failLogs) await route.fulfill({ status: 502, json: { error: '集群连接失败' } });
+      else
+        await route.fulfill({
+          json: {
+            logs: `${body.pod}/${body.container} previous=${body.previous} <script>literal</script>`,
+            checkedAt: '2026-10-21T00:00:00Z',
+          },
+        });
+    });
+    await page.goto('/');
+    await page.getByRole('menuitem', { name: /Kubernetes$/ }).click();
+    await page.getByRole('button', { name: '状态与容器日志', exact: true }).click();
+    const details = page.getByRole('dialog', { name: /^Kubernetes · core/ });
+    const output = details.getByLabel('容器日志', { exact: true });
+    await expect(output).toContainText('core-abc/app');
+    await expect(output).toContainText('<script>literal</script>');
+    await details.getByRole('combobox', { name: '日志容器', exact: true }).click();
+    await page.locator('.ant-select-item-option').filter({ hasText: 'sidecar' }).click();
+    await expect(output).toContainText('core-abc/sidecar');
+    await details.getByRole('combobox', { name: '日志 Pod', exact: true }).click();
+    await page.locator('.ant-select-item-option').filter({ hasText: 'core-def' }).click();
+    await expect(output).toContainText('core-def/worker');
+    await details.getByRole('switch', { name: '上次容器日志', exact: true }).click();
+    await expect(output).toContainText('previous=true');
+    await details.getByRole('switch', { name: '自动刷新日志', exact: true }).click();
+    const logsCount = () => requests.filter((request) => request.action === 'logs').length;
+    await expect.poll(logsCount).toBeGreaterThan(4);
+    const count = logsCount();
+    await expect.poll(logsCount, { timeout: 8000 }).toBeGreaterThan(count);
+    failLogs = true;
+    await details.getByRole('button', { name: '刷新日志', exact: true }).click();
+    await expect(details.getByText('集群连接失败', { exact: true })).toBeVisible();
+    await page.setViewportSize({ width: 390, height: 844 });
+    await expect(details).toBeVisible();
+    await expect
+      .poll(() =>
+        details.evaluate((element) => {
+          const rect = element.getBoundingClientRect();
+          return (
+            rect.left >= 0 &&
+            rect.right <= innerWidth &&
+            rect.top >= 0 &&
+            rect.bottom <= innerHeight
+          );
+        }),
+      )
+      .toBe(true);
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1)).toBe(
+      true,
+    );
+    await details.getByRole('button', { name: '关闭', exact: true }).click();
+    await expect(details).toHaveCount(0);
+    const afterClose = logsCount();
+    await page.waitForTimeout(5200);
+    expect(logsCount()).toBe(afterClose);
+  });
+
   test('prefers the launch project over remembered selection and resets on reload', async ({
     page,
   }) => {

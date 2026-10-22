@@ -8,7 +8,7 @@ import { withRecoverableFileLock } from '../fs/plugin-store.js';
 
 export const PROJECT_REGISTRY_SCHEMA_VERSION = 1;
 
-export type ProjectRegistrySource = 'init' | 'update' | 'repair';
+export type ProjectRegistrySource = 'init' | 'update' | 'repair' | 'dashboard';
 export type ProjectRegistryErrorCode = 'invalid-json' | 'invalid-schema';
 
 export interface ProjectRegistryTarget {
@@ -107,7 +107,7 @@ function findProjectRegistryEntryByCanonicalPath(
 }
 
 function isProjectRegistrySource(value: unknown): value is ProjectRegistrySource {
-  return value === 'init' || value === 'update' || value === 'repair';
+  return value === 'init' || value === 'update' || value === 'repair' || value === 'dashboard';
 }
 
 function isProjectRegistryTarget(value: unknown): value is ProjectRegistryTarget {
@@ -411,6 +411,31 @@ export async function listProjectRegistryEntries(
   options: ProjectRegistryOptions = {},
 ): Promise<ProjectRegistryEntry[]> {
   return (await readProjectRegistry(options)).projects;
+}
+
+/** Register a directory without changing an existing installation record. */
+export async function registerProjectDirectory(
+  projectPath: string,
+  options: ProjectRegistryOptions = {},
+): Promise<ProjectRegistryEntry> {
+  return withRecoverableFileLock(`${getProjectRegistryPath(options.homeDir)}.lock`, async () => {
+    const registry = await readProjectRegistrySnapshot({ ...options, strict: true });
+    const resolved = await resolveProjectPath(projectPath);
+    const existing = findProjectRegistryEntryByCanonicalPath(
+      registry.projects,
+      resolved.canonicalPath,
+    );
+    if (existing) {
+      if (existing.path === resolved.path) return existing;
+      return upsertProjectInstallationUnlocked(
+        projectPath,
+        existing.lastTargets,
+        existing.lastSource,
+        options,
+      );
+    }
+    return upsertProjectInstallationUnlocked(projectPath, [], 'dashboard', options);
+  });
 }
 
 export async function upsertProjectInstallation(

@@ -9071,3 +9071,237 @@ body {
     display: none;
   }
 }
+
+.dashboard-main-section-repositories {
+  display: flex;
+  height: 100dvh;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.dashboard-main-section-repositories > header {
+  flex-shrink: 0;
+}
+
+.dashboard-main-section-repositories .dashboard-content-shell {
+  min-height: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
+  padding-bottom: 20px;
+}
+
+.dashboard-main-section-repositories .dashboard-content-inner {
+  height: 100%;
+  width: 100%;
+}
+
+.dashboard-repositories-page {
+  display: flex;
+  height: 100%;
+  min-height: 0;
+  flex-direction: column;
+}
+
+.dashboard-project-init-fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0 20px;
+}
+
+@media (max-width: 767px) {
+  .dashboard-project-init-fields {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+.dashboard-repositories-heading {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding-bottom: 16px;
+}
+
+.dashboard-repositories-heading h2 {
+  margin: 0;
+  font-size: 20px;
+}
+
+.dashboard-repositories-body {
+  min-height: 0;
+  flex: 1 1 auto;
+  overflow: auto;
+  padding: 0 4px 20px;
+  scrollbar-gutter: stable;
+}
+
+.dashboard-repositories-body .ant-space-item {
+  min-width: 0;
+}
+
+.dashboard-repositories-heading {
+  flex-wrap: wrap;
+}
+
+.dashboard-repositories-list-heading {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+.dashboard-repositories-filters {
+  display: grid;
+  grid-template-columns: minmax(180px, 1.5fr) minmax(110px, 0.6fr) minmax(180px, 1fr) auto;
+  gap: 12px;
+}
+
+.dashboard-repositories-filters > * {
+  min-width: 0;
+}
+
+.dashboard-repository-location,
+.dashboard-repository-tag {
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+.dashboard-repository-secondary {
+  color: var(--color-fg-2);
+  font-size: 12px;
+}
+
+.dashboard-repository-form-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 0 16px;
+}
+
+.dashboard-repositories-table {
+  min-width: 0;
+}
+
+@media (max-width: 760px) {
+  .dashboard-repositories-filters {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  }
+
+  .dashboard-repositories-filters > :first-child {
+    grid-column: 1 / -1;
+  }
+}
+
+.dashboard-log-viewer {
+  min-width: 0;
+  width: 100%;
+}
+
+.dashboard-log-content {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  align-items: start;
+  gap: 12px;
+}
+
+.dashboard-log-content.has-analysis {
+  grid-template-columns: minmax(0, 1fr) minmax(300px, 0.85fr);
+}
+
+.dashboard-log-ai {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--color-border-soft);
+  border-radius: 8px;
+}
+
+.dashboard-log-ai-heading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.dashboard-log-ai-heading > :last-child {
+  margin-left: auto;
+}
+
+.dashboard-log-ai-conversation {
+  max-height: 40dvh;
+  overflow: auto;
+  overflow-wrap: anywhere;
+}
+
+.dashboard-log-ai-turn {
+  margin-bottom: 12px;
+  white-space: pre-wrap;
+  font-size: 13px;
+}
+
+.dashboard-log-ai-turn.is-user {
+  color: var(--color-fg-2);
+}
+
+@media (max-width: 900px) {
+  .dashboard-log-content.has-analysis {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+.dashboard-log-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.dashboard-log-search {
+  flex: 1 1 240px;
+  min-width: 0;
+}
+
+.dashboard-log-search-count {
+  color: var(--color-fg-2);
+  font-size: 12px;
+}
+
+.dashboard-log-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+
+.dashboard-kubernetes-logs {
+  max-height: 48dvh;
+  overflow: auto;
+  margin: 0;
+  padding: 14px;
+  border: 1px solid var(--color-border-soft);
+  border-radius: 8px;
+  background: var(--color-surface);
+  color: var(--color-fg);
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.dashboard-kubernetes-logs[data-wrap='false'] {
+  white-space: pre;
+  overflow-wrap: normal;
+  word-break: normal;
+}
+
+.dashboard-kubernetes-logs mark {
+  padding: 0;
+  background: #ffe58f;
+  color: #262626;
+}
+
+.dashboard-kubernetes-logs mark[aria-current='true'] {
+  background: #ff9c6e;
+  outline: 1px solid #d4380d;
+}
