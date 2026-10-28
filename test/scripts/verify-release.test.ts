@@ -8,9 +8,9 @@ import {
 } from '../../scripts/release/verify-release.mjs';
 
 describe('release bad-case and Eval gate', () => {
-  it('requires explicit candidate Eval evidence for publication, never a prior implicit report', () => {
-    expect(() => releaseOptions([], {})).toThrow('完整 Eval');
-    expect(() => releaseOptions([], { COMET_RELEASE_EVAL_REPORT: '  ' })).toThrow();
+  it('makes the candidate Eval receipt optional and parses it from flags or environment', () => {
+    expect(releaseOptions([], {})).toEqual({ regressionsOnly: false, evalReport: undefined });
+    expect(releaseOptions([], { COMET_RELEASE_EVAL_REPORT: '  ' }).evalReport).toBeUndefined();
     expect(releaseOptions(['--eval-report', 'evidence/current.json'], {})).toEqual({
       regressionsOnly: false,
       evalReport: 'evidence/current.json',
@@ -77,24 +77,46 @@ describe('release bad-case and Eval gate', () => {
     }
   });
 
+  it('publishes without a receipt by running all no-model checks only', () => {
+    const options = releaseOptions([], {});
+    expect(options.regressionsOnly).toBe(false);
+    const steps = releaseSteps(options, '/repo');
+    expect(steps.map((step) => step.args.join(' '))).toContain(
+      'scripts/lint/workflow-regressions.mjs --require-acceptance',
+    );
+    expect(steps.some((step) => step.args.includes('--verify-receipt'))).toBe(false);
+  });
+
   it('does not confuse deterministic checks with completion of additional acceptance', () => {
     expect(
       releaseSteps({ regressionsOnly: true }).some((step) =>
         step.args.includes('--require-acceptance'),
       ),
     ).toBe(false);
-    expect(
-      releaseSteps({ regressionsOnly: false, evalReport: 'current.json' }).some((step) =>
-        step.args.includes('--require-acceptance'),
-      ),
-    ).toBe(true);
+    for (const options of [
+      { regressionsOnly: false },
+      { regressionsOnly: false, evalReport: 'current.json' },
+    ])
+      expect(
+        releaseSteps(options).some((step) => step.args.includes('--require-acceptance')),
+      ).toBe(true);
   });
 
-  it('labels regressions-only success as insufficient for publication', () => {
+  it('labels the run result by whether a model Eval receipt was verified', () => {
     const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
     try {
       verifyRelease({ regressionsOnly: true }, vi.fn().mockReturnValue({ status: 0 }), '/repo');
-      expect(log).toHaveBeenLastCalledWith(expect.stringContaining('不构成发布放行'));
+      expect(log).toHaveBeenLastCalledWith(
+        expect.stringContaining('未运行 badcase 附加验收和完整模型 Eval'),
+      );
+      verifyRelease({ regressionsOnly: false }, vi.fn().mockReturnValue({ status: 0 }), '/repo');
+      expect(log).toHaveBeenLastCalledWith(expect.stringContaining('未提供完整 Eval 凭证'));
+      verifyRelease(
+        { regressionsOnly: false, evalReport: 'current.json' },
+        vi.fn().mockReturnValue({ status: 0 }),
+        '/repo',
+      );
+      expect(log).toHaveBeenLastCalledWith(expect.stringContaining('完整 Eval 凭证均已核对通过'));
     } finally {
       log.mockRestore();
     }

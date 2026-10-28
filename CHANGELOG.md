@@ -19,6 +19,7 @@ All notable changes to @rpamis/comet will be documented in this file.
 - **Native brief structure**: List only the directory categories relevant to a change, instead of filling unused categories with "None". The Directory structure section and meaningful content in each retained category remain required. Existing complete briefs remain valid.
 - **Classic configuration guidance**: Show each execution, TDD, and review setting with its meaning and confirmation status. Ask only for missing, invalid, or explicitly changed choices, while retaining valid choices within the same change. Each new full change still requires its own configuration approval; hotfix and tweak retain their existing confirmation steps.
 - **Requirement reconfirmation**: Before presenting the complete revised Native or Classic proposal, explain behavior changes, affected acceptance criteria, retained work, and steps that must be repeated. State when the previous approved proposal is unavailable. Approval remains bound to the complete current proposal, and old verification results do not approve new requirements.
+- **Release verification**: Stop blocking `npm publish` on a mandatory model Eval receipt. Publication still runs the build, package scan, SDK API, regression, and badcase acceptance checks; pass `--eval-report` or set `COMET_RELEASE_EVAL_REPORT` to additionally verify a complete Eval receipt for the current candidate.
 
 ### Fixed
 

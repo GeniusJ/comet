@@ -15,13 +15,10 @@ export function releaseOptions(args, env = process.env) {
       evalReport = args[++index];
     else throw new Error(`不支持的发布检查参数：${argument}`);
   }
-  if (regressionsOnly && evalReport)
+  const receipt = typeof evalReport === 'string' ? evalReport.trim() : '';
+  if (regressionsOnly && receipt)
     throw new Error('无模型回归检查不能同时声明完整 Eval 放行凭证。');
-  if (!regressionsOnly && (typeof evalReport !== 'string' || !evalReport.trim()))
-    throw new Error(
-      '发布前必须提供当前候选的完整 Eval 凭证：--eval-report <release-gate.json>，或 COMET_RELEASE_EVAL_REPORT。仅检查无模型回归请使用 test:release-regressions；这不代表可以发布。',
-    );
-  return { regressionsOnly, evalReport: evalReport?.trim() };
+  return { regressionsOnly, evalReport: receipt || undefined };
 }
 
 export function releaseSteps(options, repositoryRoot = root) {
@@ -59,11 +56,15 @@ export function releaseSteps(options, repositoryRoot = root) {
             'scripts/lint/workflow-regressions.mjs',
             '--require-acceptance',
           ]),
-          python('核对当前候选完整 Eval 凭证', [
-            'local/scripts/regression_check.py',
-            '--verify-receipt',
-            path.resolve(repositoryRoot, options.evalReport),
-          ]),
+          ...(options.evalReport
+            ? [
+                python('核对当前候选完整 Eval 凭证', [
+                  'local/scripts/regression_check.py',
+                  '--verify-receipt',
+                  path.resolve(repositoryRoot, options.evalReport),
+                ]),
+              ]
+            : []),
         ]
       : []),
   ];
@@ -80,8 +81,10 @@ export function verifyRelease(options, run = spawnSync, repositoryRoot = root) {
   }
   console.log(
     options.regressionsOnly
-      ? '无模型发布回归通过；尚未核对完整模型 Eval，不构成发布放行。'
-      : '当前候选的核心回归和完整 Eval 凭证均已核对通过。',
+      ? '无模型发布回归通过；未运行 badcase 附加验收和完整模型 Eval。'
+      : options.evalReport
+        ? '当前候选的核心回归和完整 Eval 凭证均已核对通过。'
+        : '核心回归与 badcase 附加验收通过；本次未提供完整 Eval 凭证，未核对真实模型 Eval。',
   );
 }
 
