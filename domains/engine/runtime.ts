@@ -44,7 +44,12 @@ export type {
   WorkflowReference,
   WorkflowTransition,
 } from './workflow-definition.js';
-export { createMemoryRuntimeStore, createFileRuntimeStore } from './runtime-store.js';
+export {
+  createMemoryRuntimeStore,
+  createFileRuntimeStore,
+  inspectFileRuntimeStoreLock,
+  repairFileRuntimeStoreLock,
+} from './runtime-store.js';
 export {
   iterateFileRuntimeStoreRunSources,
   listFileRuntimeStoreRuns,
@@ -74,6 +79,7 @@ export {
   portableRunCheckpointMatches,
   PORTABLE_RUN_CHECKPOINT_KEY,
   readPortableRunCheckpoint,
+  readPortableRunCheckpointProjection,
 } from './portable-run-checkpoint.js';
 export type { RuntimeValue } from './runtime-json.js';
 export type {

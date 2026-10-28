@@ -40,8 +40,11 @@ import {
   reconcileNativeSdkExecutionStops,
 } from './native-sdk-check-execution.js';
 import { readProjectConfig } from './native-config.js';
-import { nativeProjectPaths } from './native-paths.js';
-import { inspectNativePortableAcceptanceDrift } from './native-portable-requirements.js';
+import { nativeProjectPaths, resolveArtifactRoot } from './native-paths.js';
+import {
+  inspectNativePortableAcceptanceDrift,
+  readNativeApprovedShapeSemanticSnapshot,
+} from './native-portable-requirements.js';
 import { parseNativePortableState } from './native-portable-state.js';
 import { currentNativeSdkSupervisorPlan } from './native-sdk-supervisor-prepare.js';
 import { nativeSdkSupervisorParentCandidateCommit } from './native-sdk-supervisor-parent.js';
@@ -51,12 +54,23 @@ import {
   nativeSupervisorIntegrationWorktree,
 } from './native-supervisor-workspace.js';
 import { toNativePortableText } from './native-portable-text.js';
-import { nativeCheckInputFingerprint, nativeCandidateInputGate } from './native-portable-checks.js';
+import {
+  nativeCheckInputSnapshot,
+  nativeCandidateInputGate,
+  nativeGeneratedCheckInputSnapshot,
+} from './native-portable-checks.js';
 import { nativeEditReviewScope } from './native-edit-review.js';
 import type { NativePortableCheckSummary } from './native-portable-types.js';
+import {
+  captureNativeCheckScope,
+  isNativeCheckScope,
+  sameNativeCheckScope,
+  type NativeCheckScope,
+} from './native-check-scope.js';
 
 /** 已完成检查的输入发生变化；这不是执行结果未知。 */
 export class NativeSdkCheckInputDriftError extends Error {}
+export class NativeSdkCheckInputSnapshotError extends NativeSdkCheckInputDriftError {}
 export class NativeSdkCandidateDriftError extends Error {}
 
 /** 只重放当前候选明确声明可重复执行的检查。 */
@@ -68,9 +82,10 @@ export function nativeSdkCanRefreshChecks(run: Readonly<WorkflowRun>): boolean {
         action.status === 'succeeded',
     )
     .lastIndexOf(true);
-  const plans = nativeSdkCheckPlans(
-    run.outputs['supervisor.parent.builder']?.value ?? run.outputs['build.builder']?.value,
-  );
+  // Outputs retain earlier workflow modes. Only the latest successful Builder
+  // owns this candidate; an old Supervisor one-shot plan must not disable it.
+  const builder = run.actions[start];
+  const plans = nativeSdkCheckPlans(builder?.outcome?.output);
   for (const action of run.actions.slice(start + 1)) {
     if (action.stepId !== 'verify.requested-checks') continue;
     const outputs = record(
@@ -96,6 +111,8 @@ interface NativeSdkCheckResult {
   durationMs: number;
   logRef: string;
   logSha256: string;
+  inputScope?: NativeCheckScope;
+  reusedFrom?: { actionId: string; attempt: number; candidateId: string; checkId: string };
 }
 
 interface NativeSdkCheckInterruption {
@@ -114,6 +131,14 @@ interface NativeSdkCheckOutcome {
   candidateInputFingerprintGate?: string | null;
   inputBefore?: string;
   inputAfter?: string;
+  inputSnapshot?: {
+    schema: 'comet.native.check-input.v2';
+    before: string;
+    after: string;
+    candidateBefore: string | null;
+    complete: boolean;
+    diagnostics: string[];
+  };
   interruption?: NativeSdkCheckInterruption;
   candidateId: string;
   checks: NativeSdkCheckResult[];
@@ -529,6 +554,73 @@ function checkOperationId(action: Readonly<RuntimeAction>): string {
   return hashRuntimeValue({ actionId: action.id, attempt: action.attempt });
 }
 
+async function reusableScopedCheck(options: {
+  run: Readonly<WorkflowRun>;
+  action: Readonly<RuntimeAction>;
+  plan: NativeCheckPlan;
+  scope: NativeCheckScope | null;
+  projectRoot: string;
+}): Promise<NativeSdkCheckResult | null> {
+  if (!options.scope) return null;
+  const before = options.run.actions.findIndex(({ id }) => id === options.action.id);
+  for (const prior of options.run.actions.slice(0, before).reverse()) {
+    if (
+      !['verify.checks', 'verify.requested-checks'].includes(prior.stepId) ||
+      !['succeeded', 'failed'].includes(prior.status) ||
+      !prior.outcome ||
+      prior.claim?.executorId !== nativeSdkCheckExecutor.id
+    )
+      continue;
+    const output = prior.outcome.output as unknown as NativeSdkCheckOutcome;
+    if (
+      output.interruption ||
+      !output.inputSnapshot?.complete ||
+      output.inputSnapshot.candidateBefore === null ||
+      output.inputSnapshot.candidateBefore !== output.candidateInputFingerprintGate
+    )
+      continue;
+    const plans = checkPlansForAction(options.run, prior, output.candidateId);
+    const index = plans.findIndex(
+      (plan) => nativeCheckPlanKey(plan) === nativeCheckPlanKey(options.plan),
+    );
+    const check = output.checks[index];
+    if (
+      !check ||
+      check.reusedFrom ||
+      check.status !== 'passed' ||
+      !isNativeCheckScope(check.inputScope, plans[index]) ||
+      !sameNativeCheckScope(check.inputScope, options.scope)
+    )
+      continue;
+    try {
+      await validatedCheckResults({
+        run: options.run,
+        action: prior,
+        outcome: prior.outcome,
+        candidateId: output.candidateId,
+        plans,
+        projectRoot: options.projectRoot,
+        allowCandidateSuccessor: true,
+      });
+    } catch {
+      // 历史证据损坏不成为新的通过结果，执行当前检查重新建立证据。
+      continue;
+    }
+    return {
+      ...check,
+      id: options.plan.id,
+      name: options.plan.name,
+      reusedFrom: {
+        actionId: prior.id,
+        attempt: prior.attempt,
+        candidateId: output.candidateId,
+        checkId: check.id,
+      },
+    };
+  }
+  return null;
+}
+
 export const nativeSdkCheckExecutor: RuntimeExecutor = {
   id: 'comet-native-checks',
   capabilities: [],
@@ -601,6 +693,7 @@ export const nativeSdkCheckExecutor: RuntimeExecutor = {
       });
     }
     const checkRoot = executionRoot ?? context.projectRoot;
+    const managedArtifactRoot = await resolveArtifactRoot(checkRoot, artifactRootRef);
     preflightNativeCheckPlans(checkRoot, plans);
     if (state.phase === 'verify' && state.builder_handoff)
       await assertNativeSdkCandidateUnchanged({ run, projectRoot: context.projectRoot });
@@ -608,9 +701,22 @@ export const nativeSdkCheckExecutor: RuntimeExecutor = {
       state,
       projectRoot: checkRoot,
       plans,
-      managedArtifactRoot: paths.artifactRoot,
+      managedArtifactRoot,
     };
-    const inputBefore = await nativeCheckInputFingerprint(fingerprintOptions);
+    const inputBefore = await nativeCheckInputSnapshot(fingerprintOptions);
+    const candidateBefore =
+      state.phase === 'verify' && state.builder_handoff
+        ? await nativeCandidateInputGate({
+            projectRoot: checkRoot,
+            candidateId,
+            plans,
+            managedArtifactRoot,
+            editReviewScope: nativeEditReviewScope(paths, state),
+            shapeSemanticSnapshot: (await readNativeApprovedShapeSemanticSnapshot({ paths, state }))
+              ?.snapshot,
+            legacyShapeSemanticSnapshot: state.shape_semantic_snapshot === undefined,
+          })
+        : null;
 
     const runtimeRef = checkRuntimeRef(run);
     await ensureProtectedProjectDirectory(paths.workspaceRuntimeRoot, `${runtimeRef}/logs/checks`, {
@@ -629,6 +735,31 @@ export const nativeSdkCheckExecutor: RuntimeExecutor = {
     try {
       for (const plan of plans) {
         await registration.assertNotStopped();
+        const scopeOptions = {
+          projectRoot: checkRoot,
+          plan,
+          contract: {
+            shape: state.shape_confirmation_hash ?? null,
+            acceptance: state.acceptance.map(({ id, source, text }) => ({ id, source, text })),
+          },
+        };
+        const scopeBefore = await captureNativeCheckScope(scopeOptions);
+        const reused = await reusableScopedCheck({
+          run,
+          action,
+          plan,
+          scope: scopeBefore,
+          projectRoot: context.projectRoot,
+        });
+        if (reused) {
+          const scopeAfter = await captureNativeCheckScope(scopeOptions);
+          if (scopeAfter && sameNativeCheckScope(scopeBefore!, scopeAfter)) {
+            checks.push(reused);
+            registration.execution.checks = checks as unknown as RuntimeValue[];
+            await registration.save();
+            continue;
+          }
+        }
         // 下一监管器尚无 PID 时也先保留未知边界，不能沿用上一条检查的停止收据。
         delete registration.execution.child;
         registration.execution.checkId = plan.id;
@@ -646,6 +777,7 @@ export const nativeSdkCheckExecutor: RuntimeExecutor = {
             registration.recordTermination(instance, confirmed),
         });
         const logRef = `${runtimeRef}/${executed.logRef}`;
+        const scopeAfter = await captureNativeCheckScope(scopeOptions);
         const log = await inspectProtectedProjectPath(paths.workspaceRuntimeRoot, logRef, {
           label: 'Native SDK check log',
           expected: 'file',
@@ -661,25 +793,41 @@ export const nativeSdkCheckExecutor: RuntimeExecutor = {
           durationMs: executed.durationMs,
           logRef,
           logSha256: executed.logSha256,
+          ...(scopeBefore && scopeAfter && sameNativeCheckScope(scopeBefore, scopeAfter)
+            ? { inputScope: scopeAfter }
+            : {}),
         });
         registration.execution.checks = checks as unknown as RuntimeValue[];
         await registration.save();
       }
+      const inputAfter = await nativeCheckInputSnapshot(fingerprintOptions);
       const result = {
         status: checks.every((check) => check.status === 'passed')
           ? ('succeeded' as const)
           : ('failed' as const),
         output: {
-          inputBefore,
-          inputAfter: await nativeCheckInputFingerprint(fingerprintOptions),
+          inputBefore: inputBefore.fingerprint,
+          inputAfter: inputAfter.fingerprint,
+          inputSnapshot: {
+            schema: 'comet.native.check-input.v2',
+            before: inputBefore.contentFingerprint,
+            after: inputAfter.contentFingerprint,
+            candidateBefore,
+            complete: inputBefore.complete && inputAfter.complete,
+            diagnostics: [...new Set([...inputBefore.diagnostics, ...inputAfter.diagnostics])],
+          },
           candidateInputFingerprintGate:
             state.phase === 'verify' && state.builder_handoff
               ? await nativeCandidateInputGate({
                   projectRoot: checkRoot,
                   candidateId,
                   plans,
-                  managedArtifactRoot: paths.artifactRoot,
+                  managedArtifactRoot,
                   editReviewScope: nativeEditReviewScope(paths, state),
+                  shapeSemanticSnapshot: (
+                    await readNativeApprovedShapeSemanticSnapshot({ paths, state })
+                  )?.snapshot,
+                  legacyShapeSemanticSnapshot: state.shape_semantic_snapshot === undefined,
                 })
               : null,
           candidateId,
@@ -750,21 +898,70 @@ async function validatedCheckResults(options: {
         : action.stepId === 'supervisor.child.integration-checks'
           ? activation?.integrationWorktree
           : parentActivation?.integrationWorktree;
-    const paths = await nativeProjectPaths(projectRoot, artifactRootRef, { readOnly: true });
-    if (
+    const paths = await nativeProjectPaths(executionRoot ?? projectRoot, artifactRootRef, {
+      readOnly: true,
+    });
+    const current = await nativeCheckInputSnapshot({
+      state,
+      projectRoot: executionRoot ?? projectRoot,
+      plans,
+      managedArtifactRoot: paths.artifactRoot,
+    });
+    if (!current.complete) {
+      throw new NativeSdkCheckInputSnapshotError(
+        `Native 检查输入快照不完整：${current.diagnostics.join('；')}。先修复输入读取范围或文件状态，再刷新检查；不能验收或复用旧证据`,
+      );
+    }
+    if (output.inputSnapshot !== undefined) {
+      const snapshot = record(output.inputSnapshot, 'Native check input snapshot');
+      if (
+        snapshot.schema !== 'comet.native.check-input.v2' ||
+        typeof snapshot.before !== 'string' ||
+        !/^[a-f0-9]{64}$/u.test(snapshot.before) ||
+        typeof snapshot.after !== 'string' ||
+        !/^[a-f0-9]{64}$/u.test(snapshot.after) ||
+        (snapshot.candidateBefore !== null &&
+          (typeof snapshot.candidateBefore !== 'string' ||
+            !/^[a-f0-9]{64}$/u.test(snapshot.candidateBefore))) ||
+        typeof snapshot.complete !== 'boolean' ||
+        !Array.isArray(snapshot.diagnostics) ||
+        snapshot.diagnostics.some((entry) => typeof entry !== 'string')
+      ) {
+        throw new Error('Native 检查输入收据结构无效；不能降级复用旧版证据');
+      }
+      if (
+        state.builder_handoff &&
+        state.phase === 'verify' &&
+        (snapshot.candidateBefore === null ||
+          snapshot.candidateBefore !== output.candidateInputFingerprintGate)
+      ) {
+        throw new NativeSdkCandidateDriftError(
+          'Native 候选源码在检查执行期间发生变化或无法完整读取；需要新的 Builder 候选，不能验收本次检查',
+        );
+      }
+      if (!snapshot.complete) {
+        throw new NativeSdkCheckInputDriftError(
+          `Native 原检查输入快照不完整：${snapshot.diagnostics.join('；')}。当前输入已可完整读取，由当前 Verifier 请求原检查并提交 refreshChecks: true，重新建立完整证据`,
+        );
+      }
+      // 执行环境用于判断能否复用检查，不属于 Verifier 提交时的候选内容。
+      if (snapshot.after !== current.contentFingerprint) {
+        throw new NativeSdkCheckInputDriftError(
+          'Native 检查输入已变化（候选或项目文件内容）；保留 Verify，由当前 Verifier 请求原检查并提交 refreshChecks: true，刷新证据后再验收',
+        );
+      }
+    } else if (
       !output.inputBefore ||
       !output.inputAfter ||
-      output.inputAfter !==
-        (await nativeCheckInputFingerprint({
-          state,
-          projectRoot: executionRoot ?? projectRoot,
-          plans,
-          managedArtifactRoot: paths.artifactRoot,
-        }))
-    )
+      output.inputBefore !== output.inputAfter ||
+      output.inputAfter !== current.fingerprint
+    ) {
+      // 0.5.0 收据未分离内容与执行环境。只允许完整且仍精确匹配的旧证据；
+      // 无法证明时刷新一次，新收据不再受提交 shell 的环境差异影响。
       throw new NativeSdkCheckInputDriftError(
-        'Native 检查输入已变化；保留 Verify，由当前 Verifier 请求原检查并提交 refreshChecks: true，刷新证据后再验收',
+        'Native 旧版检查收据无法区分输入变化与执行环境差异；由当前 Verifier 请求原检查并提交 refreshChecks: true，升级一次检查证据后再验收',
       );
+    }
   }
   if (
     output.candidateId !== candidateId ||
@@ -786,7 +983,46 @@ async function validatedCheckResults(options: {
       output.checks[index],
       `Native check ${index}`,
     ) as unknown as NativeSdkCheckResult;
-    const expectedRef = `${runtimeRef}/logs/checks/${operationId}-${plan.id}.log`;
+    let expectedRef = `${runtimeRef}/logs/checks/${operationId}-${plan.id}.log`;
+    if (check.reusedFrom) {
+      const origin = check.reusedFrom;
+      const prior = run.actions.find((entry) => entry.id === origin.actionId);
+      const priorOutput = prior?.outcome?.output as unknown as NativeSdkCheckOutcome | undefined;
+      const priorPlans =
+        prior && priorOutput ? checkPlansForAction(run, prior, priorOutput.candidateId) : [];
+      const originalIndex = priorOutput?.checks.findIndex(({ id }) => id === origin.checkId) ?? -1;
+      const original = priorOutput?.checks[originalIndex];
+      if (
+        !prior ||
+        !prior.outcome ||
+        run.actions.findIndex(({ id }) => id === prior.id) >=
+          run.actions.findIndex(({ id }) => id === action.id) ||
+        prior.attempt !== origin.attempt ||
+        prior.claim?.executorId !== nativeSdkCheckExecutor.id ||
+        !['succeeded', 'failed'].includes(prior.status) ||
+        priorOutput?.interruption ||
+        !priorOutput?.inputSnapshot?.complete ||
+        priorOutput.candidateId !== origin.candidateId ||
+        priorOutput.inputSnapshot.candidateBefore === null ||
+        priorOutput.inputSnapshot.candidateBefore !== priorOutput.candidateInputFingerprintGate ||
+        !original ||
+        original.reusedFrom ||
+        original.status !== 'passed' ||
+        !priorPlans[originalIndex] ||
+        nativeCheckPlanKey(priorPlans[originalIndex]) !== nativeCheckPlanKey(plan) ||
+        !isNativeCheckScope(original.inputScope, priorPlans[originalIndex]) ||
+        !isNativeCheckScope(check.inputScope, plan) ||
+        !sameNativeCheckScope(original.inputScope, check.inputScope) ||
+        original.logSha256 !== check.logSha256 ||
+        original.exitCode !== check.exitCode ||
+        original.durationMs !== check.durationMs
+      ) {
+        throw new Error('Native reused check is not bound to its original Runtime evidence');
+      }
+      expectedRef = `${runtimeRef}/logs/checks/${checkOperationId(prior)}-${origin.checkId}.log`;
+      if (nativeSdkCheckStorageRef(original.logRef) !== expectedRef)
+        throw new Error('Native original check log does not match its Runtime Action');
+    }
     if (
       check.id !== plan.id ||
       check.name !== plan.name ||
@@ -860,7 +1096,10 @@ export async function nativeSdkCompletedCheckInputDrift(
     await validatedCheckResults({ ...validation, allowCandidateSuccessor: true });
     await validatedCheckResults(validation);
   } catch (error) {
-    return error instanceof NativeSdkCheckInputDriftError;
+    return (
+      error instanceof NativeSdkCheckInputDriftError ||
+      error instanceof NativeSdkCandidateDriftError
+    );
   }
   return false;
 }
@@ -1008,6 +1247,24 @@ export async function nativeSdkCurrentCheckSummaries(options: {
   run: Readonly<WorkflowRun>;
   projectRoot: string;
 }): Promise<NativePortableCheckSummary[]> {
+  return currentCheckSummaries(options, 'verify');
+}
+
+/** Archive 只读复核原检查，不改变 Verifier 的阶段要求或推进状态。 */
+export async function assertNativeSdkArchiveCheckInputs(options: {
+  run: Readonly<WorkflowRun>;
+  projectRoot: string;
+}): Promise<void> {
+  await currentCheckSummaries(options, 'archive');
+}
+
+async function currentCheckSummaries(
+  options: {
+    run: Readonly<WorkflowRun>;
+    projectRoot: string;
+  },
+  phase: 'verify' | 'archive',
+): Promise<NativePortableCheckSummary[]> {
   const { run, projectRoot } = options;
   const state = parseNativePortableState(run.state);
   const candidateStart = run.actions
@@ -1025,7 +1282,7 @@ export async function nativeSdkCurrentCheckSummaries(options: {
         ['succeeded', 'failed'].includes(entry.status),
     );
   if (
-    state.phase !== 'verify' ||
+    state.phase !== phase ||
     !state.builder_handoff ||
     !actions.some((entry) => entry.stepId === 'verify.checks') ||
     actions.some((entry) => entry.claim?.executorId !== nativeSdkCheckExecutor.id || !entry.outcome)
@@ -1115,8 +1372,18 @@ export async function assertNativeSdkCandidateUnchanged(options: {
     );
   const recorded = (current?.outcome?.output as unknown as NativeSdkCheckOutcome | undefined)
     ?.candidateInputFingerprintGate;
+  if (current && recorded === null) {
+    if (options.requireEvidence) {
+      const output = current.outcome?.output as unknown as NativeSdkCheckOutcome;
+      const diagnostics = output.inputSnapshot?.diagnostics ?? [];
+      throw new NativeSdkCandidateDriftError(
+        `Native 本次检查未建立候选实现摘要${diagnostics.length ? `：${diagnostics.join('；')}` : '：候选输入采集失败或不完整'}；先排除输入读取问题，再通过原工作流重新验收，不能直接归档或复用旧证据`,
+      );
+    }
+    return;
+  }
   // 旧收据没有语义摘要；显式重新验收建立绑定，不能据此复用旧成功证据。
-  if (!current || recorded === undefined || recorded === null) {
+  if (!current || recorded === undefined) {
     if (options.requireEvidence)
       throw new NativeSdkCandidateDriftError(
         'Native 旧检查缺少候选实现摘要；请通过原工作流重新验收',
@@ -1139,6 +1406,7 @@ export async function nativeSdkCandidateInputGate(options: {
   archiveOwnedPaths?: readonly string[];
   legacyArchiveOverlay?: NativeLegacyArchiveOverlay;
   legacyExecutionBinding?: boolean;
+  includeGeneratedInputs?: boolean;
 }): Promise<string | null> {
   const state = parseNativePortableState(options.run.state);
   if (!state.builder_handoff) return null;
@@ -1175,15 +1443,29 @@ export async function nativeSdkCandidateInputGate(options: {
     projectRoot: executionRoot,
     candidateId: state.builder_handoff.candidate_id,
     plans,
-    managedArtifactRoot: paths.artifactRoot,
+    managedArtifactRoot: await resolveArtifactRoot(executionRoot, input.artifactRootRef),
     editReviewScope: nativeEditReviewScope(paths, state),
+    shapeSemanticSnapshot: (await readNativeApprovedShapeSemanticSnapshot({ paths, state }))
+      ?.snapshot,
+    legacyShapeSemanticSnapshot: state.shape_semantic_snapshot === undefined,
   };
-  return nativeCandidateInputGate({
+  const candidate = await nativeCandidateInputGate({
     ...gateOptions,
     archiveOwnedPaths: options.archiveOwnedPaths,
     legacyArchiveOverlay: options.legacyArchiveOverlay,
     legacyExecutionBinding: options.legacyExecutionBinding,
   });
+  if (!options.includeGeneratedInputs || candidate === null) return candidate;
+  const snapshot = await nativeGeneratedCheckInputSnapshot({
+    state,
+    projectRoot: executionRoot,
+    plans,
+    managedArtifactRoot: gateOptions.managedArtifactRoot,
+    generatedInputExclusions: options.archiveOwnedPaths,
+  });
+  return snapshot.complete
+    ? hashRuntimeValue({ candidate, generatedInputs: snapshot.fingerprint })
+    : null;
 }
 
 export async function nativeSdkSupervisorChildCheckSummaries(options: {

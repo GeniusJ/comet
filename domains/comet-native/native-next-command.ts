@@ -1,4 +1,5 @@
 import { inspectNativeChildren } from './native-children.js';
+import { captureApprovedShapeOriginals } from './native-shape-review-evidence.js';
 import type { NativeWorkspaceFinish } from './native-workspace.js';
 import {
   nativePortableContinuation,
@@ -639,6 +640,10 @@ export async function nativeNextCommand(
         state: current,
       });
       if (drift.drifted) {
+        if (drift.reviewRequired)
+          throw new NativeUsageError(
+            drift.reason ?? 'Native formal comments require independent review',
+          );
         const state = await returnNativePortableChangeToShape({
           paths: configured.paths,
           name,
@@ -736,6 +741,11 @@ export async function nativeNextCommand(
         expectedContinuation,
         ...(coordinationMode === undefined ? {} : { coordinationMode }),
       });
+      try {
+        await captureApprovedShapeOriginals(configured.paths, state);
+      } catch {
+        // 原文缓存不可用时可从 Git 恢复或继续需求修订，不阻断已批准的 Shape。
+      }
     } else if (current.phase === 'shape') {
       throw new NativeUsageError(
         '--confirmed is only valid from the persisted Shape user confirmation boundary',
@@ -837,6 +847,10 @@ export async function nativeNextCommand(
         state: current,
       });
       if (drift.drifted) {
+        if (drift.reviewRequired)
+          throw new NativeUsageError(
+            drift.reason ?? 'Native formal comments require independent review',
+          );
         state = await returnNativePortableChangeToShape({
           paths: configured.paths,
           name,

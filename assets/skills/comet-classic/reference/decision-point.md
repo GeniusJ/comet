@@ -8,24 +8,42 @@ All comet sub-skills with user decision points share this protocol. Every step l
 
 Distinguish user decisions, automatic handling, and stop conditions:
 
-- **User decision**: two or more valid actions differ in scope, behavior, responsibility for risk, or irreversible outcomes. The user must choose. Explicit phase requirements to approve artifacts or designs are also user decisions: offer approval, adjustment, or deferral. A single technically recommended solution does not authorize automatic approval.
-- **Automatic handling**: exactly one safe next action remains within the request, such as repairing a failure with a known cause, reconciling state from evidence, retrying an idempotent check, or following saved configuration. Execute and report without another confirmation.
+- **User decision**: the current matter lacks valid approval or delegated authority, and the choice affects scope, behavior, responsibility for risk, or irreversible outcomes. Ask the user to decide. Honor an explicit request for confirmation at each phase; clarify unclear authorization boundaries.
+- **Automatic handling**: current content has explicit approval, or the user explicitly delegated decisions within an agreed scope. Check that the authority still applies and continue. Known in-scope repairs, evidence-based state reconciliation, idempotent checks, and valid saved configuration also require no extra confirmation.
 - **Stop condition**: a missing dependency, corrupt state, path escape, or unavailable external command leaves no valid next action. Report the blocker and recovery condition without inventing choices.
 - **Manual handoff**: `NEXT: manual` returns control; it is not a new user decision point. Print `HINT`, end the invocation, and do not ask whether to continue.
 
 Only the first category requires a decision. Open/Design questions about unclear scope, solutions, or acceptance requirements must also use the format below. If facts, paths, or other missing information cannot be represented by real options, state what is missing and request it without inventing answers.
 
-Ask related questions together when they can be answered together. Do not re-ask saved choices that remain valid. Do not add preflight checks to predict whether a later tool or operation might fail and filter out options. Present all workflow-supported choices; execute the selected action, and stop with the original error if it fails. If a configuration field has only one workflow-valid value, explain why and apply it without a separate pause. This rule does not replace explicit phase confirmation requirements.
+Ask related questions together when they can be answered together. Do not re-ask saved choices that remain valid. Do not add preflight checks to predict whether a later tool or operation might fail and filter out options. Present all workflow-supported choices; execute the selected action, and stop with the original error if it fails. If a configuration field has only one workflow-valid value, explain why and apply it without a separate pause. Honor an explicit user request for confirmation at each phase.
 
 ## Core Rules
 
 A pause or stop applies only to actions that depend on the decision or are blocked by the current problem. Other investigation, evidence preparation, and permitted work within the same authorized scope may continue. This does not allow bypassing phase Guards, implementing unconfirmed scope, or choosing for the user.
 
-- Decision points are blocking points. Wait for an explicit user choice before continuing dependent work.
-- Use `AskUserQuestion` for single-select or multi-select choices when it is present; otherwise present clear text options and wait for the reply.
+- When a new user decision is needed, pause dependent actions until an explicit answer arrives.
+- When a question is needed, use `AskUserQuestion` for single-select or multi-select choices when available; otherwise present clear text options and end the current response, then wait for the actual answer before running dependent commands. The absence of a structured question tool does not grant authorization.
 - If `AskUserQuestion` cannot be used, record that structured questions are unavailable for this session. Do not repeatedly retry it at later decision points; use text options directly.
 - Never substitute recommendations, defaults, historical preferences, or an assumption that the user would agree for current confirmation.
 - Before an explicit choice, do not write the corresponding state fields, execute the corresponding branch operation, or automatically continue to the next phase.
+
+Authorization may come from the current request or an existing record; it need not follow artifact creation. Check its object, scope, and conditions against current content. Reuse authority that still applies, and ask only about substantial changes beyond it. Record the actual basis for the decision; do not describe an Agent's own choice as user confirmation.
+
+## Presenting execution configuration
+
+When SDK or Compat needs to present, complete, or change Build configuration, follow this section, then save it through the current Runtime path's existing commands. Use the current `configuration`, `configurationReadiness`, and existing user decisions to show each value, its plain-language meaning, and a status of "Confirmed", "Needs input", "Needs correction", or "User requested change". State when a value is missing; do not label a recommendation as confirmed. `configurationReadiness` describes field validity, not approval for this change. Ask only for missing, invalid, or explicitly changed choices, collecting necessary decisions together.
+
+Each new full change requires approval of its own configuration; project defaults, recommendations, and choices from another change do not constitute approval. Reuse confirmed choices that remain valid when recovering or returning to Design in the same change. When the configuration proposal changes, reconfirm through the current path's existing mechanism instead of reusing stale approval. After the user explicitly chooses the complete configuration, save it, briefly echo the result, and continue without another confirmation that contains no new decision. Keep waiting when a decision is missing. For hotfix/tweak, explain the current preset's values and meanings and retain existing confirmation steps without adding a separate Build configuration approval.
+
+Explain execution strategy, TDD, and review depth separately. `tdd_mode: direct` does not require RED/GREEN but still runs relevant checks and defect regressions. `direct_override` applies only to full's `build_mode: direct`; `tdd_mode: direct` does not enable it. Explain the practical effects of delegation and direct implementation instead of asking users to guess separate Boolean flags. Retain each path's existing requirements for explicit full direct selection, autonomous independent review, and subagent dispatch. Correct invalid combinations according to Runtime validation.
+
+## Reconfirmation after requirement changes
+
+When SDK or Compat needs reconfirmation after requirements or acceptance change, explain the effects under this section, then follow the current path's existing Spec Patch, Design, or preset scope-review steps. First distinguish implementation omissions within confirmed goals, changes to formal requirements or acceptance, and unrelated requests. Repair implementation omissions within the original scope; assign unrelated requests separately rather than adding them to the current change.
+
+When reconfirming, first describe behavior added, removed, or changed since the last approved proposal, affected acceptance criteria, work that can be retained, and steps that must be repeated. Then show the complete current proposal. Compare only against readable approved proposals, formal files, and explicit user decisions. When no trustworthy previous proposal is available, state that a reliable comparison is unavailable and list only known changes; do not invent differences or claim that everything else is unchanged. First-time confirmation does not require an invented before-and-after comparison.
+
+The change summary helps the user read; approval remains bound to the complete current proposal and the current path's existing approval identity. Retain prior authorization for Spec Patches in Design, formal design confirmation, and preset scope review. Reuse existing Build configuration under the preceding section. Explain repeated work from the Runtime's current action and evidence validity; do not promise reuse of invalid checks or apply old acceptance results to new requirements. Preserve failed, interrupted, or unknown results honestly, and do not skip pending user decisions during recovery.
 
 ## Reusing file-count authorization in Classic presets
 

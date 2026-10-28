@@ -8,12 +8,12 @@ import {
 } from './classic-runtime-paths.js';
 import { inspectClassicSdkRevisionReadiness } from './classic-sdk-revision-readiness.js';
 import { inspectClassicSdkActionRecovery } from './classic-sdk-check-recovery.js';
-import { reviseClassicSdkWork } from './classic-sdk-revision.js';
+import { reviseClassicSdkWork, rebindClassicSdkWork } from './classic-sdk-revision.js';
 import { measureCometGitCommand } from '../../platform/process/runtime-metrics.js';
 import { spawnSync } from 'child_process';
 import path from 'path';
 import { Document, parseDocument } from 'yaml';
-import { samePath } from '../../platform/paths/git-worktree.js';
+import { samePath, inspectGitWorktree } from '../../platform/paths/git-worktree.js';
 import type { CliOutputEnvelope } from '../workflow-contract/output-envelope.js';
 import { formatCliCommandArgs } from '../workflow-contract/output-envelope.js';
 import { classicSdkEntryData as sdkEntryData } from './classic-sdk-output.js';
@@ -37,7 +37,11 @@ import {
   decideClassicSdkArchive,
   proposeClassicSdkArchive,
 } from './classic-sdk-archive-decision.js';
-import { completeClassicSdkDelivery } from './classic-sdk-delivery.js';
+import {
+  completeClassicSdkDelivery,
+  completeClassicSdkDeliveryFromRecord,
+  verifyClassicSdkDelivery,
+} from './classic-sdk-delivery.js';
 import {
   completeClassicSdkBuild,
   continueClassicSdkBuildPlan,
@@ -1396,8 +1400,53 @@ async function progressCommand(
       `Usage: comet state ${kind} <change-name> [--file <json>${kind === 'delivery' ? ' | --verify | --reauthorize --file <json>' : ''}]`,
     );
   validateChangeName(args[0]);
-  const { directory, file } = await stateFile(args[0]);
   const root = classicCommandProjectRoot();
+  if (kind === 'delivery') {
+    const owner = await resolveClassicChangeRuntimeOwner(root, args[0]);
+    const workspace =
+      owner?.format === 'compat' ? null : await findClassicSdkWorkspace(root, args[0]);
+    if (workspace) {
+      if (reauthorize)
+        fail(
+          'Classic SDK 交付审批不可通过 delivery --reauthorize 改写；请按 state next 返回的 SDK 续行处理',
+        );
+      if (args.length > 1 && !(args[1] === '--verify' && workspace.run.status === 'completed'))
+        await assertStateCommandWritable('set');
+      const run =
+        args[1] === '--verify'
+          ? await verifyClassicSdkDelivery(workspace.projectRoot, args[0])
+          : args[1] === '--file'
+            ? await completeClassicSdkDeliveryFromRecord(
+                workspace.projectRoot,
+                args[0],
+                JSON.parse(
+                  await readClassicProjectFile(root, args[2], { label: 'Classic delivery input' }),
+                ),
+              )
+            : workspace.run;
+      const data = await sdkEntryData(args[0], { run, projectRoot: workspace.projectRoot });
+      const historical = args[1] === '--verify' && workspace.run.status === 'completed';
+      output.data =
+        historical && data.delivery
+          ? {
+              ...data,
+              delivery: {
+                ...data.delivery,
+                verification: { ...data.delivery.verification, scope: 'historical-receipt' },
+              },
+            }
+          : data;
+      output.stdout.push(
+        historical
+          ? `Classic SDK 已完成交付回执核验：${args[0]}；核对原始提交，不重新核验当前工作区或远端状态。`
+          : run.status === 'completed'
+            ? `Classic SDK 交付已记录：${args[0]}`
+            : `Classic SDK 交付状态：${args[0]}。按 continuation 继续，不要重复归档。`,
+      );
+      return;
+    }
+  }
+  const { directory, file } = await stateFile(args[0]);
   const write = args[1] === '--file' || reauthorize;
   if (write && kind === 'delivery') {
     const inputPath = path.isAbsolute(args[inputIndex])
@@ -2188,6 +2237,11 @@ function requiredExact(args: string[], count: number, usage: string): void {
 }
 
 const MUTATING_STATE_COMMANDS = new Set([
+  'continue-build',
+  'continue-work',
+  'repair-archive',
+  'repair-delivery',
+  'decide-delivery-repair',
   'reopen-verification',
   'init',
   'restore',
@@ -2242,6 +2296,13 @@ async function assertStateChangeNotSdkOwned(
     return;
   }
   if (
+    subcommand === 'delivery' ||
+    subcommand === 'continue-build' ||
+    subcommand === 'continue-work' ||
+    subcommand === 'rebind' ||
+    subcommand === 'repair-archive' ||
+    subcommand === 'repair-delivery' ||
+    subcommand === 'decide-delivery-repair' ||
     subcommand === 'reopen-verification' ||
     subcommand === 'next' ||
     subcommand === 'restore' ||
@@ -2338,6 +2399,18 @@ async function selectChange(
 
 async function rebind(output: CommandOutput, name: string): Promise<void> {
   validateChangeName(name);
+  const projectRoot = classicCommandProjectRoot();
+  if (await readSdkChangeOwner(projectRoot, 'classic', name)) {
+    const invocationRoot = inspectGitWorktree(classicCommandInvocationCwd()).currentWorktreeRoot;
+    const changeRoot = inspectGitWorktree(projectRoot).currentWorktreeRoot;
+    if (!invocationRoot || !changeRoot || !samePath(invocationRoot, changeRoot))
+      fail('ERROR: rebind must run in the change workspace');
+    const run = await rebindClassicSdkWork(projectRoot, name);
+    output.stderr.push(
+      green(`[REBIND] bound_branch: ${(run.state as unknown as ClassicState).boundBranch}`),
+    );
+    return;
+  }
   const { directory } = await stateFile(name);
   const boundBranch = await readField(name, 'bound_branch');
   if (!boundBranch || boundBranch === 'null') {
@@ -2668,6 +2741,35 @@ export const classicStateCommand: ClassicCommandHandler = withProjectContext(
             ? `Build configuration proposed for ${rest[0]}; user decision is pending.`
             : `Build configuration ${rest[4]} for ${rest[0]}.`,
         );
+      } else if (subcommand === 'decide-delivery-repair') {
+        if (
+          rest.length !== 5 ||
+          rest[1] !== '--proposal-hash' ||
+          rest[3] !== '--choice' ||
+          !['approved', 'later'].includes(rest[4])
+        )
+          fail(
+            'Usage: comet state decide-delivery-repair <change-name> --proposal-hash <hash> --choice <approved|later>',
+          );
+        validateChangeName(rest[0]);
+        const workspace = await findClassicSdkWorkspace(classicCommandProjectRoot(), rest[0]);
+        if (!workspace) fail(`ERROR: Classic change '${rest[0]}' is not owned by an SDK Run`);
+        const wait = workspace.run.waits.find(
+          (w) =>
+            w.status === 'pending' && w.stepId === `${workspace.state.workflow}.delivery.confirm`,
+        );
+        if (!wait || wait.proposalHash !== rest[2])
+          fail('Classic delivery repair approval is stale or missing');
+        const run = await workspace.runtime.resolveWait({
+          runId: workspace.run.runId,
+          expectedRevision: workspace.run.revision,
+          waitId: wait.id,
+          proposalHash: rest[2],
+          choice: rest[4],
+          decisionId: `classic-delivery-repair-${wait.id}-${rest[2]}-${rest[4]}`,
+          context: { requestId: randomUUID(), projectRoot: workspace.projectRoot },
+        });
+        await nextSdk(output, rest[0], run, workspace.projectRoot);
       } else if (subcommand === 'propose-archive' || subcommand === 'decide-archive') {
         const proposing = subcommand === 'propose-archive';
         if (!rest[0]) {
@@ -2774,8 +2876,12 @@ export const classicStateCommand: ClassicCommandHandler = withProjectContext(
         output.stdout.push(`Archive delivery recorded for ${rest[0]}.`);
       } else if (
         subcommand === 'revise-design' ||
+        subcommand === 'continue-build' ||
+        subcommand === 'continue-work' ||
         subcommand === 'revise-plan' ||
-        subcommand === 'reopen-verification'
+        subcommand === 'reopen-verification' ||
+        subcommand === 'repair-delivery' ||
+        subcommand === 'repair-archive'
       ) {
         if (
           rest.length !== 3 ||

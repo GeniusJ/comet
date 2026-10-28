@@ -281,6 +281,21 @@ export interface FileRuntimeStoreRunSource {
 // @public (undocumented)
 export function hashRuntimeValue(value: unknown): string;
 
+// @public
+export function inspectFileRuntimeStoreLock(options: Pick<FileRuntimeStoreOptions, 'rootDir'>, runId: string): Promise<{
+    file: string;
+    path: string;
+    status: "missing" | "active" | "stale" | "unknown" | "malformed";
+    owner: RecoverableFileLockOwner | null;
+    token: string | null;
+    coordinator?: Array<{
+        file: string;
+        status: "active" | "unknown" | "malformed";
+        owner: RecoverableFileLockOwner | null;
+        token: string;
+    }>;
+}>;
+
 // @public (undocumented)
 export type InvalidateRuntimeEvidence = RecordRuntimeEvidence;
 
@@ -327,6 +342,11 @@ export function readPortableRunCheckpoint(value: unknown, runId: string, options
     preserveSourceRevision?: boolean;
 }): WorkflowRun | null;
 
+// @public
+export function readPortableRunCheckpointProjection(value: unknown, runId: string, options?: {
+    preserveSourceRevision?: boolean;
+}): WorkflowRun | null;
+
 // @public (undocumented)
 export function readRuntimeProjection<T extends RuntimeRecord>(store: RuntimeStore<T>, runId: string): Promise<Readonly<{
     record: T;
@@ -354,6 +374,9 @@ export interface RecordRuntimeEvidence extends RunCommand {
 }
 
 // @public (undocumented)
+export function repairFileRuntimeStoreLock(options: Pick<FileRuntimeStoreOptions, 'rootDir'>, runId: string, token: string, confirmedOwnerStopped?: boolean): Promise<"removed" | "changed" | "missing" | "blocked">;
+
+// @public (undocumented)
 export interface ResolveRuntimeWait extends RunCommand {
     // (undocumented)
     choice: string;
@@ -361,6 +384,7 @@ export interface ResolveRuntimeWait extends RunCommand {
     decisionId: string;
     // (undocumented)
     proposalHash: string;
+    reason?: string;
     // (undocumented)
     waitId: string;
 }
@@ -463,7 +487,6 @@ export interface RuntimeClaim {
 export interface RuntimeCommandValidator {
     // (undocumented)
     id: string;
-    // (undocumented)
     validate(input: {
         run: Readonly<WorkflowRun>;
         name: string;
@@ -471,8 +494,10 @@ export interface RuntimeCommandValidator {
         context?: RuntimeInvocationContext;
     }): (RuntimeValidation & {
         allowCompleted?: boolean;
+        allowFailed?: boolean;
     }) | Promise<RuntimeValidation & {
         allowCompleted?: boolean;
+        allowFailed?: boolean;
     }>;
     // (undocumented)
     version: string;
@@ -818,6 +843,7 @@ export interface RuntimeWait {
         id: string;
         choice: string;
         proposalHash: string;
+        reason?: string;
     };
     // (undocumented)
     id: string;

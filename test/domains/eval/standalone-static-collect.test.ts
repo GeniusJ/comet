@@ -14,6 +14,32 @@ const packageRoot = repository;
 const evalRoot = path.join(repository, 'eval');
 const temporary: string[] = [];
 
+it('accepts the system Python one-shot recovery command and rejects changed execution evidence', () => {
+  const output = execFileSync(
+    'uv',
+    [
+      'run',
+      '--locked',
+      '--no-sync',
+      '--no-python-downloads',
+      'python',
+      '-m',
+      'pytest',
+      'local/tests/scaffold/test_native_sdk_recovery.py',
+      '-q',
+      '-k',
+      'one_shot or named_one',
+    ],
+    {
+      cwd: evalRoot,
+      encoding: 'utf8',
+      timeout: 60_000,
+      env: { ...process.env, PYTHON_DOTENV_DISABLED: '1', PYTHONUTF8: '1' },
+    },
+  );
+  expect(output).toContain('3 passed');
+});
+
 afterEach(async () => {
   await Promise.all(
     temporary.splice(0).map((root) => fs.rm(root, { recursive: true, force: true })),
@@ -85,6 +111,582 @@ function pythonAccepts(manifest: string): boolean {
 }
 
 describe('standalone static collector parity', () => {
+  it.each<[string, string, number?]>([
+    [
+      'reuses prior authorization while binding a required new reply to its pending proposal',
+      'local/tests/scaffold/test_sdk_task_validators.py::test_classic_explicit_reply_scope_preserves_prior_authorization_and_binds_the_new_reply',
+    ],
+    [
+      'observes only requested pending Classic decisions without changing their state',
+      'local/tests/scaffold/test_sdk_task_validators.py::test_classic_reply_probe_observes_only_original_pending_requested_waits',
+    ],
+    [
+      'rejects invalid explicit decision interaction scopes',
+      'local/tests/scaffold/test_tasks.py::test_task_limits_new_reply_requirements_to_the_explicit_decision_scope',
+    ],
+    [
+      'keeps subject output outside trusted decision reply evidence',
+      'local/tests/scaffold/test_conftest_helpers.py::test_extract_loop_binds_only_controller_owned_sdk_decision_replies',
+    ],
+    [
+      'does not mistake recovery hashes for rate limits',
+      'local/tests/scaffold/test_sample_quality.py::test_completed_recovery_hash_is_not_a_rate_limit',
+      3,
+    ],
+    [
+      'keeps actual rate limits excluded after hash classification repair',
+      'local/tests/scaffold/test_sample_quality.py::test_real_rate_limit_is_still_excluded',
+      3,
+    ],
+    [
+      'reserves Judge output space after reasoning without changing model identity',
+      'local/tests/scaffold/test_profiles.py::test_judge_provider_uses_direct_http_when_base_url_is_configured',
+      5,
+    ],
+    [
+      'excludes prior generated Eval output while binding real release inputs',
+      'local/tests/scaffold/test_regression_check.py::test_candidate_harness_ignores_old_eval_outputs_but_binds_authored_skill_inputs',
+    ],
+    [
+      'rejects unreadable Skill directories instead of accepting incomplete candidate inputs',
+      'local/tests/scaffold/test_regression_check.py::test_candidate_skill_enumeration_rejects_unreadable_directories',
+      4,
+    ],
+    [
+      'preflights fixed release suites without requiring a standalone target',
+      'local/tests/scaffold/test_regression_check.py::test_release_preflight_uses_fixed_suite_artifact_root_without_standalone_target',
+      3,
+    ],
+    [
+      'uses the actual frozen CLI distribution for both release suites',
+      'local/tests/scaffold/test_regression_check.py::test_release_snapshot_uses_actual_distribution_without_recompiling',
+      2,
+    ],
+    [
+      'freezes the exact fixed release tasks before Docker image preparation',
+      'local/tests/scaffold/test_regression_check.py::test_release_collection_freezes_exact_tasks_for_docker_prebuild',
+      2,
+    ],
+    [
+      'recognizes every approval request preserved from the original Classic failure',
+      'local/tests/scaffold/test_utils.py::test_decision_point_detector_accepts_original_104058_choice_replies',
+      4,
+    ],
+    [
+      'sends an actual approval reply for numeric delivery options instead of a continuation nudge',
+      'local/tests/scaffold/test_utils.py::test_claude_loop_sends_a_real_reply_to_plain_numeric_approval',
+    ],
+    [
+      'recognizes labelled delivery questions without requiring an interrogative opening',
+      'local/tests/scaffold/test_utils.py::test_decision_point_detector_accepts_labelled_delivery_questions',
+      6,
+    ],
+    [
+      'keeps labelled delivery approval history closed',
+      'local/tests/scaffold/test_utils.py::test_decision_point_detector_keeps_labelled_delivery_history_closed',
+      6,
+    ],
+    [
+      'sends an actual approval reply for labelled delivery options instead of a continuation nudge',
+      'local/tests/scaffold/test_utils.py::test_claude_loop_sends_a_real_reply_to_labelled_delivery_approval',
+    ],
+    [
+      'aligns both Classic layout treatments with the required unified entry',
+      'local/tests/scaffold/test_tasks.py::test_current_classic_treatments_follow_the_required_unified_entry_before_classic',
+    ],
+    [
+      'keeps destructive and unbound shell cleanup rejected',
+      'local/tests/scaffold/test_profiles.py::test_generic_safety_keeps_dangerous_or_unbound_cleanup_blocked',
+      18,
+    ],
+    [
+      'accepts explicit temporary cleanup APIs without relaxing shell deletion patterns',
+      'local/tests/scaffold/test_profiles.py::test_generic_safety_accepts_explicit_temporary_resource_cleanup',
+      2,
+    ],
+    [
+      'keeps the approved hardest-task matrix at three independent successes per workflow',
+      'local/tests/scaffold/test_regression_check.py::test_recovery_release_requires_all_three_samples_of_both_hard_tasks',
+    ],
+    [
+      'accepts exactly one requested passing sample of each hardest task',
+      'local/tests/scaffold/test_regression_check.py::test_recovery_release_accepts_one_requested_sample_of_each_hard_task',
+    ],
+    [
+      'requires the combined hardest Classic task to retain original post-Archive repair guards',
+      'local/tests/scaffold/test_sdk_task_validators.py::test_classic_hardest_post_archive_repair_retains_original_guards',
+      15,
+    ],
+    [
+      'revalidates the complete six-sample recovery receipt without accepting the full-suite baseline',
+      'local/tests/scaffold/test_regression_check.py::test_recovery_release_receipt_requires_six_independent_passing_samples',
+    ],
+    [
+      'rejects a failed or missing third recovery sample and duplicate executions',
+      'local/tests/scaffold/test_regression_check.py::test_recovery_release_never_selects_one_success_out_of_three',
+      5,
+    ],
+    [
+      'combines both actual CI core partitions before launching paid models',
+      'local/tests/scaffold/test_regression_check.py::test_ci_preflight_combines_complete_original_platform_jobs_before_models',
+    ],
+    [
+      'binds a uniquely named one-shot check to its original identity and rejects mismatched evidence',
+      'local/tests/scaffold/test_native_sdk_recovery.py::test_named_one_shot_requires_unique_plan_and_original_receipt_identity',
+    ],
+    [
+      'collects Python artifacts without repeating execution or one-shot side effects',
+      'local/tests/scaffold/test_logging.py::test_save_artifacts_never_replays_python_or_one_shot_outputs',
+    ],
+    [
+      'checks cold recovery boundaries even after artifact failure and retains the original SDK Run',
+      'local/tests/scaffold/test_native_sdk_recovery.py::test_failed_native_artifact_still_checks_cold_boundary_and_retains_authoritative_run',
+    ],
+    [
+      'archives trusted SDK inspections with explicit integrity and credential redaction',
+      'local/tests/scaffold/test_logging.py::test_save_artifacts_preserves_sdk_inspection_with_integrity_and_redaction',
+    ],
+    [
+      'retains only trusted validator evidence even when the task fails',
+      'local/tests/scaffold/test_utils.py::test_execution_validator_retains_failed_trusted_inspection_and_discards_subject_evidence',
+    ],
+    [
+      'stops only after every requested owned Classic Run has completed delivery',
+      'local/tests/scaffold/test_sdk_task_validators.py::test_requested_classic_completion_requires_every_owned_delivery',
+    ],
+    [
+      'requires the requested Native owner and terminal Run before ending the model loop',
+      'local/tests/scaffold/test_sdk_task_validators.py::test_requested_native_completion_uses_owned_terminal_run_without_prose',
+    ],
+    [
+      'binds the Native recovery task to its fixed completion Run and brief table location',
+      'local/tests/scaffold/test_sdk_task_validators.py::test_native_recovery_task_declares_its_fixed_completion_run',
+    ],
+    [
+      'ends the Native model loop on trusted completion without requiring completion words',
+      'local/tests/scaffold/test_utils.py::test_native_terminal_probe_ends_without_requiring_completion_words',
+      2,
+    ],
+    [
+      'preserves literal simulator context with empty optional loop arguments',
+      'local/tests/scaffold/test_utils.py::test_claude_loop_preserves_literal_simulator_context_with_empty_optional_arguments[False]',
+    ],
+    [
+      'preserves custom simulator context and subject-only plugin arguments',
+      'local/tests/scaffold/test_utils.py::test_claude_loop_preserves_literal_simulator_context_with_empty_optional_arguments[True]',
+    ],
+    [
+      'preserves Agent exit status and diagnostic framing across shell versions',
+      'local/tests/scaffold/test_utils.py::test_agent_runtime_capture_preserves_exit_and_frames_diagnostics',
+      2,
+    ],
+    [
+      'rejects a failed diagnostic framer instead of accepting successful Agent output',
+      'local/tests/scaffold/test_utils.py::test_agent_runtime_capture_rejects_failed_diagnostic_framing',
+    ],
+    [
+      'requires a pending decision before matching custom decision patterns across shell versions',
+      'local/tests/scaffold/test_utils.py::test_decision_point_patterns_require_an_unresolved_decision_signal',
+    ],
+    [
+      'preserves timeout status while cleaning only the registered Agent container across shell versions',
+      'local/tests/scaffold/test_utils.py::test_shell_timeout_cleans_only_its_registered_turn',
+    ],
+    [
+      'rejects cleanup of unowned or uninspectable Agent containers across shell versions',
+      'local/tests/scaffold/test_utils.py::test_shell_cleanup_refuses_unowned_or_uninspectable_container',
+      2,
+    ],
+    [
+      'rejects fresh Classic design or delivery approvals without actual user interaction evidence',
+      'local/tests/scaffold/test_sdk_task_validators.py::test_new_classic_proposals_cannot_pass_without_actual_user_interaction',
+    ],
+    [
+      'requires explicit fresh Classic proposal interaction configuration without reapproving historical runs',
+      'local/tests/scaffold/test_tasks.py::test_task_declares_classic_proposal_interaction_only_for_fresh_scenarios',
+    ],
+    [
+      'exports the original SDK Run from shared archive tasks before any later terminal failure',
+      'local/tests/scaffold/test_current_archive_acceptance.py::test_shared_archive_tasks_export_the_original_inspected_run_even_after_terminal_failure',
+      4,
+    ],
+    [
+      'loads the completion probe across separate mounts without workspace or PYTHONPATH injection',
+      'local/tests/scaffold/test_utils.py::test_requested_run_probe_loads_standalone_helper_without_package_imports',
+      4,
+    ],
+    [
+      'stops on an unavailable completion probe without repeatedly invoking the agent',
+      'local/tests/scaffold/test_utils.py::test_requested_run_probe_bootstrap_failure_stops_loop_without_terminal_nudges',
+    ],
+    [
+      'requires a bound execution observation for parked coexistence outside scoped check inputs',
+      'local/tests/scaffold/test_classic_sdk_recovery.py::test_scoped_verify_requires_bound_coexistence_observation',
+    ],
+    [
+      'selects the actual cache regenerated by the unchanged Classic Verify command',
+      'local/tests/scaffold/test_classic_sdk_recovery.py::test_post_archive_repair_selects_cache_regenerated_by_original_command',
+    ],
+    [
+      'rejects workspace module and PYTHONPATH injection into the coexistence observer and pytest',
+      'local/tests/scaffold/test_classic_sdk_recovery.py::test_coexistence_helper_isolates_workspace_modules_and_pythonpath',
+    ],
+  ])('%s', (_name, selector, expectedCount = 1) => {
+    const output = execFileSync(
+      'uv',
+      [
+        'run',
+        '--locked',
+        '--no-sync',
+        '--no-python-downloads',
+        'python',
+        '-m',
+        'pytest',
+        '-q',
+        selector,
+      ],
+      {
+        cwd: evalRoot,
+        encoding: 'utf8',
+        timeout: 60_000,
+        env: { ...process.env, PYTHONUTF8: '1' },
+      },
+    );
+    expect(output).toContain(`${expectedCount} passed`);
+  });
+
+  it('preserves exact provided check bytes across LF and CRLF without accepting mutations or duplicate execution', () => {
+    const result = execFileSync(
+      'uv',
+      [
+        'run',
+        '--locked',
+        'python',
+        '-m',
+        'pytest',
+        'local/tests/scaffold/test_current_archive_acceptance.py',
+        '-k',
+        'exact_distributed_script_bytes or missing_distributed_script_digest',
+        '-q',
+      ],
+      { cwd: evalRoot, encoding: 'utf8', stdio: 'pipe' },
+    );
+    expect(result).toMatch(/6 passed/);
+    expect(result).not.toMatch(/failed|skipped/);
+  });
+
+  it('binds Native recovery inputs to its required canonical spec and numeric line format', () => {
+    const result = execFileSync(
+      'uv',
+      [
+        'run',
+        '--locked',
+        'python',
+        '-m',
+        'pytest',
+        'local/tests/scaffold/test_current_archive_acceptance.py',
+        '-k',
+        'fixed_canonical',
+        '-q',
+      ],
+      { cwd: evalRoot, encoding: 'utf8', stdio: 'pipe' },
+    );
+    expect(result).toMatch(/1 passed/);
+    expect(result).not.toMatch(/failed|skipped/);
+  });
+
+  it('binds Classic parked proposal instructions to the unchanged exact preservation validator', () => {
+    const result = execFileSync(
+      'uv',
+      [
+        'run',
+        '--locked',
+        'python',
+        '-m',
+        'pytest',
+        'local/tests/scaffold/test_current_archive_acceptance.py',
+        '-k',
+        'classic_parked_proposal',
+        '-q',
+      ],
+      { cwd: evalRoot, encoding: 'utf8', stdio: 'pipe' },
+    );
+    expect(result).toMatch(/1 passed/);
+    expect(result).not.toMatch(/failed|skipped/);
+  });
+
+  it('prepares all six current workflow fixtures with only their selected trusted oracles', () => {
+    const result = execFileSync(
+      'uv',
+      [
+        'run',
+        '--locked',
+        'python',
+        '-m',
+        'pytest',
+        'local/tests/scaffold/test_current_archive_acceptance.py',
+        '-k',
+        '051_matrix_prepares or native_oracle_requires',
+        '-q',
+      ],
+      { cwd: evalRoot, encoding: 'utf8', stdio: 'pipe' },
+    );
+    expect(result).toMatch(/9 passed/);
+    expect(result).not.toMatch(/failed|skipped/);
+  });
+
+  it('isolates Classic controller tooling from Git inputs without altering Native fixtures', () => {
+    const result = execFileSync(
+      'uv',
+      [
+        'run',
+        '--locked',
+        'python',
+        '-m',
+        'pytest',
+        'local/tests/scaffold/test_conftest_helpers.py',
+        'local/tests/scaffold/test_utils.py',
+        '-k',
+        'current_classic_git_excludes or eval_git_excludes_does_not_initialize',
+        '-q',
+      ],
+      { cwd: evalRoot, encoding: 'utf8', stdio: 'pipe' },
+    );
+    expect(result).toMatch(/3 passed/);
+    expect(result).not.toMatch(/failed|skipped/);
+  });
+
+  it('binds Native recovery acceptance examples to the unchanged business baseline', () => {
+    const result = execFileSync(
+      'uv',
+      [
+        'run',
+        '--locked',
+        'python',
+        '-m',
+        'pytest',
+        'local/tests/scaffold/test_current_archive_acceptance.py',
+        '-k',
+        'native_recovery_examples',
+        '-q',
+      ],
+      { cwd: evalRoot, encoding: 'utf8', stdio: 'pipe' },
+    );
+    expect(result).toMatch(/1 passed/);
+    expect(result).not.toMatch(/failed|skipped/);
+  });
+
+  it('loads public treatment configurations with the current scaffold model', () => {
+    const result = execFileSync(
+      'uv',
+      [
+        'run',
+        '--locked',
+        'python',
+        '-m',
+        'pytest',
+        'local/tests/scaffold/test_treatments.py',
+        '-k',
+        'public_load_treatment',
+        '-q',
+      ],
+      { cwd: evalRoot, encoding: 'utf8', stdio: 'pipe' },
+    );
+    expect(result).toMatch(/1 passed/);
+    expect(result).not.toMatch(/failed|skipped/);
+  });
+
+  it('provides the current Native shared capability reference without installing another Skill', () => {
+    const result = execFileSync(
+      'uv',
+      [
+        'run',
+        '--locked',
+        'python',
+        '-m',
+        'pytest',
+        'local/tests/scaffold/test_conftest_helpers.py',
+        '-k',
+        'current_native_shared_host_check',
+        '-q',
+      ],
+      { cwd: evalRoot, encoding: 'utf8', stdio: 'pipe' },
+    );
+    expect(result).toMatch(/2 passed/);
+    expect(result).not.toMatch(/failed|skipped/);
+  });
+
+  it('binds one-shot recovery receipts to direct Python or an explicit fixed PATH', () => {
+    const result = execFileSync(
+      'uv',
+      [
+        'run',
+        '--locked',
+        'python',
+        '-m',
+        'pytest',
+        'local/tests/scaffold/test_native_sdk_recovery.py',
+        '-k',
+        'test_one_shot_receipt_accepts_only_the_bound_direct_or_fixed_path_command',
+        '-q',
+      ],
+      { cwd: evalRoot, encoding: 'utf8', stdio: 'pipe' },
+    );
+    expect(result).toMatch(/1 passed/);
+    expect(result).not.toMatch(/failed|skipped/);
+  });
+
+  it('starts the trusted Native recovery boundary checker in the actual flattened container layout', () => {
+    const result = execFileSync(
+      'uv',
+      [
+        'run',
+        '--locked',
+        'python',
+        '-m',
+        'pytest',
+        'local/tests/scaffold/test_current_archive_acceptance.py',
+        '-k',
+        'native_boundary_entry_imports_in_the_flattened_docker_python_layout',
+        '-q',
+      ],
+      { cwd: evalRoot, encoding: 'utf8', stdio: 'pipe' },
+    );
+    expect(result).toMatch(/1 passed/);
+    expect(result).not.toMatch(/failed|skipped/);
+  });
+
+  it('keeps the outer case timeout beyond the configured Classic execution budget', () => {
+    const result = execFileSync(
+      'uv',
+      [
+        'run',
+        '--locked',
+        'python',
+        '-m',
+        'pytest',
+        'local/tests/scaffold/test_current_archive_acceptance.py',
+        '-k',
+        'outer_case_timeout',
+        '-q',
+      ],
+      { cwd: evalRoot, encoding: 'utf8', stdio: 'pipe' },
+    );
+    expect(result).toMatch(/1 passed/);
+    expect(result).not.toMatch(/failed|skipped/);
+  });
+
+  it('stops after verified requested Run deliveries without dropping incomplete or child-only cases', () => {
+    const result = execFileSync(
+      'uv',
+      [
+        'run',
+        '--locked',
+        'python',
+        '-m',
+        'pytest',
+        'local/tests/scaffold/test_current_archive_acceptance.py',
+        'local/tests/scaffold/test_utils.py',
+        '-k',
+        'completion_detector or completion_point',
+        '-q',
+      ],
+      { cwd: evalRoot, encoding: 'utf8', stdio: 'pipe' },
+    );
+    expect(result).toMatch(/11 passed/);
+    expect(result).not.toMatch(/failed|skipped/);
+  });
+
+  it('ends disposable medium fixtures after verified Archive without persisting learning', () => {
+    const result = execFileSync(
+      'uv',
+      [
+        'run',
+        '--locked',
+        'python',
+        '-m',
+        'pytest',
+        'local/tests/scaffold/test_current_archive_acceptance.py',
+        '-k',
+        'disposable_medium_fixture',
+        '-q',
+      ],
+      { cwd: evalRoot, encoding: 'utf8', stdio: 'pipe' },
+    );
+    expect(result).toMatch(/1 passed/);
+    expect(result).not.toMatch(/failed|skipped/);
+  });
+
+  it('keeps controller installations from displacing actual business artifacts in Judge input', () => {
+    const result = execFileSync(
+      'uv',
+      [
+        'run',
+        '--locked',
+        'python',
+        '-m',
+        'pytest',
+        'local/tests/scaffold/test_profiles.py',
+        '-k',
+        'generic_judge_keeps_business_artifacts_when_current_cli_snapshots_are_present',
+        '-q',
+      ],
+      { cwd: evalRoot, encoding: 'utf8', stdio: 'pipe' },
+    );
+    expect(result).toMatch(/1 passed/);
+    expect(result).not.toMatch(/failed|skipped/);
+  });
+
+  it('translates Claude context suffixes for HTTP Judges while retaining configured model identity', () => {
+    const result = execFileSync(
+      'uv',
+      [
+        'run',
+        '--locked',
+        'python',
+        '-m',
+        'pytest',
+        'local/tests/scaffold/test_profiles.py',
+        '-k',
+        'judge_provider_uses_direct_http_when_base_url_is_configured',
+        '-q',
+      ],
+      { cwd: evalRoot, encoding: 'utf8', stdio: 'pipe' },
+    );
+    expect(result).toMatch(/5 passed/);
+    expect(result).not.toMatch(/failed|skipped/);
+  });
+
+  it('accepts either builtin Judge credential while preserving custom credential requirements', () => {
+    const result = execFileSync(
+      'uv',
+      ['run', '--locked', 'python', '-m', 'pytest', 'local/tests/scaffold/test_execution.py', '-q'],
+      { cwd: evalRoot, encoding: 'utf8', stdio: 'pipe' },
+    );
+    expect(Number(result.match(/(\d+) passed/)?.[1])).toBeGreaterThanOrEqual(28);
+    expect(result).not.toMatch(/failed|skipped/);
+  });
+
+  it('forwards explicit Claude tool search compatibility into isolated evaluation containers', () => {
+    const result = execFileSync(
+      'uv',
+      [
+        'run',
+        '--locked',
+        'python',
+        '-m',
+        'pytest',
+        'local/tests/scaffold/test_utils.py',
+        '-k',
+        'docker_forwards_explicit_tool_search_compatibility',
+        '-q',
+      ],
+      { cwd: evalRoot, encoding: 'utf8', stdio: 'pipe' },
+    );
+    expect(result).toMatch(/2 passed/);
+    expect(result).not.toMatch(/failed|skipped/);
+  });
+
   it.each([
     ['valid inline', '        files: [result.md]', true, 'evaluation.tasks[0]'],
     ['unsafe files', '        files: [../secret]', false, 'evaluation.tasks[0]'],

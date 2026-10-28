@@ -37,6 +37,8 @@ import {
 import { nativeSdkCheckValidator } from './native-sdk-checks.js';
 import {
   nativeSdkBeforeVerifierRecovery,
+  nativeSdkBeforeImplementationRevision,
+  nativeSdkBeforeBlockedVerifierRecovery,
   nativeSdkBeforeIntegrationRepairRecovery,
   nativeSdkLegacyDefinitions,
   nativeSdkMatchesRun,
@@ -49,6 +51,26 @@ import { validateNativeSdkFailedIntegrationRepair } from './native-sdk-superviso
 import { readProjectConfig } from './native-config.js';
 import { withNativeMutationLock } from './native-mutation-lock.js';
 import { nativeProjectPaths } from './native-paths.js';
+import { registerNativeRunnerInputArtifactLocked } from './native-runner-input-artifacts.js';
+
+/** 在已绑定的 SDK 入口登记请求文件；只读 inspect 不调用此写入口。 */
+export async function registerNativeSdkRequestInput(options: {
+  projectRoot: string;
+  artifactRootRef: string;
+  file: string;
+  runId: string;
+  validateContent: (content: string) => void;
+}): Promise<void> {
+  const paths = await nativeProjectPaths(options.projectRoot, options.artifactRootRef);
+  await withNativeMutationLock(paths, 'sdk-request-input', () =>
+    registerNativeRunnerInputArtifactLocked({
+      paths,
+      file: options.file,
+      runtimeRunId: options.runId,
+      validateContent: options.validateContent,
+    }),
+  );
+}
 import { parseNativePortableState } from './native-portable-state.js';
 import { recoverPristineNativeSdkChange } from './native-sdk-create.js';
 import { createNativeSdkStateStore } from './native-sdk-state-store.js';
@@ -218,6 +240,8 @@ export async function inspectNativeSdkDefinitionUpgrade(
     if (!workflow) return null;
     store = application.store;
     previousDefinitions = [
+      nativeSdkBeforeImplementationRevision(workflow),
+      nativeSdkBeforeBlockedVerifierRecovery(workflow),
       nativeSdkBeforeIntegrationRepairRecovery(workflow),
       nativeSdkBeforeVerifierRecovery(workflow),
     ];
@@ -245,6 +269,13 @@ export async function inspectNativeSdkDefinitionUpgrade(
     ready,
     required:
       previousHash === NATIVE_SDK_PRE_CHILD_ARCHIVE_HASH ||
+      (state.loop.next_action === 'resolve-verifier-blocker' &&
+        run.waits.some(
+          (wait) =>
+            wait.status === 'pending' &&
+            wait.stepId === 'verify.stop' &&
+            !wait.choices.includes('retry'),
+        )) ||
       (run.status === 'failed' && nativeSdkRecoverableFailureReason(run.reason)),
     repaired: false,
     fromHash: previousHash,
@@ -268,6 +299,19 @@ export async function inspectNativeSdkDefinitionUpgrade(
         !wait.choices.includes('reverify')
       )
         wait.choices = [...wait.choices, 'reverify'];
+  }
+  if (
+    workflow.steps['verify.stop']?.type === 'ask_user' &&
+    Array.isArray(workflow.steps['verify.stop'].choices) &&
+    workflow.steps['verify.stop'].choices.includes('retry')
+  ) {
+    for (const wait of next.waits)
+      if (
+        wait.stepId === 'verify.stop' &&
+        wait.status === 'pending' &&
+        !wait.choices.includes('retry')
+      )
+        wait.choices = ['retry', ...wait.choices];
   }
   next.workflow.hash = result.toHash;
   next.definitionHashes[JSON.stringify([definition.id, definition.version])] = result.toHash;
@@ -572,7 +616,7 @@ export async function findNativeSdkWorkspace(
   options: { readOnly?: boolean } = {},
 ): Promise<({ projectRoot: string } & Awaited<ReturnType<typeof inspectNativeSdkRun>>) | null> {
   const requestedRoot = path.resolve(projectRoot);
-  if (await readSdkChangeOwner(requestedRoot, 'native', name)) {
+  if (await readSdkChangeOwner(requestedRoot, 'native', name, options)) {
     return {
       projectRoot: requestedRoot,
       ...(await inspectNativeSdkRun(requestedRoot, name, options)),
@@ -583,7 +627,7 @@ export async function findNativeSdkWorkspace(
   > = [];
   for (const worktree of listGitWorktrees(requestedRoot)) {
     if (samePath(worktree.root, requestedRoot)) continue;
-    if (!(await readSdkChangeOwner(worktree.root, 'native', name))) continue;
+    if (!(await readSdkChangeOwner(worktree.root, 'native', name, options))) continue;
     const inspected = await inspectNativeSdkRun(worktree.root, name, options);
     if (!worktree.branch || inspected.state.workspace.change_branch !== worktree.branch) {
       throw new Error(`Native SDK change '${name}' is not bound to its registered worktree`);
@@ -602,7 +646,7 @@ export async function resolveNativeSdkCommandRoot(
   options: { readOnly?: boolean } = {},
 ): Promise<string> {
   const requestedRoot = path.resolve(projectRoot);
-  let localOwner = await readChangeRuntimeOwner(requestedRoot, 'native', name);
+  let localOwner = await readChangeRuntimeOwner(requestedRoot, 'native', name, options);
   if (!localOwner && !options.readOnly) {
     const config = await readProjectConfig(requestedRoot);
     if (config) {

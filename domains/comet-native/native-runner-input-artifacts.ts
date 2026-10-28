@@ -1,5 +1,6 @@
 import { resolveWorkspaceRuntimeRoot } from '../workflow-contract/workspace-runtime.js';
 import { createHash } from 'node:crypto';
+import { realpath } from 'node:fs/promises';
 import path from 'node:path';
 import { runGitCommand } from '../../platform/process/git.js';
 import { readProtectedProjectFile } from '../workflow-contract/protected-project-path.js';
@@ -12,6 +13,7 @@ const MAX_INPUT_BYTES = 8 * 1024 * 1024;
 interface RunnerInputArtifact {
   path: string;
   digest: string;
+  runtimeRunId?: string;
 }
 
 function digest(bytes: Buffer): string {
@@ -51,10 +53,16 @@ async function readRegistry(projectRoot: string): Promise<RunnerInputArtifact[]>
         typeof row.path !== 'string' ||
         relativeInputPath(projectRoot, row.path) !== row.path ||
         typeof row.digest !== 'string' ||
-        !/^[a-f0-9]{64}$/u.test(row.digest)
+        !/^[a-f0-9]{64}$/u.test(row.digest) ||
+        (row.runtimeRunId !== undefined &&
+          (typeof row.runtimeRunId !== 'string' || !row.runtimeRunId.trim()))
       )
         throw new Error('Invalid Native Runner input artifact');
-      return { path: row.path, digest: row.digest };
+      return {
+        path: row.path,
+        digest: row.digest,
+        ...(row.runtimeRunId ? { runtimeRunId: row.runtimeRunId } : {}),
+      };
     });
   } catch {
     // Missing or damaged local bookkeeping never removes a candidate input.
@@ -78,6 +86,7 @@ async function matchingArtifacts(projectRoot: string): Promise<RunnerInputArtifa
   if (!registry.length) return [];
   const tracked = trackedPaths(projectRoot);
   if (!tracked) return [];
+  const physicalProjectRoot = await realpath(projectRoot);
   const matching: RunnerInputArtifact[] = [];
   for (const row of registry) {
     if (tracked.has(gitPathKey(row.path))) continue;
@@ -85,9 +94,26 @@ async function matchingArtifacts(projectRoot: string): Promise<RunnerInputArtifa
       const read = await readProtectedProjectFile(projectRoot, row.path, MAX_INPUT_BYTES, {
         label: 'Native Runner input artifact',
       });
-      const relative = relativeInputPath(projectRoot, read.realPath);
-      if (relative && !tracked.has(gitPathKey(relative)) && digest(read.bytes) === row.digest)
-        matching.push({ path: relative, digest: row.digest });
+      const relative = relativeInputPath(physicalProjectRoot, read.realPath);
+      let matches = digest(read.bytes) === row.digest;
+      if (!matches && row.runtimeRunId) {
+        const request: unknown = JSON.parse(read.bytes.toString('utf8'));
+        if (request && typeof request === 'object' && !Array.isArray(request)) {
+          const inspect = request as Record<string, unknown>;
+          // 只读 inspect 不写登记；仅识别原 Run 已登记文件中的严格只读载荷。
+          matches =
+            inspect.operation === 'inspect' &&
+            inspect.runId === row.runtimeRunId &&
+            Object.keys(inspect).every((key) =>
+              ['operation', 'runId', 'requestId', 'protocolVersion'].includes(key),
+            ) &&
+            (inspect.requestId === undefined ||
+              (typeof inspect.requestId === 'string' && Boolean(inspect.requestId.trim()))) &&
+            (inspect.protocolVersion === undefined || inspect.protocolVersion === 1);
+        }
+      }
+      if (relative && !tracked.has(gitPathKey(relative)) && matches)
+        matching.push({ ...row, path: relative });
     } catch {
       // Replaced, missing, linked or unstable files remain ordinary inputs.
     }
@@ -104,6 +130,7 @@ export async function registerNativeRunnerInputArtifactLocked(options: {
   paths: NativeProjectPaths;
   file: string;
   validateContent: (content: string) => void;
+  runtimeRunId?: string;
 }): Promise<void> {
   const relative = relativeInputPath(options.paths.projectRoot, options.file);
   if (!relative) return;
@@ -116,7 +143,10 @@ export async function registerNativeRunnerInputArtifactLocked(options: {
     { label: 'Native Runner input artifact' },
   );
   options.validateContent(read.bytes.toString('utf8'));
-  const physicalRelative = relativeInputPath(options.paths.projectRoot, read.realPath);
+  const physicalRelative = relativeInputPath(
+    await realpath(options.paths.projectRoot),
+    read.realPath,
+  );
   if (!physicalRelative || tracked.has(gitPathKey(physicalRelative))) return;
   const current = (await matchingArtifacts(options.paths.projectRoot)).filter(
     (row) => gitPathKey(row.path) !== gitPathKey(physicalRelative),
@@ -127,7 +157,14 @@ export async function registerNativeRunnerInputArtifactLocked(options: {
     );
   await atomicWriteJson(
     path.join(options.paths.workspaceRuntimeRoot, ...REGISTRY_REF.split('/')),
-    [...current, { path: physicalRelative, digest: digest(read.bytes) }],
+    [
+      ...current,
+      {
+        path: physicalRelative,
+        digest: digest(read.bytes),
+        ...(options.runtimeRunId ? { runtimeRunId: options.runtimeRunId } : {}),
+      },
+    ],
     { containedRoot: options.paths.runtimeDir },
   );
 }

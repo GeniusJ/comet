@@ -42,7 +42,12 @@ from scaffold.python.agents import get_agent_adapter
 from scaffold.python.execution import redact_sensitive
 from scaffold.python.manifest_tasks import load_manifest_tasks
 from scaffold.python.eval_context import resolve_eval_context
-from scaffold.python.task_resolution import build_task_catalogue, resolve_task_set
+from scaffold.python.task_resolution import (
+    ResolvedTask,
+    ResolvedTaskSet,
+    build_task_catalogue,
+    resolve_task_set,
+)
 from scaffold.python.paths import get_tasks_dir
 from scaffold.python.tasks import list_tasks, load_task
 from scaffold.python.treatments import TreatmentConfig, build_treatment_skills, load_treatments
@@ -50,7 +55,7 @@ from scaffold.python.validation import run_validators
 
 # Timeouts
 CLAUDE_TIMEOUT = 1500  # Default floor for Claude to complete a multi-turn task
-PYTEST_TIMEOUT = 4200  # Include long full-cycle task runtime, image setup, and teardown
+PYTEST_TIMEOUT = 14_400  # 允许单例三小时执行预算，并为验证、评分和清理保留一小时。
 MANIFEST_DYNAMIC_ONLY_TASKS = {"workflow-overlay-contract"}
 
 
@@ -145,6 +150,35 @@ def expand_treatment_patterns(patterns: list[str], all_treatments: dict) -> list
 def generate_test_params(task_filter: str | None, treatment_filter: str | None, config=None):
     """Generate (task_name, treatment_name) pairs based on filters."""
     params = []
+    if config is not None and conftest._release_suite(config):
+        from scaffold.python.release_gate import release_cases
+
+        cases = release_cases(conftest._release_suite(config), config.getoption("--count"))
+        if (
+            task_filter
+            or treatment_filter
+            or any(
+                config.getoption(flag)
+                for flag in (
+                    "--skill-path",
+                    "--eval-manifest",
+                    "--profile",
+                    "--quick",
+                    "--interaction-mode",
+                    "--max-turns",
+                    "--simulator-prompt",
+                )
+            )
+            or read_case_selection() is not None
+        ):
+            raise ValueError("发布矩阵不允许筛选 task/treatment、改变 profile/交互或只重跑失败项")
+        selected = tuple(
+            ResolvedTask(name, "bundled", load_task(name, tasks_dir=get_tasks_dir()))
+            for name in dict.fromkeys(task for task, _, _, _ in cases)
+        )
+        config._comet_frozen_task_set = ResolvedTaskSet("explicit", selected, None)
+        config._comet_resolved_tasks = {item.name: item.task for item in selected}
+        return [(task, treatment) for task, treatment, _, _ in cases]
     if config is not None:
         conftest._ensure_auto_generated_manifest(config, task_filter)
     all_treatments = load_treatments()
@@ -504,6 +538,11 @@ def test_task_treatment(task_name, treatment_name):
         environment_dir=task.environment_dir,
         workspace_dir=task.workspace_dir,
     )
+    # 在模型启动前读取控制器准备的真实 CLI 身份，不从模型生成的产物推断。
+    from scaffold.python.release_gate import read_json
+
+    build_identity_file = fixtures.test_dir / "_eval_current_comet/build-identity.json"
+    current_comet_build = read_json(build_identity_file) if build_identity_file.exists() else None
     selected_agent = conftest._resolve_eval_agent(fixtures.request_config).agent
     selected_adapter = get_agent_adapter(selected_agent)
     execution = conftest._resolve_eval_execution(fixtures.request_config)
@@ -636,6 +675,7 @@ def test_task_treatment(task_name, treatment_name):
         "case_manifest": case_manifest,
         "role_sessions": events["role_sessions"],
     }
+    events["current_comet_build"] = current_comet_build
     events["profile"] = outputs["profile"]
     events["agent"] = selected_agent
     events["role_models"] = role_models
@@ -648,6 +688,16 @@ def test_task_treatment(task_name, treatment_name):
     events["eval_generation"] = outputs["eval_generation"]
 
     passed, failed = run_validators(validators, fixtures.test_dir, outputs)
+    if task.config.evaluation.require_classic_proposal_interaction:
+        from scaffold.python.validation.current_sdk import classic_new_proposal_approval_issues
+
+        failed.extend(
+            classic_new_proposal_approval_issues(
+                outputs.get("validation_evidence", {}),
+                outputs["interaction"],
+                required_steps=task.config.evaluation.classic_proposal_interaction_steps,
+            )
+        )
     passed, failed = adapt_checks_for_native(
         fixtures.test_dir,
         outputs,
@@ -684,6 +734,7 @@ def test_task_treatment(task_name, treatment_name):
     # These fields are local evidence as well; Langfuse applies its own bounded
     # capture policy before sending them remotely.
     events["task"] = task.name
+    events["validation_evidence"] = outputs.get("validation_evidence", {})
     if "application_coverage" in outputs:
         events["application_coverage"] = outputs["application_coverage"]
         events["application_executed_steps"] = outputs["application_executed_steps"]

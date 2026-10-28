@@ -5,7 +5,7 @@ Generates rich experiment logs in logs/experiments/ including:
 - events/: Parsed events from each test run
 - raw/: Raw selected Agent CLI output
 - reports/: Per-run validation reports
-- artifacts/: Files selected Agent generated and their execution output
+- artifacts/: Read-only snapshots of generated files and validator evidence
 - metadata.json: Experiment metadata
 
 Supports pytest-xdist parallel execution via worker coordination.
@@ -28,7 +28,8 @@ from typing import Any
 
 import pytest
 
-from scaffold import run_agent_in_docker, run_python_in_docker, run_shell
+from scaffold import run_agent_in_docker, run_shell
+from scaffold import run_python_in_docker as run_python_in_docker
 from scaffold.python import (
     ExperimentLogger,
     TreatmentResult,
@@ -39,7 +40,6 @@ from scaffold.python import (
     save_events,
     save_raw,
     save_report,
-    strip_ansi,
 )
 from scaffold.python.agents import get_agent_adapter, resolve_agent, validate_agent_capabilities
 from scaffold.python.auto_tasks import AutoTaskError, ensure_generated_manifest, find_project_root
@@ -90,7 +90,7 @@ from scaffold.python.aligned_comparison import (
 
 
 def _extract_loop_turns(stderr: str | None) -> int | None:
-    match = re.search(r"\[loop\] finished after (\d+) turns", stderr or "")
+    match = re.search(r"^\[loop\] finished after (\d+) turns", stderr or "", re.MULTILINE)
     return int(match.group(1)) if match else None
 
 
@@ -98,16 +98,38 @@ def _extract_loop_interaction(stderr: str | None) -> dict[str, Any]:
     source = stderr or ""
     role_sessions = {"subject": [], "simulator": [], "judge": []}
     for role, session_id in re.findall(
-        r"\[loop\] role-session (subject|simulator|judge) ([^\s]+)", source
+        r"^\[loop\] role-session (subject|simulator|judge) ([^\s]+)$", source, re.MULTILINE
     ):
         if session_id not in role_sessions[role]:
             role_sessions[role].append(session_id)
+    boundaries = []
+    for raw in re.findall(r"^\[loop\] sdk-recovery-boundary (.+)$", source, re.MULTILINE):
+        try:
+            boundaries.append(json.loads(raw))
+        except json.JSONDecodeError:
+            boundaries.append({"invalid": True})
+    decision_replies = []
+    for raw in re.findall(r"^\[loop\] sdk-decision-reply (.+)$", source, re.MULTILINE):
+        try:
+            decision_replies.append(json.loads(raw))
+        except json.JSONDecodeError:
+            decision_replies.append({"invalid": True})
     return {
+        **({"sdk_recovery_boundaries": boundaries} if boundaries else {}),
+        **({"sdk_decision_replies": decision_replies} if decision_replies else {}),
         "actual_turns": _extract_loop_turns(source),
-        "decision_points": source.count("[loop] decision point detected"),
-        "deterministic_replies": source.count("[loop] deterministic decision reply applied"),
-        "completion_signals": source.count("[loop] workflow completion detected"),
-        "fresh_resume_boundaries": source.count("[loop] fresh resume boundary detected"),
+        "decision_points": len(
+            re.findall(r"^\[loop\] decision point detected", source, re.MULTILINE)
+        ),
+        "deterministic_replies": len(
+            re.findall(r"^\[loop\] deterministic decision reply applied", source, re.MULTILINE)
+        ),
+        "completion_signals": len(
+            re.findall(r"^\[loop\] workflow completion detected", source, re.MULTILINE)
+        ),
+        "fresh_resume_boundaries": len(
+            re.findall(r"^\[loop\] fresh resume boundary detected", source, re.MULTILINE)
+        ),
         "role_sessions": role_sessions,
     }
 
@@ -440,8 +462,13 @@ def _normal_run_preflight(config) -> None:
         raise pytest.UsageError("Docker CLI or daemon is unavailable")
     context = getattr(config, "_comet_eval_context", None)
     if context is None:
-        raise pytest.UsageError("Eval context is missing before normal-run preflight")
-    artifact_root = Path(context.artifact_root)
+        if not _release_suite(config):
+            raise pytest.UsageError("Eval context is missing before normal-run preflight")
+        from scaffold.python.paths import get_logs_dir
+
+        artifact_root = get_logs_dir()
+    else:
+        artifact_root = Path(context.artifact_root)
     artifact_root.mkdir(parents=True, exist_ok=True)
     try:
         with tempfile.NamedTemporaryFile(dir=artifact_root, prefix=".preflight-", delete=True):
@@ -767,8 +794,19 @@ def _copy_current_comet_cli_snapshot(environment_dir: Path, test_dir: Path) -> N
         or not source_files
     ):
         raise FileNotFoundError("Current Comet source snapshot is incomplete")
-    source_hash, source_count = _tree_digest(source_root, sorted(set(source_files)))
-    if published:
+    from scaffold.python.release_gate import current_source_identity
+
+    source_identity = current_source_identity(source_root)
+    source_hash = source_identity["sourceHash"]
+    source_count = source_identity["sourceFileCount"]
+    release = os.environ.get("COMET_EVAL_RELEASE_SUITE") in {"current", "recovery"}
+    if release:
+        from scaffold.python.release_gate import cli_snapshot_identity
+
+        cli_snapshot_identity(source_root)
+        compiler_version = "release-dist"
+        shutil.copytree(source_root / "dist", target / "dist")
+    elif published:
         compiler_version = "published-dist"
         shutil.copytree(source_root / "dist", target / "dist")
     else:
@@ -814,6 +852,8 @@ def _copy_trusted_native_runtime_snapshot(
     """Snapshot the controller-selected Native runtime before the Agent starts."""
     if not (environment_dir / TRUSTED_NATIVE_RUNTIME_MARKER).is_file():
         return
+    if "comet-classic" in (skills or {}) and "comet-native" not in (skills or {}):
+        return
     config = (skills or {}).get("comet-native")
     if not isinstance(config, dict):
         raise ValueError("Trusted Native oracle requires the comet-native Skill source")
@@ -855,8 +895,18 @@ def _copy_trusted_native_runtime_snapshot(
 # =============================================================================
 
 
+def _release_suite(config):
+    return getattr(getattr(config, "option", None), "release_suite", None)
+
+
 def pytest_addoption(parser):
     """Add CLI options for task and treatment selection."""
+    parser.addoption(
+        "--release-suite",
+        choices=["current", "recovery"],
+        default=None,
+        help="完整当前候选发布矩阵，不接受 task/treatment 缩减",
+    )
     parser.addoption(
         "--task",
         action="store",
@@ -1052,6 +1102,11 @@ class ExperimentPlugin:
             experiment_id=experiment_id,
             report_outputs=report_outputs,
         )
+        if _release_suite(self.config):
+            from scaffold.python.release_gate import candidate_identity, suite_contract
+
+            self.logger.metadata["release_candidate"] = candidate_identity()
+            self.logger.metadata["release_suite"] = suite_contract(_release_suite(self.config))
         self.start_time = time.time()
 
         print(f"\n{'=' * 60}")
@@ -1067,6 +1122,13 @@ class ExperimentPlugin:
         if not cases:
             return
         payload = expected_case_matrix_payload(cases)
+        if _release_suite(self.config):
+            from scaffold.python.release_gate import expected_matrix
+
+            if payload != expected_matrix(
+                self.config.getoption("--count"), _release_suite(self.config)
+            ):
+                raise pytest.UsageError("发布矩阵被筛选或不完整；不会启动模型样本")
         _persist_expected_case_matrix(self.logger.base_dir, payload)
         self.logger.metadata["expected_case_matrix"] = {
             "schema": payload["schema"],
@@ -1125,6 +1187,10 @@ class ExperimentPlugin:
 
     def pytest_runtest_logreport(self, report):
         """Keep setup/teardown failures distinct from scored case failures."""
+        if self.logger and getattr(report, "skipped", False):
+            self.logger.metadata["pytest_skipped"] = (
+                self.logger.metadata.get("pytest_skipped", 0) + 1
+            )
         if self.logger and report.failed and report.when != "call":
             self.logger.metadata["pytest_errors"] = self.logger.metadata.get("pytest_errors", 0) + 1
 
@@ -1142,6 +1208,8 @@ class ExperimentPlugin:
         self._reload_expected_case_matrix_metadata()
         self._reload_results_from_reports()
         self.logger.metadata["pytest_exitstatus"] = int(exitstatus)
+        self.logger.metadata.setdefault("pytest_errors", 0)
+        self.logger.metadata.setdefault("pytest_skipped", 0)
 
         if self.logger.results:
             self.logger.finalize()
@@ -1415,6 +1483,7 @@ def _resolve_interaction_config(task, profile_name: str, config):
         decision_replies=decision_replies,
         continue_prompt=continue_prompt,
         fresh_resume_marker=fresh_resume_marker,
+        completion_runs=task_interaction.completion_runs,
     )
 
 
@@ -1762,9 +1831,14 @@ def test_dir(tmp_path):
     yield tmp_path
     if (tmp_path / ".eval-runtime-volume").is_file():
         from scaffold.python.utils import run_shell
-        result = run_shell("docker.sh", "cleanup-runtime-data", str(tmp_path), timeout=30, check=False)
+
+        result = run_shell(
+            "docker.sh", "cleanup-runtime-data", str(tmp_path), timeout=30, check=False
+        )
         if result.returncode != 0:
-            raise RuntimeError("Eval Runtime data cleanup failed: " + (result.stderr or result.stdout))
+            raise RuntimeError(
+                "Eval Runtime data cleanup failed: " + (result.stderr or result.stdout)
+            )
 
 
 @pytest.fixture
@@ -1817,6 +1891,7 @@ def setup_test_context(test_dir):
             if item.name in {
                 CURRENT_COMET_CLI_MARKER,
                 TRUSTED_NATIVE_RUNTIME_MARKER,
+                ".eval-classic-git-excludes",
             }:
                 continue
             dest = test_dir / item.name
@@ -1833,7 +1908,12 @@ def setup_test_context(test_dir):
     def _copy_workspace(workspace_dir: Path) -> None:
         """Copy a bounded project fixture without replacing the task Dockerfile."""
         for item in workspace_dir.iterdir():
-            if item.name in {"Dockerfile", CURRENT_COMET_CLI_MARKER, TRUSTED_NATIVE_RUNTIME_MARKER}:
+            if item.name in {
+                "Dockerfile",
+                CURRENT_COMET_CLI_MARKER,
+                TRUSTED_NATIVE_RUNTIME_MARKER,
+                ".eval-classic-git-excludes",
+            }:
                 continue
             dest = test_dir / item.name
             if item.is_dir():
@@ -1913,6 +1993,31 @@ def setup_test_context(test_dir):
                 os.unlink(temp_file)
 
         agent = _resolve_eval_agent(_plugin.config).agent if _plugin else "claude-code"
+        skills_root = test_dir / _agent_project_root(agent) / "skills"
+        if (
+            environment_dir
+            and (environment_dir / CURRENT_COMET_CLI_MARKER).is_file()
+            and "comet-classic" in (skills or {})
+        ):
+            (test_dir / ".eval-classic-git-excludes").write_bytes(
+                b"comet.eval.classic-git-excludes.v1\n"
+            )
+        native_entry = skills_root / "comet-native/SKILL.md"
+        if (
+            environment_dir
+            and (environment_dir / CURRENT_COMET_CLI_MARKER).is_file()
+            and native_entry.is_file()
+            and "../comet/reference/host-check.md" in native_entry.read_text(encoding="utf-8")
+        ):
+            # This is shared documentation, not an additional executable Skill.
+            reference = test_dir / "_eval_current_comet/assets/skills/comet/reference/host-check.md"
+            if not reference.is_file():
+                raise FileNotFoundError(
+                    f"Current Native capability reference is missing: {reference}"
+                )
+            target = skills_root / "comet/reference/host-check.md"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(reference, target)
         _ensure_langfuse_trajectory_support(test_dir, agent)
         _ensure_agent_pre_tool_hook(test_dir, agent, _comet_hook_command(test_dir, agent))
 
@@ -1988,6 +2093,8 @@ def run_claude(test_dir, experiment_logger, request):
                 loop_args += ["--decision-reply-step", decision_reply_step]
             if interaction.fresh_resume_marker:
                 loop_args += ["--fresh-resume-marker", interaction.fresh_resume_marker]
+            if interaction.completion_runs:
+                loop_args += ["--completion-runs", json.dumps(interaction.completion_runs)]
 
             prompt_file = None
             try:
@@ -2064,6 +2171,13 @@ def record_result(test_dir, experiment_logger, request):
         treatment_name = _get_treatment_name(request.node)
         rep = _get_repetition(request.node)
         events["sample"] = rep
+        if getattr(experiment_logger, "metadata", {}).get("release_candidate"):
+            from scaffold.python.release_gate import candidate_identity
+
+            expected_candidate = experiment_logger.metadata["release_candidate"]
+            if candidate_identity() != expected_candidate:
+                raise ValueError("评估期间候选源码或 harness 已变化，请重新执行完整评估")
+            events["release_candidate"] = expected_candidate
         base_dir = experiment_logger.base_dir
 
         save_events(base_dir, treatment_name, rep, events)
@@ -2073,6 +2187,7 @@ def record_result(test_dir, experiment_logger, request):
             rep,
             test_dir,
             agent=events.get("agent", "claude-code"),
+            validation_evidence=events.get("validation_evidence"),
         )
         artifact_references = build_eval_artifact_references(base_dir, treatment_name, rep)
 
@@ -2182,6 +2297,7 @@ def _build_report_payload(
         "rep": rep,
         "passed": len(failed) == 0,
         "run_id": run_id,
+        "agent_returncode": returncode,
         "checks_passed": passed,
         "checks_failed": failed,
         "sample_quality": sample_quality,
@@ -2204,6 +2320,8 @@ def _build_report_payload(
             "skill_sources": events.get("skill_sources", []),
             "eval_manifest": events.get("eval_manifest"),
             "case_manifest": events.get("case_manifest"),
+            "release_candidate": events.get("release_candidate"),
+            "current_comet_build": events.get("current_comet_build"),
             "eval_generation": events.get("eval_generation"),
             "interaction": events.get("interaction", {}),
             "artifact_references": artifact_references,
@@ -2260,9 +2378,7 @@ def fixtures(
         record_result=record_result,
         request_config=request.config,
         repetition=(
-            _get_repetition(request.node)
-            if request.node.get_closest_marker("eval_case")
-            else 1
+            _get_repetition(request.node) if request.node.get_closest_marker("eval_case") else 1
         ),
     )
     yield _current_fixtures
@@ -2433,6 +2549,7 @@ def _save_artifacts(
     test_dir: Path,
     *,
     agent: str = "claude-code",
+    validation_evidence: dict | None = None,
 ):
     """Save the selected Agent's generated files as artifacts."""
     require_workspace_artifact_support()
@@ -2447,6 +2564,22 @@ def _save_artifacts(
     execution_dir = artifacts_dir / "execution"
     agent_dir.mkdir(parents=True, exist_ok=True)
     execution_dir.mkdir(parents=True, exist_ok=True)
+    if validation_evidence:
+        source = json.dumps(validation_evidence, sort_keys=True, separators=(",", ":"))
+        persisted = json.dumps(
+            redact_sensitive(validation_evidence), sort_keys=True, separators=(",", ":")
+        )
+        (execution_dir / "sdk-inspections.json").write_text(persisted, encoding="utf-8")
+        (execution_dir / "sdk-inspections-integrity.json").write_text(
+            json.dumps(
+                {
+                    "sourceHash": hashlib.sha256(source.encode()).hexdigest(),
+                    "persistedHash": hashlib.sha256(persisted.encode()).hexdigest(),
+                    "redacted": persisted != source,
+                }
+            ),
+            encoding="utf-8",
+        )
 
     from scaffold.python.utils import TEST_CONTEXT_FILE, TEST_RESULTS_FILE
 
@@ -2474,7 +2607,6 @@ def _save_artifacts(
         TEST_RESULTS_FILE,
     }
 
-    claude_files = []
     for item in iter_workspace_paths(test_dir):
         # Classic's public checkpoint is a dotfile, not private Agent config.
         # Keep this one state file while excluding all other hidden filenames.
@@ -2502,21 +2634,9 @@ def _save_artifacts(
             else:
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 dest.write_text(redact_sensitive(content), encoding="utf-8")
-            claude_files.append(item)
         except WorkspaceArtifactError:
             raise
         except Exception as e:
             import sys
 
             print(f"Warning: failed to save artifact {item.name}: {e}", file=sys.stderr)
-
-    for py_file in claude_files:
-        if py_file.suffix == ".py" and py_file.parent == test_dir:
-            try:
-                success, output = run_python_in_docker(test_dir, py_file.name, timeout=300)
-                status = "success" if success else "error"
-                output_file = execution_dir / f"{py_file.stem}_{status}.txt"
-                output_file.write_text(redact_sensitive(strip_ansi(output)), encoding="utf-8")
-            except Exception as e:
-                error_file = execution_dir / f"{py_file.stem}_error.txt"
-                error_file.write_text(redact_sensitive(str(e)), encoding="utf-8")

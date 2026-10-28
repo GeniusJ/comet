@@ -1,3 +1,4 @@
+import { resolveClassicCheckTimeout } from './classic-project-config.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { classicSdkRunMatchesProfile } from './classic-sdk-profile.js';
 import { promises as fs } from 'node:fs';
@@ -27,6 +28,12 @@ import {
   writeClassicProjectText,
 } from './classic-protected-path.js';
 import type { ClassicState } from './classic-state.js';
+import { assertClassicDeliveryRepairCurrent } from './classic-sdk-delivery-repair.js';
+import {
+  classicDeliveryRepairInputs,
+  classicDeliveryRepairForAction,
+  isClassicDeliveryRepairCheck,
+} from './classic-sdk-delivery-repair-model.js';
 import {
   classicSdkCheckRecordRef,
   classicSdkCheckDirectoryRef,
@@ -112,16 +119,21 @@ async function runCommand(
         finish(timedOut ? 124 : 1);
       }
     });
-    timer = setTimeout(() => {
-      timedOut = true;
-      finish(124);
-    }, timeoutMs);
-    try {
-      owned.start();
-    } catch (error) {
-      output += `\n${error instanceof Error ? error.message : String(error)}`;
-      finish(1);
-    }
+    void (async () => {
+      try {
+        // Windows 先等监管器完成启动，避免 taskkill 与进程初始化及自行清理竞争。
+        await owned.ready;
+        if (settled) return;
+        timer = setTimeout(() => {
+          timedOut = true;
+          finish(124);
+        }, timeoutMs);
+        owned.start();
+      } catch (error) {
+        output += `\n${error instanceof Error ? error.message : String(error)}`;
+        finish(1);
+      }
+    })();
   });
   // completed 只代表命令退出。监管器仍持有后代的执行边界；正常退出也必须清理，
   // 不能用组长 close 事件证明检查已静止，更不能提前采集成功快照。
@@ -173,20 +185,27 @@ async function checkedInput(
   ) {
     throw new Error('Classic check requires literal program arguments');
   }
-  const timeoutMs = input.timeoutMs ?? 300_000;
-  if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 3_600_000) {
-    throw new Error('Classic check timeout must be 1..3600000 milliseconds');
-  }
+  const timeoutMs = await resolveClassicCheckTimeout(root, input.timeoutMs);
   const state = run.state as ClassicState | undefined;
-  const changeDirRef =
+  let changeDirRef =
     run.input !== null &&
     typeof run.input === 'object' &&
     !Array.isArray(run.input) &&
     typeof run.input.changeDir === 'string'
       ? run.input.changeDir
       : null;
-  const scope = state?.phase === 'build' ? 'build' : state?.phase === 'verify' ? 'verify' : null;
+  const repairing = state && isClassicDeliveryRepairCheck(run, action);
+  const scope =
+    state?.phase === 'build' ? 'build' : state?.phase === 'verify' || repairing ? 'verify' : null;
   const profile = state?.workflow;
+  if (repairing) {
+    const original = run.actions.find(
+      (a) => a.id === classicDeliveryRepairForAction(action).archiveActionId,
+    );
+    changeDirRef =
+      (original?.outcome?.output as { archiveDirectory?: string } | undefined)?.archiveDirectory ??
+      null;
+  }
   if (
     !profile ||
     !classicSdkRunMatchesProfile(run, profile) ||
@@ -196,7 +215,7 @@ async function checkedInput(
     (scope === 'verify' && !state.verificationReport) ||
     !changeDirRef ||
     action.runId !== run.runId ||
-    action.stepId !== `${profile}.${scope}.check` ||
+    (!repairing && action.stepId !== `${profile}.${scope}.check`) ||
     action.type !== 'call_tool' ||
     action.ref !== 'classic-check'
   ) {
@@ -221,6 +240,9 @@ export function classicSdkCheckCommand(
   action: Readonly<RuntimeAction>,
   projectRoot: string,
 ): ClassicSdkCheckInput {
+  if (isClassicDeliveryRepairCheck(run, action)) {
+    return { runId: run.runId, projectRoot, ...classicDeliveryRepairForAction(action).command };
+  }
   const scope = (run.state as unknown as ClassicState).phase;
   if (scope !== 'build' && scope !== 'verify') throw new Error('Classic check scope is invalid');
   const label = `Classic input.checkCommands.${scope} must declare literal argv`;
@@ -265,7 +287,7 @@ export async function assertClassicSdkCheckCommandBinding(
   if (
     hashRuntimeValue(output.argv) !== hashRuntimeValue(input.argv) ||
     output.cwd !== cwd.relative ||
-    output.timeoutMs !== (input.timeoutMs ?? 300_000) ||
+    output.timeoutMs !== (await resolveClassicCheckTimeout(projectRoot, input.timeoutMs)) ||
     (output.reusable === true) !== (input.reusable === true)
   )
     throw new Error('Classic check receipt does not match the fixed command');
@@ -338,7 +360,7 @@ export async function runClassicSdkCommandCheck(
         ...(scope === 'verify'
           ? {
               deliveryInputs:
-                (await collectClassicSdkDeliveryInputs(root, before.manifest, identity)) ?? {},
+                (await collectClassicSdkDeliveryInputs(root, before.manifest, identity, run)) ?? {},
             }
           : {}),
         checkEpoch: state.checkEpoch ?? 0,
@@ -433,8 +455,28 @@ export async function runClassicSdkCommandCheck(
         return [...diff.added, ...diff.removed, ...diff.changed].slice(0, 100);
       })()
     : [];
+  let regeneration: Record<string, string> | undefined;
+  let regenerationFailure: string | undefined;
+  if (isClassicDeliveryRepairCheck(run, action)) {
+    try {
+      regeneration = (
+        await assertClassicDeliveryRepairCurrent(
+          root,
+          run,
+          classicDeliveryRepairForAction(action),
+          'checked',
+          after?.manifest,
+        )
+      ).regeneratedOutputs;
+    } catch (error) {
+      regenerationFailure = error instanceof Error ? error.message : String(error);
+    }
+  }
   const outcome: Pick<RuntimeOutcome, 'status' | 'output'> = {
-    status: result.exitCode === 0 && before.digest === inputAfter ? 'succeeded' : 'failed',
+    status:
+      result.exitCode === 0 && before.digest === inputAfter && !regenerationFailure
+        ? 'succeeded'
+        : 'failed',
     output: {
       scope,
       argv: identity.argv,
@@ -452,13 +494,24 @@ export async function runClassicSdkCommandCheck(
       ...(scope === 'verify' && after
         ? {
             deliveryInputs:
-              (await collectClassicSdkDeliveryInputs(root, after.manifest, identity)) ?? {},
+              (await collectClassicSdkDeliveryInputs(root, after.manifest, identity, run)) ?? {},
           }
         : {}),
       tier: 'full',
       checkEpoch: state.checkEpoch ?? 0,
       reusable: input.reusable === true,
       reused: false,
+      ...(isClassicDeliveryRepairCheck(run, action)
+        ? {
+            deliveryRepair: classicDeliveryRepairForAction(action) as unknown as RuntimeValue,
+            deliveryInputs: classicDeliveryRepairInputs(
+              run,
+              classicDeliveryRepairForAction(action),
+            ),
+            ...(regeneration ? { regeneratedOutputs: regeneration } : {}),
+            ...(regenerationFailure ? { regenerationFailure } : {}),
+          }
+        : {}),
     },
   };
   await recordClassicSdkCheckReceipt(root, run, action, outcome);

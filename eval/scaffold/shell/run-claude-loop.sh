@@ -15,6 +15,7 @@
 #   --continue-prompt TEXT    Nudge used when the workflow should continue
 #   --decision-pattern TEXT   Extra case-insensitive substring to treat as a decision point
 #   --fresh-resume-marker TEXT  Start the following turn in a new subject session
+#   --completion-runs JSON   Fixed SDK Run identities required to finish
 #
 # Env: ANTHROPIC_AUTH_TOKEN / ANTHROPIC_BASE_URL / ANTHROPIC_MODEL for the proxy.
 # Stdout: concatenated stream-json from every subject turn (for event extraction).
@@ -43,6 +44,7 @@ DECISION_REPLY=""
 DECISION_REPLY_STEPS=()
 CONTINUE_PROMPT="Please continue with the next phase of the comet workflow."
 FRESH_RESUME_MARKER=""
+COMPLETION_RUNS=""
 DECISION_PATTERNS=()
 PLUGIN_ARGS=()
 while [[ $# -gt 0 ]]; do
@@ -73,6 +75,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         --continue-prompt) CONTINUE_PROMPT="$2"; shift 2 ;;
         --fresh-resume-marker) FRESH_RESUME_MARKER="$2"; shift 2 ;;
+        --completion-runs) COMPLETION_RUNS="$2"; shift 2 ;;
         --decision-pattern)
             DECISION_PATTERNS+=("$2")
             shift 2
@@ -127,50 +130,50 @@ run_agent_turn() {
     local role="${3:-subject}"
     local role_plugin_args=()
     if [[ "$role" == "subject" ]]; then
-        role_plugin_args=("${PLUGIN_ARGS[@]}")
+        role_plugin_args=(${PLUGIN_ARGS[@]+"${PLUGIN_ARGS[@]}"})
     fi
     case "$AGENT" in
         claude-code)
             if [[ -n "$resume_id" ]]; then
-                COMET_EVAL_AGENT_ROLE="$role" capture_agent "$role" claude -p "$prompt" "${role_plugin_args[@]}" "${MODEL_FLAG[@]}" \
+                COMET_EVAL_AGENT_ROLE="$role" capture_agent "$role" claude -p "$prompt" ${role_plugin_args[@]+"${role_plugin_args[@]}"} ${MODEL_FLAG[@]+"${MODEL_FLAG[@]}"} \
                     --resume "$resume_id" --output-format stream-json --verbose \
                     --dangerously-skip-permissions
             else
-                COMET_EVAL_AGENT_ROLE="$role" capture_agent "$role" claude -p "$prompt" "${role_plugin_args[@]}" "${MODEL_FLAG[@]}" \
+                COMET_EVAL_AGENT_ROLE="$role" capture_agent "$role" claude -p "$prompt" ${role_plugin_args[@]+"${role_plugin_args[@]}"} ${MODEL_FLAG[@]+"${MODEL_FLAG[@]}"} \
                     --output-format stream-json --verbose --dangerously-skip-permissions
             fi
             ;;
         codex)
             if [[ -n "$resume_id" ]]; then
-                COMET_EVAL_AGENT_ROLE="$role" capture_agent "$role" codex exec resume "$resume_id" --json --yolo "${MODEL_FLAG[@]}" "$prompt"
+                COMET_EVAL_AGENT_ROLE="$role" capture_agent "$role" codex exec resume "$resume_id" --json --yolo ${MODEL_FLAG[@]+"${MODEL_FLAG[@]}"} "$prompt"
             else
-                COMET_EVAL_AGENT_ROLE="$role" capture_agent "$role" codex exec --json --yolo "${MODEL_FLAG[@]}" "$prompt"
+                COMET_EVAL_AGENT_ROLE="$role" capture_agent "$role" codex exec --json --yolo ${MODEL_FLAG[@]+"${MODEL_FLAG[@]}"} "$prompt"
             fi
             ;;
         qoder)
             if [[ -n "$resume_id" ]]; then
                 COMET_EVAL_AGENT_ROLE="$role" capture_agent "$role" qodercli -p "$prompt" --output-format stream-json --yolo \
-                    "${MODEL_FLAG[@]}" -r "$resume_id"
+                    ${MODEL_FLAG[@]+"${MODEL_FLAG[@]}"} -r "$resume_id"
             else
-                COMET_EVAL_AGENT_ROLE="$role" capture_agent "$role" qodercli -p "$prompt" --output-format stream-json --yolo "${MODEL_FLAG[@]}"
+                COMET_EVAL_AGENT_ROLE="$role" capture_agent "$role" qodercli -p "$prompt" --output-format stream-json --yolo ${MODEL_FLAG[@]+"${MODEL_FLAG[@]}"}
             fi
             ;;
         codebuddy)
             if [[ -n "$resume_id" ]]; then
                 COMET_EVAL_AGENT_ROLE="$role" capture_agent "$role" codebuddy -p "$prompt" --output-format stream-json \
-                    --dangerously-skip-permissions "${MODEL_FLAG[@]}" "${CODEBUDDY_SETTINGS_FLAG[@]}" -r "$resume_id"
+                    --dangerously-skip-permissions ${MODEL_FLAG[@]+"${MODEL_FLAG[@]}"} ${CODEBUDDY_SETTINGS_FLAG[@]+"${CODEBUDDY_SETTINGS_FLAG[@]}"} -r "$resume_id"
             else
                 COMET_EVAL_AGENT_ROLE="$role" capture_agent "$role" codebuddy -p "$prompt" --output-format stream-json \
-                    --dangerously-skip-permissions "${MODEL_FLAG[@]}" "${CODEBUDDY_SETTINGS_FLAG[@]}"
+                    --dangerously-skip-permissions ${MODEL_FLAG[@]+"${MODEL_FLAG[@]}"} ${CODEBUDDY_SETTINGS_FLAG[@]+"${CODEBUDDY_SETTINGS_FLAG[@]}"}
             fi
             ;;
         *)
             if [[ -n "$resume_id" ]]; then
                 COMET_EVAL_AGENT_ROLE="$role" capture_agent "$role" "$COMET_EVAL_CUSTOM_EXECUTABLE" -p "$prompt" \
-                    --output-format stream-json "${MODEL_FLAG[@]}" --resume "$resume_id"
+                    --output-format stream-json ${MODEL_FLAG[@]+"${MODEL_FLAG[@]}"} --resume "$resume_id"
             else
                 COMET_EVAL_AGENT_ROLE="$role" capture_agent "$role" "$COMET_EVAL_CUSTOM_EXECUTABLE" -p "$prompt" \
-                    --output-format stream-json "${MODEL_FLAG[@]}"
+                    --output-format stream-json ${MODEL_FLAG[@]+"${MODEL_FLAG[@]}"}
             fi
             ;;
     esac
@@ -178,7 +181,7 @@ run_agent_turn() {
 
 extract_session_id() {
     python3 -c '
-import json, sys
+import json, re, sys
 for line in sys.stdin:
     try:
         value = json.loads(line)
@@ -190,7 +193,7 @@ for line in sys.stdin:
         if isinstance(item, dict):
             for key in ("session_id", "sessionId", "thread_id", "threadId"):
                 candidate = item.get(key)
-                if isinstance(candidate, str) and candidate:
+                if isinstance(candidate, str) and re.fullmatch(r"[A-Za-z0-9._:-]{1,256}", candidate):
                     print(candidate)
                     raise SystemExit(0)
             stack.extend(item.values())
@@ -207,38 +210,32 @@ simulate_user() {
     local subject_text="$1"
     local sim_prompt
     if [[ -n "$SIMULATOR_PROMPT" ]]; then
-        sim_prompt=$(cat <<EOF
-${SIMULATOR_PROMPT}
+        sim_prompt="${SIMULATOR_PROMPT}
 
 Reply as the user at the current decision point; do not execute the task or write files.
 Follow the task scenario's explicit approval, rejection and recovery requirements.
 Do not replace a required rejection with default approval.
 
 Task scenario:
-"""
+\"\"\"
 ${PROMPT}
-"""
+\"\"\"
 
 Assistant's message:
-"""
+\"\"\"
 ${subject_text}
-"""
-EOF
-)
+\"\"\""
     else
-        sim_prompt=$(cat <<EOF
-You are simulating a developer user in an automated eval. The AI assistant below is running the Comet development workflow and has paused to ask you something. Read its message and reply with a SHORT (1-3 sentences) response that:
+        sim_prompt="You are simulating a developer user in an automated eval. The AI assistant below is running the Comet development workflow and has paused to ask you something. Read its message and reply with a SHORT (1-3 sentences) response that:
 - Approves the proposed approach / name / plan when asked to confirm
 - Picks the most reasonable default option when asked to choose
 - Asks for clarification only if the question is truly ambiguous about WHAT to build
 Never refuse; always let the workflow move forward. Do not write code or files.
 
 Assistant's message:
-"""
+\"\"\"
 ${subject_text:0:3000}
-"""
-EOF
-)
+\"\"\""
     fi
     # Run the simulator through the same adapter command in a fresh session,
     # retaining only bounded role/session evidence in the driver log.
@@ -342,20 +339,33 @@ except: print('')
     fi
 
     if [[ -n "$FRESH_RESUME_MARKER" && "$RESULT_TEXT" == *"$FRESH_RESUME_MARKER"* ]]; then
+        if [[ "$FRESH_RESUME_MARKER" == "COMET_SDK_RECOVERY_READY" ]]; then
+            # The read-only harness records actual SDK state before starting a new session.
+            if ! BOUNDARY="$(python3 "$SCRIPT_DIR/../python/validation/native_recovery_boundary.py" "$SESSION_ID")"; then
+                echo "[loop] invalid SDK recovery boundary; refusing a fresh session" >&2
+                exit 3
+            fi
+            echo "[loop] sdk-recovery-boundary $BOUNDARY" >&2
+        fi
         echo "[loop] fresh resume boundary detected; starting a new subject session" >&2
         SESSION_ID=""
         FRESH_PROMPT="$CONTINUE_PROMPT"
         continue
     fi
 
-    # Completion is task-validated from exported artifacts after the loop. Stop
-    # only on an explicit, non-negated workflow/archive completion statement.
-    if bash "$SCRIPT_DIR/completion-point.sh" "$RESULT_TEXT"; then
+    # 指定 Run 时读取真实交付状态；探针不可用时终止，避免反复催促已完成的流程。
+    COMPLETION_STATUS=0
+    COMET_EVAL_COMPLETION_RUNS="$COMPLETION_RUNS" bash "$SCRIPT_DIR/completion-point.sh" "$RESULT_TEXT" || COMPLETION_STATUS=$?
+    if [[ $COMPLETION_STATUS -eq 0 ]]; then
         echo "[loop] workflow completion detected; ending" >&2
         break
     fi
+    if [[ $COMPLETION_STATUS -gt 1 ]]; then
+        echo "[loop] completion probe unavailable; ending evaluation" >&2
+        exit 2
+    fi
 
-    if bash "$SCRIPT_DIR/decision-point.sh" "$RESULT_TEXT" "${DECISION_PATTERNS[@]}"; then
+    if bash "$SCRIPT_DIR/decision-point.sh" "$RESULT_TEXT" ${DECISION_PATTERNS[@]+"${DECISION_PATTERNS[@]}"}; then
         echo "[loop] decision point detected; simulating user reply" >&2
         if [[ ${#DECISION_REPLY_STEPS[@]} -gt 0 ]]; then
             if [[ $DECISION_REPLY_STEP_INDEX -ge ${#DECISION_REPLY_STEPS[@]} ]]; then
@@ -378,6 +388,29 @@ except: print('')
         fi
         if [[ -z "$USER_REPLY" ]]; then
             USER_REPLY="Yes, please proceed with the recommended option."
+        fi
+        if [[ -n "$COMPLETION_RUNS" ]]; then
+            if ! DECISION_CONTEXT="$(COMET_EVAL_COMPLETION_RUNS="$COMPLETION_RUNS" COMET_EVAL_DECISION_REPLY="$USER_REPLY" COMET_EVAL_TURN="$TURN" python3 -I - "$SCRIPT_DIR/../python/validation/current_sdk.py" <<'PY'
+import hashlib
+import importlib.util
+import json
+import os
+import sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("comet_decision_probe", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+print(json.dumps({
+    "turn": int(os.environ["COMET_EVAL_TURN"]),
+    "replyHash": hashlib.sha256(os.environ["COMET_EVAL_DECISION_REPLY"].encode()).hexdigest(),
+    "decisions": module.requested_classic_decisions(Path.cwd(), json.loads(os.environ["COMET_EVAL_COMPLETION_RUNS"])),
+}))
+PY
+            )"; then
+                echo "[loop] decision evidence unavailable; ending evaluation" >&2
+                exit 3
+            fi
+            echo "[loop] sdk-decision-reply $DECISION_CONTEXT" >&2
         fi
         echo "[loop] simulated reply (${#USER_REPLY} chars)" >&2
         continue

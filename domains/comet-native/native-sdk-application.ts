@@ -1,3 +1,4 @@
+import { nativeSdkVerifyWaitDecisions } from './native-sdk-verify-decision.js';
 import { assertNativeEditReviewsComplete } from './native-edit-review.js';
 import path from 'node:path';
 
@@ -37,7 +38,6 @@ import {
 } from '../workflow-contract/change-runtime-owner.js';
 import { inspectProtectedProjectPath } from '../workflow-contract/protected-project-path.js';
 import {
-  nativeSdkCanRefreshChecks,
   nativeSdkCheckExecutor,
   nativeSdkCurrentCheckSummaries,
   assertNativeSdkCandidateUnchanged,
@@ -58,6 +58,9 @@ import {
   nativeSdkReviseCommandValidator,
   nativeSdkReviseExecutor,
   nativeSdkReviseValidator,
+  nativeSdkImplementationRevisionCommandValidator,
+  nativeSdkImplementationRevisionExecutor,
+  nativeSdkImplementationRevisionValidator,
 } from './native-sdk-revise.js';
 import {
   nativeSdkReportExecutor,
@@ -119,6 +122,7 @@ import {
   reserveNativeVerifierAttempt,
   recordNativeVerifierExecutionError,
   retryNativeVerifier,
+  resolveNativeVerifierBlocker,
   returnNativeCandidateToBuild,
 } from './native-loop-runtime.js';
 import { nativeProjectPaths } from './native-paths.js';
@@ -178,6 +182,7 @@ interface NativeShapeProposal {
   specChanges: NativePortableSpecChange[];
   acceptance: Array<Pick<NativePortableAcceptanceState, 'id' | 'source' | 'text'>>;
   formalHash: string;
+  semanticSnapshot?: import('./native-shape-semantics.js').NativeShapeSemanticSnapshot;
   children: { hash: string; contract: NativeChildrenContract } | null;
   shapeConfirmationHash: string;
 }
@@ -227,6 +232,15 @@ export async function registerNativeSdkStartOwner(options: {
   });
 }
 
+function nativeSdkShapeConstraintsVersion(state: NativePortableState): 1 | 2 | 3 {
+  // Upgrade only a fresh proposal; pending approvals retain their original document contract.
+  return state.phase === 'shape' &&
+    state.status === 'active' &&
+    state.loop.next_action === 'prepare-shape-confirmation'
+    ? 3
+    : (state.document_constraints_version ?? 2);
+}
+
 /** Reads formal Shape artifacts without creating a second mutable Native state. */
 export async function collectNativeSdkShapeProposal(options: {
   paths: NativeProjectPaths;
@@ -234,7 +248,7 @@ export async function collectNativeSdkShapeProposal(options: {
 }): Promise<NativeShapeProposal> {
   const state = parseNativePortableState({
     ...options.state,
-    document_constraints_version: options.state.document_constraints_version ?? 2,
+    document_constraints_version: nativeSdkShapeConstraintsVersion(options.state),
   });
   if (state.phase !== 'shape' || !['active', 'await-user'].includes(state.status)) {
     throw new Error('Native Shape proposal requires an active or pending Shape');
@@ -242,10 +256,11 @@ export async function collectNativeSdkShapeProposal(options: {
   const changeDir = path.join(options.paths.changesDir, state.name);
   const specChanges = await discoverNativePortableSpecChanges({ paths: options.paths, state });
   await assertNativePortableDocuments({ paths: options.paths, state, specChanges });
-  const { acceptance, formalHash } = await readNativePortableAcceptance({
+  const { acceptance, formalHash, semanticSnapshot } = await readNativePortableAcceptance({
     paths: options.paths,
     state,
     specChanges,
+    captureSemanticSnapshot: state.phase === 'shape' && state.status === 'active',
   });
   const children = await readNativeChildrenContract({
     changeDir,
@@ -259,6 +274,9 @@ export async function collectNativeSdkShapeProposal(options: {
     specChanges,
     acceptance: acceptance.map(({ id, source, text }) => ({ id, source, text })),
     formalHash,
+    ...(semanticSnapshot
+      ? { semanticSnapshot: state.shape_semantic_snapshot ?? semanticSnapshot }
+      : {}),
     children: children ? { hash: children.hash, contract: children.contract } : null,
     shapeConfirmationHash: nativePortableShapeConfirmationHash({
       formalHash,
@@ -277,6 +295,7 @@ function resetShape(state: NativePortableState): NativePortableState {
     acceptance: [],
   };
   delete next.shape_confirmation_hash;
+  delete next.shape_semantic_snapshot;
   delete next.children_contract_hash;
   delete next.coordination_mode;
   return parseNativePortableState(next);
@@ -314,6 +333,7 @@ function resetShapeForRemoval(
     },
   };
   delete next.shape_confirmation_hash;
+  delete next.shape_semantic_snapshot;
   delete next.children_contract_hash;
   delete next.coordination_mode;
   delete next.verifier_action;
@@ -358,6 +378,7 @@ function resetShapeForRequirementsRevision(
     },
   };
   delete next.shape_confirmation_hash;
+  delete next.shape_semantic_snapshot;
   delete next.children_contract_hash;
   delete next.coordination_mode;
   delete next.verifier_action;
@@ -470,6 +491,20 @@ function builderCandidateState(
   const output = outcome.output as Record<string, unknown> | null;
   const sessionId = action.claim?.sessionId;
   if (
+    output &&
+    (typeof output.submittedAt !== 'string' ||
+      Number.isNaN(Date.parse(output.submittedAt)) ||
+      new Date(output.submittedAt).toISOString() !== output.submittedAt)
+  ) {
+    const expected =
+      typeof output.submittedAt === 'string' && !Number.isNaN(Date.parse(output.submittedAt))
+        ? new Date(output.submittedAt).toISOString()
+        : 'YYYY-MM-DDTHH:mm:ss.sssZ';
+    throw new Error(
+      `Native Builder submittedAt must be a canonical UTC timestamp (${expected}); received ${JSON.stringify(output.submittedAt)}`,
+    );
+  }
+  if (
     state.phase !== 'build' ||
     !['build.builder', 'supervisor.parent.builder'].includes(action.stepId) ||
     action.type !== 'handoff' ||
@@ -488,8 +523,12 @@ function builderCandidateState(
   ) {
     throw new Error('Native Builder result needs a claimed host session and a complete candidate');
   }
-  const checks = output.checks.map((value) => {
+  const checks = output.checks.map((value, index) => {
     const check = value as Record<string, unknown> | null;
+    if (check && !['passed', 'failed', 'not-run'].includes(String(check.result)))
+      throw new Error(
+        `Native Builder checks[${index}].result must be passed, failed, or not-run; received ${JSON.stringify(check.result)}`,
+      );
     if (
       !check ||
       typeof check.name !== 'string' ||
@@ -590,13 +629,23 @@ function verifierResultState(
   const lastExecutionFailure = candidateActions
     .map((entry) => entry.stepId === 'verify.verifier' && entry.status === 'failed')
     .lastIndexOf(true);
+  // 新 Verifier 从已批准的 blocked 恢复 Wait 开始独立尝试；旧结果仍保留为历史证据。
+  const recoverySequence = run.actionContexts[action.id]?.results['verify.stop']?.sequence;
+  const recoveryWait = run.waits.find(
+    (wait) =>
+      wait.stepId === 'verify.stop' &&
+      wait.sequence === recoverySequence &&
+      wait.status === 'resolved' &&
+      wait.decision?.choice === 'retry',
+  );
   const previousVerifierActions = candidateActions
     .slice(lastExecutionFailure + 1)
     .filter(
       (entry) =>
         entry.stepId === 'verify.verifier' &&
         entry.id !== action.id &&
-        entry.status === 'succeeded',
+        entry.status === 'succeeded' &&
+        (!recoveryWait || run.actionContexts[entry.id].sequence > recoveryWait.sequence),
     );
   if (
     previousVerifierActions.some(
@@ -707,6 +756,7 @@ function verifierResultState(
   return { state: applied.state, requestChecks: applied.response.kind === 'request-checks' };
 }
 
+/** 失败收据结束原领取，不产生验收结论；后继 Verifier 仍须独立。 */
 function verifierExecutionFailureState(
   run: Readonly<WorkflowRun>,
   action: Readonly<RuntimeAction>,
@@ -719,13 +769,12 @@ function verifierExecutionFailureState(
     action.stepId !== 'verify.verifier' ||
     action.type !== 'handoff' ||
     !action.claim?.sessionId ||
-    action.claim.sessionId === state.builder_handoff?.builder_execution_ref ||
     !output ||
     typeof output.summary !== 'string' ||
     !output.summary.trim()
   ) {
     throw new Error(
-      'Native Verifier execution failure needs a claimed independent session and summary',
+      'Native Verifier execution failure needs the original claimed session and summary',
     );
   }
   return recordNativeVerifierExecutionError({ state, summary: output.summary });
@@ -897,6 +946,10 @@ const verifierValidator: RuntimeValidator = {
       return { accepted: false, reason: 'Native Verifier result lacks its project binding' };
     }
     try {
+      if (outcome.status === 'failed') {
+        verifierExecutionFailureState(run, action, outcome);
+        return { accepted: true };
+      }
       const config = await readProjectConfig(context.projectRoot);
       if (
         !config ||
@@ -927,8 +980,7 @@ const verifierValidator: RuntimeValidator = {
         await nativeSdkCurrentCheckSummaries({ run, projectRoot: context.projectRoot });
         await assertNativeEditReviewsComplete(paths, state);
       }
-      if (outcome.status === 'failed') verifierExecutionFailureState(run, action, outcome);
-      else verifierResultState(run, action, outcome);
+      verifierResultState(run, action, outcome);
       return { accepted: true };
     } catch (error) {
       return { accepted: false, reason: error instanceof Error ? error.message : String(error) };
@@ -956,6 +1008,13 @@ export function defineNativeWorkflowApplication(): NativeWorkflowApplication {
       version: '1',
       entry: 'shape.prepare',
       commands: {
+        'revise-implementation': {
+          stepId: 'repair.implementation',
+          validator: {
+            id: nativeSdkImplementationRevisionCommandValidator.id,
+            version: nativeSdkImplementationRevisionCommandValidator.version,
+          },
+        },
         'revise-requirements': {
           stepId: 'shape.revise',
           validator: {
@@ -994,6 +1053,14 @@ export function defineNativeWorkflowApplication(): NativeWorkflowApplication {
       transitionHandler: { id: 'comet-native-transition', version: '1' },
       stateValidator: { id: nativeStateValidator.id, version: nativeStateValidator.version },
       steps: {
+        'repair.implementation': {
+          type: 'call_tool',
+          ref: 'native-revise-implementation',
+          validator: {
+            id: nativeSdkImplementationRevisionValidator.id,
+            version: nativeSdkImplementationRevisionValidator.version,
+          },
+        },
         'shape.revise': {
           type: 'call_tool',
           ref: 'native-revise-requirements',
@@ -1180,7 +1247,7 @@ export function defineNativeWorkflowApplication(): NativeWorkflowApplication {
         'verify.stop': {
           type: 'ask_user',
           proposalFrom: 'verify.verifier',
-          choices: ['repair'],
+          choices: ['retry', 'repair'],
         },
         'verify.checks-stop': {
           type: 'ask_user',
@@ -1237,6 +1304,11 @@ export function defineNativeWorkflowApplication(): NativeWorkflowApplication {
         },
       },
       transitions: [
+        { from: 'repair.implementation', to: 'archive.prepare' },
+        { from: 'repair.implementation', to: 'archive.execute' },
+        { from: 'repair.implementation', to: 'shape.prepare' },
+        { from: 'repair.implementation', to: 'build.builder' },
+        { from: 'repair.implementation', to: 'supervisor.parent.builder' },
         { from: 'shape.revise', to: 'shape.prepare' },
         { from: 'shape.remove', to: 'shape.prepare' },
         { from: 'shape.disassociate', to: 'shape.prepare' },
@@ -1318,6 +1390,7 @@ export function defineNativeWorkflowApplication(): NativeWorkflowApplication {
         { from: 'verify.verifier', to: 'verify.retry', on: 'failed' },
         { from: 'verify.retry', to: 'verify.verifier', on: 'retry' },
         { from: 'verify.verifier', to: 'verify.stop' },
+        { from: 'verify.stop', to: 'verify.verifier', on: 'retry' },
         { from: 'verify.stop', to: 'build.builder', on: 'repair' },
         { from: 'verify.stop', to: 'supervisor.parent.builder', on: 'repair' },
         { from: 'verify.requested-checks', to: 'verify.verifier' },
@@ -1346,6 +1419,50 @@ export function defineNativeWorkflowApplication(): NativeWorkflowApplication {
       version: '1',
       apply({ run, event }) {
         const state = parseNativePortableState(run.state);
+        if (event.kind === 'action-outcome' && event.stepId === 'repair.implementation') {
+          if (event.outcome.status !== 'succeeded')
+            return { state: state as unknown as RuntimeValue, next: [] };
+          const output = event.outcome.output as {
+            drift: boolean;
+            requirementsChanged: boolean;
+            archiveStep: string;
+            reason: string;
+          };
+          if (!output.drift)
+            return { state: state as unknown as RuntimeValue, next: [output.archiveStep] };
+          if (output.requirementsChanged)
+            return {
+              state: resetShapeForRequirementsRevision(
+                state,
+                output.reason,
+              ) as unknown as RuntimeValue,
+              next: ['shape.prepare'],
+            };
+          const returned = returnNativeCandidateToBuild({ state, reason: output.reason });
+          const verifier = [...run.actions]
+            .reverse()
+            .find((action) => action.stepId === 'verify.verifier' && action.status === 'succeeded');
+          if (!verifier)
+            throw new Error('Native implementation revision has no original Verifier result');
+          return {
+            state: returned as unknown as RuntimeValue,
+            next: state.children_contract_hash
+              ? [
+                  {
+                    stepId: 'supervisor.parent.builder',
+                    input: supervisorParentRepairActivation(run, {
+                      failedVerifierActionId: verifier.id,
+                    }),
+                  },
+                ]
+              : [
+                  {
+                    stepId: 'build.builder',
+                    input: { repairContext: nativeBuilderRepairContext(returned, run) },
+                  },
+                ],
+          };
+        }
         if (event.kind === 'action-outcome' && event.stepId === 'shape.revise') {
           if (event.outcome.status !== 'succeeded') {
             return { state: state as unknown as RuntimeValue, next: [] };
@@ -1384,9 +1501,12 @@ export function defineNativeWorkflowApplication(): NativeWorkflowApplication {
           const prepared = prepareNativePortableShapeConfirmation({
             state: {
               ...state,
-              document_constraints_version: state.document_constraints_version ?? 2,
+              document_constraints_version: nativeSdkShapeConstraintsVersion(state),
               spec_changes: proposal.specChanges,
               shape_confirmation_hash: proposal.shapeConfirmationHash,
+              ...(proposal.semanticSnapshot
+                ? { shape_semantic_snapshot: proposal.semanticSnapshot }
+                : {}),
             },
             acceptance: proposal.acceptance,
           });
@@ -2168,13 +2288,22 @@ export function defineNativeWorkflowApplication(): NativeWorkflowApplication {
                     ? supervisorParentRepairActivation(run, {
                         failedCheckActionId: event.outcome.actionId,
                       })
-                    : { failedCheckActionId: event.outcome.actionId },
+                    : {
+                        failedCheckActionId: event.outcome.actionId,
+                        repairContext: nativeBuilderRepairContext(returned, run),
+                      },
                 },
               ],
             };
           }
           const reserved = reserveNativeVerifierAttempt(state);
-          return { state: reserved as unknown as RuntimeValue, next: ['verify.verifier'] };
+          const userEditedReport = nativeUserEditedReportContext(reserved, run);
+          return {
+            state: reserved as unknown as RuntimeValue,
+            next: userEditedReport
+              ? [{ stepId: 'verify.verifier', input: { userEditedReport } }]
+              : ['verify.verifier'],
+          };
         }
         if (event.kind === 'action-outcome' && event.stepId === 'verify.verifier') {
           const action = run.actions.find((candidate) => candidate.id === event.outcome.actionId);
@@ -2204,7 +2333,12 @@ export function defineNativeWorkflowApplication(): NativeWorkflowApplication {
                           }),
                         },
                       ]
-                    : ['build.builder']
+                    : [
+                        {
+                          stepId: 'build.builder',
+                          input: { repairContext: nativeBuilderRepairContext(verified.state, run) },
+                        },
+                      ]
                   : ['verify.stop'],
           };
         }
@@ -2251,19 +2385,47 @@ export function defineNativeWorkflowApplication(): NativeWorkflowApplication {
                   ? supervisorParentRepairActivation(run, {
                       failedCheckActionId: failedCheckActionId!,
                     })
-                  : { failedCheckActionId: failedCheckActionId! },
+                  : {
+                      failedCheckActionId: failedCheckActionId!,
+                      repairContext: nativeBuilderRepairContext(returned, run),
+                    },
               },
             ],
           };
         }
         if (event.kind === 'wait-resolved' && event.stepId === 'verify.stop') {
+          const wait = run.waits.find(
+            (candidate) =>
+              candidate.stepId === event.stepId &&
+              candidate.decision?.id === event.decisionId &&
+              candidate.proposalHash === event.proposalHash,
+          );
           if (
-            event.choice !== 'repair' ||
-            state.phase !== 'verify' ||
-            state.status !== 'await-user' ||
-            state.loop.next_action !== 'await-user'
+            !wait ||
+            !nativeSdkVerifyWaitDecisions(state, wait, run).some(
+              ({ choice }) => choice === event.choice,
+            )
           ) {
             throw new Error('Native Verify stop decision does not match the current Run');
+          }
+          if (event.choice === 'retry') {
+            const reserved = reserveNativeVerifierAttempt(
+              resolveNativeVerifierBlocker(state, { reason: wait.decision?.reason }),
+            );
+            return {
+              state: reserved as unknown as RuntimeValue,
+              next: [
+                {
+                  stepId: 'verify.verifier',
+                  input: {
+                    recoveryWaitId: wait.id,
+                    ...(wait.decision?.reason === undefined
+                      ? {}
+                      : { reason: wait.decision.reason }),
+                  },
+                },
+              ],
+            };
           }
           const returned = returnNativeCandidateToBuild({
             state,
@@ -2284,7 +2446,12 @@ export function defineNativeWorkflowApplication(): NativeWorkflowApplication {
                     }),
                   },
                 ]
-              : ['build.builder'],
+              : [
+                  {
+                    stepId: 'build.builder',
+                    input: { repairContext: nativeBuilderRepairContext(returned, run) },
+                  },
+                ],
           };
         }
         if (event.kind === 'wait-resolved' && event.stepId === 'verify.retry') {
@@ -2301,9 +2468,23 @@ export function defineNativeWorkflowApplication(): NativeWorkflowApplication {
           return { state: state as unknown as RuntimeValue, next: ['verify.confirm'] };
         }
         if (event.kind === 'wait-resolved' && event.stepId === 'verify.confirm') {
+          const wait = run.waits.find(
+            (candidate) =>
+              candidate.stepId === event.stepId &&
+              candidate.decision?.id === event.decisionId &&
+              candidate.proposalHash === event.proposalHash,
+          );
+          if (
+            !wait ||
+            !nativeSdkVerifyWaitDecisions(state, wait, run).some(
+              ({ choice }) => choice === event.choice,
+            )
+          ) {
+            throw new Error(
+              'Native Verify confirmation does not match an executable current decision',
+            );
+          }
           if (event.choice === 'reverify') {
-            if (!nativeSdkCanRefreshChecks(run))
-              throw new Error('不可重复执行的检查不能重放；请先确认后续验证方式');
             return {
               state: parseNativePortableState({
                 ...state,
@@ -2344,7 +2525,12 @@ export function defineNativeWorkflowApplication(): NativeWorkflowApplication {
                     }),
                   },
                 ]
-              : ['build.builder'],
+              : [
+                  {
+                    stepId: 'build.builder',
+                    input: { repairContext: nativeBuilderRepairContext(returned, run) },
+                  },
+                ],
           };
         }
         if (
@@ -2475,6 +2661,7 @@ export function defineNativeWorkflowApplication(): NativeWorkflowApplication {
       },
     },
     validators: [
+      nativeSdkImplementationRevisionValidator,
       nativeSdkReviseValidator,
       nativeSdkRemoveValidator,
       nativeSdkDisassociateValidator,
@@ -2501,11 +2688,13 @@ export function defineNativeWorkflowApplication(): NativeWorkflowApplication {
     stateValidators: [nativeStateValidator],
     validateRecovery: validateNativeSdkSupervisorRecovery,
     commandValidators: [
+      nativeSdkImplementationRevisionCommandValidator,
       nativeSdkReviseCommandValidator,
       nativeSdkRemoveCommandValidator,
       nativeSdkDisassociateCommandValidator,
     ],
     executors: [
+      nativeSdkImplementationRevisionExecutor,
       nativeSdkReviseExecutor,
       nativeSdkRemoveExecutor,
       nativeSdkDisassociateExecutor,
@@ -2524,3 +2713,7 @@ export function defineNativeWorkflowApplication(): NativeWorkflowApplication {
     ],
   };
 }
+import {
+  nativeBuilderRepairContext,
+  nativeUserEditedReportContext,
+} from './native-task-context.js';

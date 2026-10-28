@@ -492,6 +492,40 @@ it('executes the real check through the public composed factory', async () => {
   expect(f.run.actions.at(-1)).toMatchObject({ stepId: 'classic.extension.review' });
 });
 
+it.each([
+  { configured: 25, explicit: undefined, exitCode: 124 },
+  { configured: 5000, explicit: undefined, exitCode: 0 },
+  { configured: 25, explicit: 5000, exitCode: 0 },
+])(
+  'uses the project default timeout in composed SDK checks: %j',
+  async ({ configured, explicit, exitCode }) => {
+    const f = await fixture('tweak', [], undefined, {
+      build: {
+        // 仅超时分支保持命令存活到终止；正常完成和覆盖分支沿用原时长。
+        argv: [process.execPath, '-e', `setTimeout(() => {}, ${exitCode === 124 ? 20000 : 200})`],
+        ...(explicit === undefined ? {} : { timeoutMs: explicit }),
+      },
+    });
+    await fs.appendFile(
+      path.join(f.projectRoot, '.comet/config.yaml'),
+      `  check_timeout_ms: ${configured}\n`,
+    );
+    await f.reachReview(false, true);
+    const action = f.run.actions.find((entry) => entry.status === 'pending')!;
+    f.run = await f.runtime.execute({
+      runId: 'example',
+      actionId: action.id,
+      executorId: 'comet-classic-check',
+      context: { requestId: 'project-timeout', projectRoot: f.projectRoot },
+    });
+    expect(f.run.actions.find((entry) => entry.id === action.id)?.outcome?.output).toMatchObject({
+      timeoutMs: explicit ?? configured,
+      exitCode,
+    });
+    if (exitCode === 0) await f.evidence();
+  },
+);
+
 it('keeps a composed read-only store free of projection and ownership writes', async () => {
   const f = await fixture('tweak');
   await f.refresh();

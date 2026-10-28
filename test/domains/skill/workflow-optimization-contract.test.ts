@@ -39,11 +39,12 @@ describe('Chinese Classic efficiency contracts', () => {
     ]) {
       expect(presentation).toContain(requirement);
     }
-    expect(decisions).toContain('存在 `AskUserQuestion` 时，使用它展示单选/多选选项');
+    expect(decisions).toContain('需要提问时，存在 `AskUserQuestion` 就使用它展示单选/多选选项');
     expect(decisions).toContain('本会话后续决策点不得反复重试它');
     expect(presentation).toContain('待定决定保持未确认');
-    expect(decisions).toContain('阶段明确要求的产物/设计批准也属于用户决策点');
-    expect(decisions).toContain('此规则不替代阶段明确要求的用户确认');
+    expect(decisions).toContain('用户明确要求逐阶段确认时遵守该要求');
+    expect(decisions).toContain('核对授权的对象、范围和条件与当前内容是否一致');
+    expect(decisions).toContain('发生实质变化时只确认超出授权的部分');
     for (const name of ['comet-classic', 'comet-open', 'comet-design']) {
       const skill = await readSkill(zhSkillRoot, name);
       expect(skill, name).toContain('comet-classic/reference/decision-point.md');
@@ -263,6 +264,61 @@ describe('Chinese Classic efficiency contracts', () => {
     expect(recovery).toContain('`configurationReadiness` 的 `missingFields` 与 `invalidFields`');
     expect(native).toContain('只在字段缺失、命令因版本或所有权被拒绝，或需要额外正文时读取详情');
     expect(native).toContain('不因等待工具超时重复派发');
+  });
+
+  it('shares Chinese configuration presentation without extending approval beyond the current change', async () => {
+    const methods = await readChineseReference('sdk-methods');
+    const configuration = section(
+      await readChineseReference('decision-point'),
+      '## 执行配置展示',
+      '## 需求变化后的重新确认',
+    );
+    const build = section(
+      await readSkill(zhSkillRoot, 'comet-build'),
+      '## SDK Run 路径',
+      '## Compat 路径',
+    );
+    expect(build).toContain('(../comet-classic/reference/sdk-methods.md#build)');
+    expect(configuration).toContain('逐项列出当前值、自然语言含义');
+    for (const status of ['已确认', '待补充', '需修正', '用户要求更改']) {
+      expect(configuration).toContain(`「${status}」`);
+    }
+    expect(configuration).toContain('只询问缺失、无效或用户要求更改的字段');
+    expect(configuration).toContain('每个新 full change 都确认本 change 的配置');
+    expect(configuration).toContain('项目默认值、推荐或其他 change 的选择不构成批准');
+    expect(methods).toContain('已有待决定 Wait 复用原提案');
+    expect(configuration).toMatch(/hotfix\/tweak[^\n]+不增加独立 Build 配置批准/u);
+    expect(configuration).toContain('`tdd_mode: direct` 不要求 RED/GREEN，仍做相关检查与缺陷回归');
+    expect(configuration).toContain('不因 `tdd_mode: direct` 自动启用');
+  });
+
+  it('shares Chinese reconfirmation impacts without weakening SDK proposal binding', async () => {
+    const methods = await readChineseReference('sdk-methods');
+    const reconfirmation = section(
+      await readChineseReference('decision-point'),
+      '## 需求变化后的重新确认',
+      '## Classic 预设的文件数授权复用',
+    );
+    const design = section(
+      await readSkill(zhSkillRoot, 'comet-design'),
+      '## SDK Run 路径',
+      '## Compat 路径',
+    );
+    expect(design).toContain('(../comet-classic/reference/decision-point.md#需求变化后的重新确认)');
+    expect(section(methods, '## 预设范围复核', '## Archive 与 Git 交付')).toContain(
+      '(decision-point.md#需求变化后的重新确认)',
+    );
+    expect(reconfirmation).toContain('实现遗漏在原范围内修复');
+    expect(reconfirmation).toMatch(
+      /先说明相对上次批准方案的新增、删除和改变的行为、受影响验收、可保留成果与需要重做的步骤，再展示完整当前方案/u,
+    );
+    expect(reconfirmation).toContain('缺少可信旧方案时，说明无法可靠比较');
+    expect(reconfirmation).toContain('批准仍绑定完整当前提案');
+    expect(reconfirmation).toContain(
+      'Design 中 Spec Patch 的事先授权、正式设计确认及预设范围复核均保留',
+    );
+    expect(section(methods, '## Design', '## Build')).toContain('仍绑定当前 Design 提案哈希');
+    expect(reconfirmation).toContain('不把旧验收结论用于新需求');
   });
 
   it('publishes a usable checkpoint JSON shape and refuses stale or missing records as proof of missing implementation', async () => {
@@ -638,14 +694,14 @@ describe('Comet workflow optimization contracts', () => {
       zhSkillRoot,
       '### 1b. 整理需求并确定 Change 名称',
       '范围与命名都明确时直接继续',
-      '最终审视同时确认 change 名称、范围和产物内容',
+      '最终审视核对 change 名称、范围和产物内容是否符合已获授权的要求',
     ],
     [
       'English',
       skillRoot,
       '### 1b. Summarize requirements and choose the change name',
       'Continue directly when scope and name are clear',
-      'This final review confirms the change name, scope, and artifact content together',
+      'The final review checks the change name, scope, and artifact content against the authorized requirements',
     ],
   ])(
     '%s open flow avoids a redundant pre-artifact confirmation',
@@ -924,9 +980,162 @@ describe('Comet workflow optimization contracts', () => {
   });
 });
 
+describe('Classic decision guidance routing', () => {
+  it.each([
+    {
+      language: 'Chinese',
+      root: zhSkillRoot,
+      sdkHeading: '## SDK Run 路径',
+      compatHeading: '## Compat 路径',
+      configuration: ['执行配置展示', '执行配置展示'],
+      reconfirmation: ['需求变化后的重新确认', '需求变化后的重新确认'],
+    },
+    {
+      language: 'English',
+      root: skillRoot,
+      sdkHeading: '## SDK Run path',
+      compatHeading: '## Compat path',
+      configuration: ['presenting-execution-configuration', 'Presenting execution configuration'],
+      reconfirmation: [
+        'reconfirmation-after-requirement-changes',
+        'Reconfirmation after requirement changes',
+      ],
+    },
+  ])('reaches shared guidance from actual SDK and Compat entries in $language', async (variant) => {
+    const decisionPath = path.join(variant.root, 'comet-classic/reference/decision-point.md');
+    const decisions = await fs.readFile(decisionPath, 'utf8');
+
+    for (const name of ['comet-build', 'comet-design']) {
+      const entry = await fs.readFile(path.join(variant.root, name, 'SKILL.md'), 'utf8');
+      expect(section(entry, variant.sdkHeading, variant.compatHeading), name).toContain(
+        '../comet-classic/reference/sdk-methods.md#',
+      );
+      expect(entry.slice(entry.indexOf(variant.compatHeading)), name).toContain(
+        '(reference/compat.md)',
+      );
+    }
+
+    const references = [
+      [
+        'comet-classic/reference/sdk-methods.md',
+        'decision-point.md',
+        [variant.configuration, variant.reconfirmation],
+      ],
+      ['comet-classic/reference/context-recovery.md', 'decision-point.md', [variant.configuration]],
+      [
+        'comet-build/reference/compat.md',
+        '../../comet-classic/reference/decision-point.md',
+        [variant.configuration, variant.reconfirmation],
+      ],
+      [
+        'comet-design/reference/compat.md',
+        '../../comet-classic/reference/decision-point.md',
+        [variant.reconfirmation],
+      ],
+      [
+        'comet-design/SKILL.md',
+        '../comet-classic/reference/decision-point.md',
+        [variant.reconfirmation],
+      ],
+    ] as const;
+    for (const [file, relativeTarget, sections] of references) {
+      const sourcePath = path.join(variant.root, file);
+      const source = await fs.readFile(sourcePath, 'utf8');
+      expect(path.resolve(path.dirname(sourcePath), relativeTarget), file).toBe(decisionPath);
+      for (const [anchor, heading] of sections) {
+        expect(source, file).toContain(`](${relativeTarget}#${anchor})`);
+        expect(decisions, `${file} target`).toContain(`## ${heading}\n`);
+      }
+    }
+
+    const buildCompat = await fs.readFile(
+      path.join(variant.root, 'comet-build/reference/compat.md'),
+      'utf8',
+    );
+    const designCompat = await fs.readFile(
+      path.join(variant.root, 'comet-design/reference/compat.md'),
+      'utf8',
+    );
+    expect(buildCompat).toContain('comet state set <name> build_mode');
+    expect(designCompat).toContain(
+      'comet state complete-design <name> --design-doc "<design-doc-ref>" --json',
+    );
+    for (const compat of [buildCompat, designCompat]) {
+      expect(compat).not.toContain('sdk-methods.md');
+      expect(compat).not.toContain('--proposal-hash');
+    }
+  });
+});
+
 describe('Approved English Classic efficiency contracts', () => {
   const reference = (name: string) =>
     fs.readFile(path.join(skillRoot, 'comet-classic', 'reference', name + '.md'), 'utf8');
+
+  it('shares configuration presentation while retaining current-change and preset approval boundaries', async () => {
+    const methods = await reference('sdk-methods');
+    const configuration = section(
+      await reference('decision-point'),
+      '## Presenting execution configuration',
+      '## Reconfirmation after requirement changes',
+    );
+    const build = section(
+      await readSkill(skillRoot, 'comet-build'),
+      '## SDK Run path',
+      '## Compat path',
+    );
+    expect(build).toContain('(../comet-classic/reference/sdk-methods.md#build)');
+    expect(configuration).toContain('each value, its plain-language meaning');
+    for (const status of [
+      'Confirmed',
+      'Needs input',
+      'Needs correction',
+      'User requested change',
+    ]) {
+      expect(configuration).toContain(`"${status}"`);
+    }
+    expect(configuration).toContain(
+      'Each new full change requires approval of its own configuration',
+    );
+    expect(configuration).toContain('choices from another change do not constitute approval');
+    expect(methods).toContain("Reuse an existing pending Wait's proposal");
+    expect(configuration).toMatch(
+      /hotfix\/tweak[^\n]+without adding a separate Build configuration approval/u,
+    );
+    expect(configuration).toContain(
+      '`tdd_mode: direct` does not require RED/GREEN but still runs relevant checks',
+    );
+    expect(configuration).toContain('`tdd_mode: direct` does not enable it');
+  });
+
+  it('shares requirement-change explanations without replacing SDK proposal identity', async () => {
+    const methods = await reference('sdk-methods');
+    const reconfirmation = section(
+      await reference('decision-point'),
+      '## Reconfirmation after requirement changes',
+      '## Reusing file-count authorization in Classic presets',
+    );
+    const design = section(
+      await readSkill(skillRoot, 'comet-design'),
+      '## SDK Run path',
+      '## Compat path',
+    );
+    expect(design).toContain(
+      '(../comet-classic/reference/decision-point.md#reconfirmation-after-requirement-changes)',
+    );
+    expect(section(methods, '## Preset scope', '## Archive and Git delivery')).toContain(
+      '(decision-point.md#reconfirmation-after-requirement-changes)',
+    );
+    expect(reconfirmation).toContain('Repair implementation omissions within the original scope');
+    expect(reconfirmation).toMatch(
+      /first describe[\s\S]*affected acceptance criteria[\s\S]*work that can be retained[\s\S]*steps that must be repeated[\s\S]*Then show the complete current proposal/u,
+    );
+    expect(reconfirmation).toContain('state that a reliable comparison is unavailable');
+    expect(reconfirmation).toContain('approval remains bound to the complete current proposal');
+    expect(section(methods, '## Design', '## Build')).toContain('the current Design proposal hash');
+    expect(reconfirmation).toContain(
+      'do not promise reuse of invalid checks or apply old acceptance results to new requirements',
+    );
+  });
 
   it('configures before planning and retains autonomous safety and explicit continuation', async () => {
     const build = await readSkill(skillRoot, 'comet-build');

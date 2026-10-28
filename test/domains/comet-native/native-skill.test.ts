@@ -389,6 +389,66 @@ describe('Comet Native Skills', () => {
     }
   });
 
+  it('allows omitted Chinese directory categories while requiring content for retained headings', async () => {
+    const brief = section(await read('zh', 'reference/artifacts.md'), 'brief');
+    expect(brief).toContain('至少填写一个有效类别');
+    expect(brief).toContain('无内容的类别可以省略');
+    expect(brief).toContain('已保留的标题必须有有效正文，不能留空或只放模板占位');
+    expect(brief).toContain('完整旧格式及「无」/`None` 写法继续有效');
+    expect(brief).not.toContain('章节固定四个三级子节');
+
+    const examples = [...brief.matchAll(/```text\r?\n([\s\S]*?)```/gu)].map((match) => match[1]);
+    const singleFile = examples.find((example) => example.includes('config/defaults.yaml'));
+    expect(singleFile).toBeDefined();
+    expect(singleFile!.match(/^### .+$/gmu)).toEqual(['### 修改']);
+    expect(singleFile).toContain('config/defaults.yaml — 调整默认超时时间');
+  });
+
+  it('explains Chinese requirement changes before reconfirming the complete current Shape', async () => {
+    const entry = await read('zh', 'SKILL.md');
+    const clarification = await read('zh', 'reference/clarification.md');
+    const anchor = '需求变化后的重新确认';
+    expect(markdownLinks(entry)).toContain(`reference/clarification.md#${anchor}`);
+    expect(markdownLinks(section(clarification, '最终确认'))).toContain(`#${anchor}`);
+    const reconfirmation = section(clarification, anchor);
+    expect(reconfirmation).toMatch(
+      /先说明新增、删除和改变的行为、受影响的验收、仍可保留的成果以及需要重做的步骤，再展示完整当前 Shape/u,
+    );
+    expect(reconfirmation).toContain('缺少可信旧方案时，明确说明无法可靠比较');
+    expect(reconfirmation).toContain('批准对象仍是完整当前 Shape');
+    expect(reconfirmation).toContain('状态版本、预期动作和提案身份');
+    expect(reconfirmation).toContain('不复用旧 Shape 批准');
+  });
+
+  it('keeps the English directory example minimal without accepting empty retained headings', async () => {
+    const brief = section(await read('en', 'reference/artifacts.md'), 'brief');
+    expect(brief).toContain('at least one valid category');
+    expect(brief).toContain('Categories with no content may be omitted');
+    expect(brief).toContain('retained headings must have meaningful body content');
+    expect(brief).toContain('The complete legacy format and "None"/「无」 remain valid');
+    expect(brief).not.toContain('four fixed level-three subsections');
+    const examples = [...brief.matchAll(/```text\r?\n([\s\S]*?)```/gu)].map((match) => match[1]);
+    const singleFile = examples.find((example) => example.includes('config/defaults.yaml'));
+    expect(singleFile).toBeDefined();
+    expect(singleFile!.match(/^### .+$/gmu)).toEqual(['### Modified']);
+  });
+
+  it('keeps English reconfirmation reachable and bound to the complete current Shape', async () => {
+    const anchor = 'reconfirmation-after-requirement-changes';
+    const entry = await read('en', 'SKILL.md');
+    const clarification = await read('en', 'reference/clarification.md');
+    expect(markdownLinks(entry)).toContain(`reference/clarification.md#${anchor}`);
+    expect(markdownLinks(section(clarification, 'final-confirmation'))).toContain(`#${anchor}`);
+    const reconfirmation = section(clarification, anchor);
+    expect(reconfirmation).toMatch(
+      /First describe[\s\S]*affected acceptance criteria[\s\S]*work that can be retained[\s\S]*steps that must be repeated[\s\S]*Then show the complete current Shape/u,
+    );
+    expect(reconfirmation).toContain('state that a reliable comparison is unavailable');
+    expect(reconfirmation).toContain('approval still covers the complete current Shape');
+    expect(reconfirmation).toContain('state version, expected action, and proposal identity');
+    expect(reconfirmation).toContain('Do not reuse the previous Shape approval');
+  });
+
   it('offers explicit cleanup for clean archived change worktrees', async () => {
     const variants = [
       {
@@ -889,6 +949,64 @@ describe('Comet Native Skills', () => {
       'Do not edit state files directly or use Verifier status to represent missing implementation material',
     ]) {
       expect(recovery, term).toContain(term);
+    }
+  });
+
+  it('uses an explicit parallel request as the worktree choice without bypassing other approvals', async () => {
+    const zh = await read('zh', 'reference/workspace.md');
+    const en = await read('en', 'reference/workspace.md');
+    expect(zh).toContain(
+      '明确表达并行、同时处理或多个会话时，直接使用 `worktree`，不再询问三种方式',
+    );
+    expect(en).toContain(
+      'An explicit request for parallel work, simultaneous tasks, or multiple sessions selects `worktree` without asking about the three modes again',
+    );
+    expect(zh).toContain('用户已经指定 `current`、`branch` 或 `worktree` 时直接采用');
+    expect(en).toContain(
+      'directly use an explicitly chosen `current`, `branch`, or `worktree` mode',
+    );
+    expect(zh).toContain('推荐不能代替用户选择');
+    expect(en).toContain('A recommendation does not replace a choice');
+    expect(zh).toContain('只有用户确认后才执行 `git worktree remove`');
+    expect(en).toContain('Run `git worktree remove` only after user confirmation');
+    expect(await read('zh', 'reference/clarification.md')).toContain('不复用旧 Shape 批准');
+    expect(await read('en', 'reference/clarification.md')).toContain(
+      'Do not reuse the previous Shape approval',
+    );
+  });
+
+  it('separates SDK archival from authorized Git delivery and checks observed results before retrying', async () => {
+    const variants = [
+      {
+        language: 'zh' as const,
+        required: [
+          'Run completed 与业务 done 只证明 SDK 归档',
+          '先读取 Run 保存的交付结果并核对实际 Git',
+          '只补未完成动作，不重复已完成的提交或集成',
+          '按已有授权完成提交、merge、push 或 PR',
+          '分别核对提交 SHA、目标分支、远端 SHA 和真实 PR',
+          '结果未知先只读核对再恢复',
+          '没有外部交付授权时只说明已归档及当前保留位置',
+          '已有授权时继续完成，不再询问相同选择',
+        ],
+      },
+      {
+        language: 'en' as const,
+        required: [
+          'Run completed and business done prove SDK archival only',
+          'First inspect saved Run delivery results and actual Git',
+          'complete only missing work without repeating completed commits or integrations',
+          'complete authorized commit, merge, push, or PR work',
+          'Verify the actual commit SHA, target branch, remote SHA, and PR separately',
+          'Investigate unknown results read-only before recovery',
+          'Without external delivery authorization, describe the archive and retained location',
+          'with authorization, continue delivery without asking again',
+        ],
+      },
+    ];
+    for (const variant of variants) {
+      const workspace = await readAction(variant.language, 'reference/workspace.md#archive-收尾');
+      for (const required of variant.required) expect(workspace).toContain(required);
     }
   });
 

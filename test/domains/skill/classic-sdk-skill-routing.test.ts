@@ -11,6 +11,104 @@ async function englishSkill(name: string): Promise<string> {
 }
 
 describe('Classic Chinese Skill SDK routing', () => {
+  // 旧案例名称保留；确认只约束需要新决定的分支，已有授权可以直接沿用。
+  it.each(['comet-classic', 'comet-open', 'comet-design'])(
+    'ends the response before newly presented %s content can be approved in Chinese',
+    async (name) => {
+      const skill = await chineseSkill(name);
+      const protocol = await readFile(
+        path.resolve('assets/skills-zh/comet-classic/reference/decision-point.md'),
+        'utf8',
+      );
+      expect(skill).toContain('decision-point.md');
+      expect(protocol).toContain('需要用户作出新决定时');
+      expect(protocol).toContain('结束当前回复');
+      expect(protocol).toContain('授权可以来自当前请求或已有记录');
+      expect(protocol).toContain('不要求发生在产物生成之后');
+      expect(protocol).toContain('不把 Agent 自行选择写成');
+    },
+  );
+  it.each(['comet-classic', 'comet-open', 'comet-design'])(
+    'ends the response before newly presented %s content can be approved in English',
+    async (name) => {
+      const skill = await englishSkill(name);
+      const protocol = await readFile(
+        path.resolve('assets/skills/comet-classic/reference/decision-point.md'),
+        'utf8',
+      );
+      expect(skill).toContain('decision-point.md');
+      expect(protocol).toContain('When a new user decision is needed');
+      expect(protocol).toContain('end the current response');
+      expect(protocol).toContain('current request or an existing record');
+      expect(protocol).toContain('it need not follow artifact creation');
+      expect(protocol).toContain("do not describe an Agent's own choice as user confirmation");
+    },
+  );
+  it('loads Open and Design Skills and enforces the confirmed reply rule at the Chinese entry', async () => {
+    const skill = await chineseSkill('comet-classic');
+    expect(skill).toContain('**立即执行：** 使用 Skill 工具加载 comet-open 技能。禁止跳过此步骤。');
+    expect(skill).toContain(
+      '**立即执行：** 使用 Skill 工具加载 comet-design 技能。禁止跳过此步骤。',
+    );
+    expect(skill).toContain('编写产物、调用 OpenSpec 或推进前先加载它');
+    expect(skill).toContain('/comet-open');
+    expect(skill).toContain('/comet-design');
+    expect(skill).toContain('SDK 的 `action` 才能加载返回的 Skill');
+    expect(skill).toContain('只加载它指定的下一 Skill');
+    expect(skill).toContain('先核对已有批准、委托授权');
+    expect(skill).toContain('需要新决定时');
+  });
+  it('loads Open and Design Skills and enforces the confirmed reply rule at the English entry', async () => {
+    const skill = await englishSkill('comet-classic');
+    expect(skill).toContain(
+      '**Immediately execute:** Use the Skill tool to load the comet-open skill. Skipping this step is prohibited.',
+    );
+    expect(skill).toContain(
+      '**Immediately execute:** Use the Skill tool to load the comet-design skill. Skipping this step is prohibited.',
+    );
+    expect(skill).toContain('load it before authoring artifacts, calling OpenSpec, or advancing');
+    expect(skill).toContain('/comet-open');
+    expect(skill).toContain('/comet-design');
+    expect(skill).toContain('Only an SDK `action` loads');
+    expect(skill).toContain('load only its next Skill');
+    expect(skill).toContain('First check existing approval, delegated authority');
+    expect(skill).toContain('when a new decision is needed');
+  });
+  it.each([
+    ['skills-zh', '结束当前回复', '实际答复', '委托授权'],
+    ['skills', 'end the current response', 'actual answer', 'delegated authority'],
+  ])(
+    'keeps text-only approval pauses explicit in the shared decision protocol in %s',
+    async (root, stop, reply, authority) => {
+      const reference = await readFile(
+        path.resolve('assets', root, 'comet-classic/reference/decision-point.md'),
+        'utf8',
+      );
+      expect(reference).toContain(stop);
+      expect(reference).toContain(reply);
+      expect(reference).toContain(authority);
+    },
+  );
+  it.each(['comet-open', 'comet-design'])(
+    'requires the actual reply to the presented content before approving %s',
+    async (name) => {
+      const skill = await chineseSkill(name);
+      expect(skill).toContain('decision-point.md');
+      expect(skill).toContain('已有授权');
+      expect(skill).toContain('需要新决定时');
+      expect(skill).toContain('等待答复');
+    },
+  );
+  it.each(['comet-open', 'comet-design'])(
+    'requires the actual reply to the presented English content before approving %s',
+    async (name) => {
+      const skill = await englishSkill(name);
+      expect(skill).toContain('decision-point.md');
+      expect(skill).toContain('existing author');
+      expect(skill).toContain('a new decision is needed');
+      expect(skill).toContain('wait');
+    },
+  );
   it.each(['skills', 'skills-zh'])(
     'shares creation order and early host checks in %s',
     async (root) => {

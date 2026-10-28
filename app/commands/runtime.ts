@@ -50,6 +50,7 @@ export interface RuntimeCommandHost {
 export type RuntimeCommandResponse = {
   protocolVersion: 1;
   requestId: string;
+  recovery?: unknown;
 } & (
   | {
       status: 'succeeded';
@@ -111,7 +112,15 @@ const operationFields = {
     'contentHash',
     'submissionId',
   ],
-  'resolve-wait': ['runId', 'expectedRevision', 'waitId', 'proposalHash', 'decisionId', 'choice'],
+  'resolve-wait': [
+    'runId',
+    'expectedRevision',
+    'waitId',
+    'proposalHash',
+    'decisionId',
+    'choice',
+    'reason',
+  ],
   'revise-wait': ['runId', 'expectedRevision', 'waitId', 'proposalHash', 'proposal'],
   'mark-unknown': ['runId', 'expectedRevision', 'actionId', 'attempt', 'reason'],
   retry: ['runId', 'expectedRevision', 'actionId', 'attempt', 'proposalHash', 'reconciliation'],
@@ -151,7 +160,17 @@ function validateOutcome(value: RuntimeValue): void {
   try {
     parseRuntimeOutcome(value);
   } catch (error) {
-    if (error instanceof RuntimeProtocolError) invalid(`outcome 无效：${error.message}`);
+    if (error instanceof RuntimeProtocolError) {
+      const missingOutput =
+        value !== null &&
+        typeof value === 'object' &&
+        !Array.isArray(value) &&
+        !Object.hasOwn(value, 'output');
+      const guidance = missingOutput
+        ? '；缺少 outcome.output，业务结果应放在其中。请按本次领取响应的 outcomeRequest 修正，保留原 Action 身份与领取绑定，不要重新领取或执行'
+        : '';
+      invalid(`outcome 无效：${error.message}${guidance}`);
+    }
     throw error;
   }
 }
@@ -268,6 +287,7 @@ function parseRequest(value: unknown): JsonObject & { operation: keyof typeof op
     if (name === 'resolve-wait') {
       text(request.decisionId, 'decisionId');
       text(request.choice, 'choice');
+      if (request.reason !== undefined) text(request.reason, 'reason');
     } else if (!Object.hasOwn(request, 'proposal')) invalid('proposal 必须显式提供，可使用 null');
   }
   if (name === 'cancel') text(request.reason, 'reason');
@@ -561,6 +581,8 @@ export async function runtimeDispatchCommand(
 ): Promise<RuntimeCommandResult> {
   let requestId: string = randomUUID();
   let recoveryRequest: { operation: 'inspect'; runId: string } | undefined;
+  let rejectedOutcome:
+    { actionId: string; attempt: number; inputHash: string; claimToken: string } | undefined;
   let recoveryCwd = path.resolve(host.invocationCwd ?? process.cwd(), options.projectRoot ?? '.');
   try {
     const invocationCwd = path.resolve(host.invocationCwd ?? process.cwd());
@@ -574,6 +596,26 @@ export async function runtimeDispatchCommand(
     );
     const requestFile = path.resolve(invocationCwd, text(options.request, '--request'));
     const request = parseRequest(await readJson(requestFile, 'REQUEST'));
+    if (
+      request.operation === 'record-outcome' &&
+      request.outcome &&
+      typeof request.outcome === 'object' &&
+      !Array.isArray(request.outcome)
+    ) {
+      const outcome = request.outcome as Record<string, unknown>;
+      if (
+        typeof outcome.actionId === 'string' &&
+        typeof outcome.attempt === 'number' &&
+        typeof outcome.inputHash === 'string' &&
+        typeof outcome.claimToken === 'string'
+      )
+        rejectedOutcome = {
+          actionId: outcome.actionId,
+          attempt: outcome.attempt,
+          inputHash: outcome.inputHash,
+          claimToken: outcome.claimToken,
+        };
+    }
     if (typeof request.runId === 'string' && request.operation !== 'inspect') {
       recoveryRequest = { operation: 'inspect', runId: request.runId };
       recoveryCwd = projectRoot;
@@ -976,6 +1018,20 @@ export async function runtimeDispatchCommand(
       );
     }
     const context = { requestId, projectRoot, invocationCwd, environment };
+    if (application === 'native' && boundRun && request.operation !== 'inspect') {
+      const { registerNativeSdkRequestInput } =
+        await import('../../domains/comet-native/native-runtime-ownership.js');
+      await registerNativeSdkRequestInput({
+        projectRoot,
+        artifactRootRef: (boundRun.input as { artifactRootRef: string }).artifactRootRef,
+        file: requestFile,
+        runId: String(request.runId),
+        validateContent: (content) => {
+          if (JSON.stringify(parseRequest(JSON.parse(content))) !== JSON.stringify(request))
+            invalid('SDK 请求文件在读取后发生变化，请重新提交原请求');
+        },
+      });
+    }
     let data =
       request.operation === 'inspect' && boundRun
         ? boundRun
@@ -1069,6 +1125,34 @@ export async function runtimeDispatchCommand(
     };
   } catch (error) {
     const failure = runtimeCommandFailure(error, requestId);
+    if (options.application && recoveryRequest) {
+      try {
+        const { withNativeCommandRecovery } =
+          await import('../../domains/comet-native/native-command-recovery.js');
+        const diagnosed = await withNativeCommandRecovery(
+          {
+            command: 'runtime',
+            exitCode: failure.exitCode,
+            error: {
+              code: 'blocked',
+              message: error instanceof Error ? error.message : String(error),
+            },
+          },
+          {
+            projectRoot: recoveryCwd,
+            name: recoveryRequest.runId,
+            error,
+            onlyLocks: true,
+            application: options.application,
+            rejectedOutcome,
+          },
+        );
+        const recovery = (diagnosed.data as { recovery?: unknown } | undefined)?.recovery;
+        if (recovery) failure.response = { ...failure.response, recovery };
+      } catch {
+        // 恢复诊断不可掩盖原失败，也不能通过尝试写入来修复观测。
+      }
+    }
     if (
       host.output !== 'compact' ||
       !recoveryRequest ||

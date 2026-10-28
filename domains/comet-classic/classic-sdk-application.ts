@@ -1,8 +1,21 @@
 import { assertClassicEditReviewsComplete } from './classic-edit-review.js';
-import { assertClassicSdkDeliveryInputs } from './classic-sdk-delivery-inputs.js';
+import {
+  readClassicArchiveManifest,
+  assertClassicArchiveExecutionReceipt,
+} from './classic-sdk-archive-manifest.js';
+import {
+  assertClassicSdkDeliveryInputs,
+  assertClassicSdkDeliveryFileInputs,
+  assertClassicSdkArchiveCommitInputs,
+} from './classic-sdk-delivery-inputs.js';
 import { resolveClassicStateFile } from './classic-state-file.js';
+import { readClassicSdkDeliveryCheckpoint } from './classic-sdk-delivery-checkpoint.js';
 import { classicSdkCheckDirectoryRef, classicSdkCheckLogHash } from './classic-sdk-check-record.js';
 import { archivedClassicDocumentRef } from './classic-archive-annotation.js';
+import {
+  classicArchiveDocumentOutputs,
+  assertClassicRecoveredArchiveDocuments,
+} from './classic-sdk-archive-documents.js';
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { isDeepStrictEqual } from 'node:util';
@@ -28,6 +41,7 @@ import {
   inspectProtectedProjectPath,
   readProtectedProjectFile,
 } from '../workflow-contract/protected-project-path.js';
+import { normalizeWorkflowRelativePath } from '../workflow-contract/project-config.js';
 import {
   classicArchivedRequirementsProblems,
   readClassicArtifactRequirements,
@@ -61,6 +75,7 @@ import {
 } from './classic-tasks.js';
 import { applyClassicTransition } from './classic-transitions.js';
 import { classicVerificationReportReceipt } from './classic-verification-report.js';
+import { classicDeliveryActionContext } from './classic-sdk-delivery-repair-model.js';
 
 export interface ClassicWorkflowApplication {
   workflow: DefineWorkflowOptions;
@@ -226,7 +241,7 @@ const buildConfigurationValidator: RuntimeValidator = {
 const archiveOutcomeValidator: RuntimeValidator = {
   id: 'comet-classic-archive-outcome',
   version: '1',
-  async validate({ action, outcome, context }) {
+  async validate({ run, action, outcome, context }) {
     if (outcome.status === 'failed') return { accepted: true };
     const root = context?.projectRoot;
     const input = action.input as { input?: { changeDir?: unknown } };
@@ -270,6 +285,24 @@ const archiveOutcomeValidator: RuntimeValidator = {
       if (problems.length > 0) {
         return { accepted: false, reason: problems.join('\n') };
       }
+      const recorded = run.actions.find((entry) => entry.id === action.id);
+      if (
+        recorded?.status === 'succeeded' &&
+        recorded.outcome &&
+        hashRuntimeValue(recorded) === hashRuntimeValue(action) &&
+        hashRuntimeValue(recorded.outcome) === hashRuntimeValue(outcome)
+      ) {
+        // 已被权威 Run 接受的同一结果可随 portable artifact 复核，不依赖原设备缓存。
+        await readClassicArchiveManifest(root, run, recorded, output.archiveDirectory);
+      } else {
+        await assertClassicArchiveExecutionReceipt(
+          root,
+          run,
+          action,
+          output.archiveDirectory,
+          outcome.artifacts,
+        );
+      }
       return { accepted: true };
     } catch (error) {
       return { accepted: false, reason: error instanceof Error ? error.message : String(error) };
@@ -303,10 +336,11 @@ async function onlyRuntimeCheckpointChanged(
   if (
     !readPortableRunCheckpoint(beforeData[PORTABLE_RUN_CHECKPOINT_KEY], run.runId) ||
     !readPortableRunCheckpoint(afterData[PORTABLE_RUN_CHECKPOINT_KEY], run.runId) ||
-    !portableRunCheckpointMatches(
+    (!portableRunCheckpointMatches(
       afterData[PORTABLE_RUN_CHECKPOINT_KEY],
       createPortableRunCheckpoint(run),
-    )
+    ) &&
+      !readClassicSdkDeliveryCheckpoint(afterData[PORTABLE_RUN_CHECKPOINT_KEY], run))
   ) {
     return false;
   }
@@ -326,7 +360,7 @@ const deliveryOutcomeValidator: RuntimeValidator = {
       input?: { changeDir?: unknown };
       outputs?: Record<string, unknown>;
     };
-    const outputs = actionInput.outputs;
+    const outputs = classicDeliveryActionContext(run, action)?.outputs ?? actionInput.outputs;
     const approved = outputs?.[`${profile}.archive.preflight`] as
       | {
           deliveryAction?: unknown;
@@ -359,12 +393,18 @@ const deliveryOutcomeValidator: RuntimeValidator = {
       typeof archive.archiveDirectory !== 'string' ||
       typeof actionInput.input?.changeDir !== 'string' ||
       typeof delivered.commit !== 'string' ||
-      !/^[0-9a-f]{40}(?:[0-9a-f]{24})?$/u.test(delivered.commit) ||
-      liveGitBranch(root) !== approved.targetBranch
+      !/^[0-9a-f]{40}(?:[0-9a-f]{24})?$/u.test(delivered.commit)
     ) {
       return { accepted: false, reason: 'Classic delivery does not match its approval' };
     }
     try {
+      const branch = liveGitBranch(root);
+      if (branch !== approved.targetBranch) {
+        return {
+          accepted: false,
+          reason: `Classic 当前分支 ${branch ?? '(detached HEAD)'} 与已批准目标 ${String(approved.targetBranch)} 不一致`,
+        };
+      }
       if (approved.deliveryAction !== 'local') {
         if (
           typeof approved.remote !== 'string' ||
@@ -375,17 +415,62 @@ const deliveryOutcomeValidator: RuntimeValidator = {
           return { accepted: false, reason: 'Classic delivery remote changed after approval' };
         }
       }
-      const layout = await resolveClassicLayout(root);
       const head = execFileSync('git', ['rev-parse', 'HEAD'], {
         cwd: root,
         encoding: 'utf8',
       }).trim();
-      const parents = execFileSync('git', ['rev-list', '--parents', '-n', '1', 'HEAD'], {
-        cwd: root,
-        encoding: 'utf8',
-      })
+      if (head !== delivered.commit) {
+        return {
+          accepted: false,
+          reason: `Classic 当前 HEAD ${head} 与交付提交 ${delivered.commit} 不一致`,
+        };
+      }
+      if (!/^[0-9a-f]{40}(?:[0-9a-f]{24})?$/u.test(approved.baseCommit)) {
+        return { accepted: false, reason: 'Classic 交付缺少有效的已批准基线 baseCommit' };
+      }
+      const commits = execFileSync(
+        'git',
+        ['rev-list', '--reverse', '--parents', `${approved.baseCommit}..${head}`, '--'],
+        { cwd: root, encoding: 'utf8' },
+      )
         .trim()
-        .split(/\s+/u);
+        .split('\n')
+        .filter(Boolean);
+      if (!commits.length) {
+        return {
+          accepted: false,
+          reason: `Classic 已批准基线 ${approved.baseCommit} 之后没有交付提交`,
+        };
+      }
+      let previousCommit = approved.baseCommit;
+      const changed = new Set<string>();
+      const commitPaths = new Map<string, string[]>();
+      for (const row of commits) {
+        const [commit, ...parents] = row.split(/\s+/u);
+        if (parents.length !== 1) {
+          return {
+            accepted: false,
+            reason: `Classic 交付范围包含非线性提交 ${commit}（父提交数 ${parents.length}）；只接受从已批准基线 ${approved.baseCommit} 连续产生的单父提交`,
+          };
+        }
+        if (parents[0] !== previousCommit) {
+          return {
+            accepted: false,
+            reason: `Classic 交付提交 ${commit} 的父提交 ${parents[0]} 不等于 ${previousCommit}；交付范围必须从已批准基线 ${approved.baseCommit} 连续开始`,
+          };
+        }
+        // 逐提交检查，避免先夹带未批准文件、再撤销的提交躲过最终 tree 对比。
+        const paths = execFileSync(
+          'git',
+          ['diff-tree', '--no-commit-id', '--no-renames', '--name-only', '-r', '-z', commit],
+          { cwd: root, encoding: 'utf8' },
+        )
+          .split('\0')
+          .filter(Boolean);
+        commitPaths.set(commit, paths);
+        for (const file of paths) changed.add(file);
+        previousCommit = commit;
+      }
       const files = execFileSync(
         'git',
         ['ls-tree', '-r', '--name-only', 'HEAD', '--', archive.archiveDirectory],
@@ -399,28 +484,19 @@ const deliveryOutcomeValidator: RuntimeValidator = {
         ['status', '--porcelain', '--untracked-files=all', '--', archive.archiveDirectory],
         { cwd: root, encoding: 'utf8' },
       ).trim();
-      const changed = execFileSync(
-        'git',
-        ['diff-tree', '--no-commit-id', '--name-only', '-r', '-z', 'HEAD'],
-        {
-          cwd: root,
-        },
-      )
-        .toString('utf8')
-        .split('\0')
-        .filter(Boolean);
       const activeRef = actionInput.input.changeDir.replaceAll('\\', '/');
       const archiveRef = archive.archiveDirectory.replaceAll('\\', '/');
-      const specsRef = path.relative(root, layout.specsDir).replaceAll('\\', '/');
-      const acceptedPlan = outputs?.['full.build.plan'] as
+      const documentBinding = classicArchiveDocumentOutputs(run, action);
+      const documentOutputs = documentBinding.outputs;
+      const acceptedPlan = documentOutputs['full.build.plan'] as
         | {
             plan?: unknown;
             designEvidence?: { ref?: unknown; contentHash?: unknown };
           }
         | undefined;
       const designDoc =
-        (outputs?.['full.design.document'] as { designDoc?: unknown } | undefined)?.designDoc ??
-        acceptedPlan?.designEvidence?.ref;
+        (documentOutputs['full.design.document'] as { designDoc?: unknown } | undefined)
+          ?.designDoc ?? acceptedPlan?.designEvidence?.ref;
       const plan = acceptedPlan?.plan;
       if (profile === 'full' && (typeof designDoc !== 'string' || typeof plan !== 'string')) {
         return { accepted: false, reason: 'Classic Archive documents are missing' };
@@ -448,41 +524,92 @@ const deliveryOutcomeValidator: RuntimeValidator = {
               stdio: ['ignore', 'pipe', 'pipe'],
             })
           : null;
+      if (
+        documentBinding.recovered &&
+        typeof designDoc === 'string' &&
+        typeof plan === 'string' &&
+        committedDesign !== null &&
+        committedPlan !== null
+      )
+        await assertClassicRecoveredArchiveDocuments({
+          projectRoot: root,
+          run,
+          archiveRef,
+          activeRef,
+          designRef: designDoc,
+          planRef: plan,
+          committedDesign,
+          committedPlan,
+          evidence: documentBinding.evidence,
+        });
       const implementationFiles = await assertClassicSdkDeliveryInputs(root, run);
+      const archiveAction = run.actions
+        .slice()
+        .reverse()
+        .find(
+          (entry) => entry.stepId === `${profile}.archive.execute` && entry.status === 'succeeded',
+        );
+      if (!archiveAction) throw new Error('Classic delivery 缺少成功的 Archive Action');
+      const archiveManifest = await readClassicArchiveManifest(
+        root,
+        run,
+        archiveAction,
+        archiveRef,
+      );
+      for (const [ref, hash] of Object.entries(archiveManifest.optionalFiles ?? {})) {
+        const committed = execFileSync('git', ['ls-tree', '-z', 'HEAD', '--', ref], {
+          cwd: root,
+          encoding: 'utf8',
+        });
+        if (committed) archiveManifest.inputs[ref] = hash;
+      }
+      const archiveFiles = await assertClassicSdkDeliveryFileInputs(root, archiveManifest.inputs);
+      await assertClassicSdkArchiveCommitInputs(
+        root,
+        archiveManifest.inputs,
+        commitPaths,
+        archiveManifest.sources,
+        archiveManifest.stateFiles,
+      );
       const allowed = (file: string) =>
         implementationFiles.has(file) ||
-        file.startsWith(`${activeRef}/`) ||
-        file.startsWith(`${archiveRef}/`) ||
-        file.startsWith(`${specsRef}/`) ||
-        (profile === 'full' && (file === designDoc || file === plan));
-      const offendingPaths = changed.filter((file) => !allowed(file));
+        archiveFiles.has(file) ||
+        archiveManifest.stateFiles.includes(file);
+      const offendingPaths = [...changed].filter((file) => !allowed(file));
       if (offendingPaths.length) {
         return {
           accepted: false,
-          reason: `Classic 归档提交包含未批准的路径：${offendingPaths.join(', ')}`,
+          reason: `Classic 交付提交范围包含未批准的路径：${offendingPaths.join(', ')}`,
         };
       }
       const checkpointOnlyDirty =
         dirty !== '' && (await onlyRuntimeCheckpointChanged(root, archiveRef, dirty, run));
+      if (!files) {
+        return { accepted: false, reason: `Classic 交付 HEAD 缺少归档目录：${archiveRef}` };
+      }
+      if (dirty && !checkpointOnlyDirty) {
+        return { accepted: false, reason: `Classic 归档目录与交付 HEAD 不一致：${dirty}` };
+      }
+      if (![...changed].some((file) => file.startsWith(`${archiveRef}/`))) {
+        return {
+          accepted: false,
+          reason: `Classic 交付范围 ${approved.baseCommit}..${head} 未包含归档目录：${archiveRef}`,
+        };
+      }
       if (
-        head !== delivered.commit ||
-        parents.length !== 2 ||
-        parents[1] !== approved.baseCommit ||
-        !files ||
-        (dirty && !checkpointOnlyDirty) ||
-        !changed.some((file) => file.startsWith(`${archiveRef}/`)) ||
-        (profile === 'full' &&
-          (typeof designDoc !== 'string' ||
-            typeof plan !== 'string' ||
-            !archivedDesignDoc ||
-            !archivedPlan ||
-            !changed.includes(archivedDesignDoc) ||
-            !changed.includes(archivedPlan) ||
-            !committedDesign?.includes(`archived-with: ${archiveName}`) ||
-            !committedDesign.includes('status: final') ||
-            !committedPlan?.includes(`archived-with: ${archiveName}`)))
+        profile === 'full' &&
+        (!archivedDesignDoc ||
+          !archivedPlan ||
+          !changed.has(archivedDesignDoc) ||
+          !changed.has(archivedPlan) ||
+          !committedDesign?.includes(`archived-with: ${archiveName}`) ||
+          !committedDesign.includes('status: final') ||
+          !committedPlan?.includes(`archived-with: ${archiveName}`))
       ) {
-        return { accepted: false, reason: 'Classic archive commit is missing or changed' };
+        return {
+          accepted: false,
+          reason: `Classic 交付范围缺少已归档的设计或计划，或归档标记不符：${archivedDesignDoc}, ${archivedPlan}`,
+        };
       }
       if (approved.deliveryAction !== 'local') {
         const remoteHead = classicSdkRemoteBranchHead(
@@ -570,20 +697,23 @@ export async function classicOpenEvidenceReceipt(
   for (const file of requirements.files) {
     const relative = path.relative(projectRoot, file).replaceAll('\\', '/');
     if (options.designRequirements && relative === `${inspected.relative}/design.md`) continue;
-    const hashed = await hashProtectedProjectFile(projectRoot, relative, {
-      label: 'Classic Open artifact',
-    });
-    if (hashed.stat.size === 0) throw new Error(`Classic Open artifact is empty: ${relative}`);
-    let digest = hashed.digest;
+    let digest: string;
     if (
       relative === `${inspected.relative}/tasks.md` &&
       (options.designRequirements ||
         options.presetRequirements ||
         options.taskCheckboxes === 'ignore')
     ) {
-      const source = await readClassicProjectFile(projectRoot, relative, {
-        label: 'Classic task requirements',
-      });
+      const taskFile = await readProtectedProjectFile(
+        projectRoot,
+        relative,
+        Number.MAX_SAFE_INTEGER,
+        {
+          label: 'Classic task requirements',
+        },
+      );
+      if (taskFile.stat.size === 0) throw new Error(`Classic Open artifact is empty: ${relative}`);
+      const source = taskFile.bytes.toString('utf8');
       digest = options.designRequirements
         ? classicTaskRevision(source)
         : createHash('sha256')
@@ -593,6 +723,12 @@ export async function classicOpenEvidenceReceipt(
               }),
             )
             .digest('hex');
+    } else {
+      const hashed = await hashProtectedProjectFile(projectRoot, relative, {
+        label: 'Classic Open artifact',
+      });
+      if (hashed.stat.size === 0) throw new Error(`Classic Open artifact is empty: ${relative}`);
+      digest = hashed.digest;
     }
     entries.push([relative, digest]);
   }
@@ -607,16 +743,12 @@ export async function classicDesignEvidenceReceipt(
   projectRoot: string,
   designDocRef: string,
 ): Promise<{ ref: string; contentHash: string }> {
-  const inspected = await inspectProtectedProjectPath(projectRoot, designDocRef, {
-    label: 'Classic Design document',
-    expected: 'file',
-  });
-  if (!inspected.exists) throw new Error('Classic Design document does not exist');
-  const hashed = await hashProtectedProjectFile(projectRoot, inspected.relative, {
+  const ref = normalizeWorkflowRelativePath(designDocRef, 'Classic Design document');
+  const hashed = await hashProtectedProjectFile(projectRoot, ref, {
     label: 'Classic Design document',
   });
   if (hashed.stat.size === 0) throw new Error('Classic Design document is empty');
-  return { ref: inspected.relative, contentHash: hashed.digest };
+  return { ref, contentHash: hashed.digest };
 }
 
 /** Reuse only the document accepted by the latest Design evidence. */
@@ -652,9 +784,7 @@ export async function classicPlanEvidenceReceipt(
   planRef: string,
   changeDirRef: string,
 ): Promise<{ ref: string; contentHash: string }> {
-  const readiness = await inspectClassicPlanReadiness(projectRoot, planRef, {
-    requireNonempty: true,
-  });
+  const readiness = await inspectClassicPlanReadiness(projectRoot, planRef);
   if (readiness.status !== 'ready') throw new Error('Classic Build plan is not ready');
   const change = await inspectProtectedProjectPath(projectRoot, changeDirRef, {
     label: 'Classic change',
@@ -670,6 +800,7 @@ export async function classicPlanEvidenceReceipt(
       label: 'Classic tasks',
     }),
   ]);
+  if (!planFile.bytes.toString('utf8').trim()) throw new Error('Classic Build plan is not ready');
   const mapping = validateClassicTaskPlan(
     planFile.bytes.toString('utf8'),
     tasksRef,
@@ -1830,6 +1961,7 @@ export function defineClassicWorkflowApplication(
               { from: `${profile}.build.check`, to: `${profile}.build.check.evidence` },
               { from: `${profile}.build.check`, to: followingStep, on: 'failed' },
               { from: `${profile}.build.check.evidence`, to: `${profile}.verify.run` },
+              { from: `${profile}.build.check.evidence`, to: followingStep, on: 'invalidated' },
               { from: `${profile}.verify.run`, to: `${profile}.verify.report.evidence` },
               { from: `${profile}.verify.run`, to: `${profile}.build.execute` },
               { from: `${profile}.verify.report.evidence`, to: `${profile}.verify.check` },
@@ -1898,6 +2030,10 @@ export function defineClassicWorkflowApplication(
     transitionHandler: {
       ...transitionRef,
       apply({ run, event }) {
+        if (event.kind === 'action-outcome' && event.outcome.status === 'failed') {
+          const interrupted = run.actions.find((action) => action.id === event.outcome.actionId);
+          if (interrupted?.type === 'invoke_skill') return { state: run.state!, next: [] };
+        }
         if (fullApplication && event.stepId.startsWith('full.')) {
           return fullApplication.transitionHandler.apply({ run, event });
         }
@@ -2179,10 +2315,12 @@ export function defineClassicWorkflowApplication(
               run.commands?.some(
                 (command) =>
                   command.name === 'revise-design' &&
-                  (
-                    run.actions.find((action) => action.id === command.actionId)?.input as
-                      { activation?: { fromPhase?: string } } | undefined
-                  )?.activation?.fromPhase === 'build',
+                  ['build', 'verify', 'archive'].includes(
+                    (
+                      run.actions.find((action) => action.id === command.actionId)?.input as
+                        { activation?: { fromPhase?: string } } | undefined
+                    )?.activation?.fromPhase ?? '',
+                  ),
               )
                 ? 'full.build.plan'
                 : 'full.build.configure',
@@ -2344,11 +2482,10 @@ export function defineClassicWorkflowApplication(
           };
         }
         if (
-          profile === 'full' &&
           event.kind === 'evidence-invalidated' &&
-          event.stepId === 'full.build.check.evidence'
+          event.stepId === `${profile}.build.check.evidence`
         ) {
-          return { state: run.state!, next: ['full.build.execute'] };
+          return { state: run.state!, next: [`${profile}.build.execute`] };
         }
         if (
           profile === 'full' &&

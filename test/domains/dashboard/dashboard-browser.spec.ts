@@ -116,6 +116,10 @@ test('searches all personal memories, pages beyond the byte budget and ignores s
     return result;
   });
   const queries: string[] = [];
+  let releaseSlowSearch!: () => void;
+  const slowSearch = new Promise<void>((resolve) => {
+    releaseSlowSearch = resolve;
+  });
   await page.route('**/plugins/comet.personal-memory/invoke', async (route) => {
     const { capability, input } = route.request().postDataJSON();
     if (capability === 'remove') {
@@ -125,7 +129,7 @@ test('searches all personal memories, pages beyond the byte budget and ignores s
     expect(capability).toBe('manage');
     queries.push(input.query ?? '');
     if (input.query === 'slow') {
-      await new Promise((resolve) => setTimeout(resolve, 600));
+      await slowSearch;
       return route.fulfill({
         json: {
           result: {
@@ -141,6 +145,10 @@ test('searches all personal memories, pages beyond the byte budget and ignores s
     return route.fulfill({ json: { result: pageOf(input.query, input.offset) } });
   });
   await page.setViewportSize({ width: 1600, height: 1000 });
+  await page.addInitScript(() => {
+    localStorage.setItem('comet-theme', 'dark');
+    localStorage.setItem('comet-dashboard-font-scale', '125');
+  });
   await page.goto('/');
   await page.getByRole('menuitem', { name: '个人记忆' }).click();
   const registry = page.getByLabel('个人记忆列表', { exact: true });
@@ -156,9 +164,19 @@ test('searches all personal memories, pages beyond the byte budget and ignores s
   const search = page.getByRole('textbox', { name: '搜索个人记忆', exact: true });
   await search.fill('slow');
   await expect.poll(() => queries.includes('slow')).toBe(true);
+  const loadingState = registry.getByRole('status', { name: '正在搜索个人记忆…' });
+  await expect(loadingState).toBeVisible();
+  await expect(loadingState.locator('.dashboard-memory-loading-row')).toHaveCount(3);
+  await expect(registry.locator('.dashboard-memory-registry-toolbar')).not.toContainText('0 条');
+  await page.setViewportSize({ width: 390, height: 844 });
+  expect(await loadingState.evaluate((element) => element.scrollWidth <= element.clientWidth)).toBe(
+    true,
+  );
+  await page.setViewportSize({ width: 1600, height: 1000 });
   await search.fill('0000');
+  releaseSlowSearch();
   await expect(registry).toContainText('Searchable memory 0000');
-  await page.waitForTimeout(700);
+  await expect(loadingState).toHaveCount(0);
   await expect(registry).not.toContainText('Stale search result');
   await registry.getByRole('button', { name: '删除记忆', exact: true }).click();
   await expect(registry).toContainText('共 0 条');
@@ -168,6 +186,283 @@ test('searches all personal memories, pages beyond the byte budget and ignores s
   await page.setViewportSize({ width: 820, height: 900 });
   await expect(registry.getByRole('button', { name: '下一页', exact: true })).toBeVisible();
 });
+
+test('pages through all personal memory demo records and keeps search local', async ({ page }) => {
+  const writes: string[] = [];
+  page.on('request', (request) => {
+    if (request.method() === 'POST' && request.url().includes('/api/dashboard/')) {
+      writes.push(request.url());
+    }
+  });
+  await page.setViewportSize({ width: 1444, height: 901 });
+  await page.goto('/?demo');
+  await page.getByRole('menuitem', { name: '个人记忆' }).click();
+  const registry = page.getByRole('region', { name: '个人记忆列表' });
+  const pagination = registry.getByLabel('个人记忆分页');
+  const previous = pagination.getByRole('button', { name: '上一页', exact: true });
+  const next = pagination.getByRole('button', { name: '下一页', exact: true });
+
+  await expect(previous).toHaveClass(/dashboard-page-nav-button/u);
+  await expect(next).toHaveClass(/dashboard-page-nav-button/u);
+  await expect(pagination).toContainText('当前显示 1–5 条，共 12 条');
+  await expect(registry).toContainText('交付语言与结构');
+  await expect(registry).not.toContainText('发布说明偏好');
+  await expect(previous).toBeDisabled();
+  await next.click();
+  await expect(pagination).toContainText('当前显示 6–10 条，共 12 条');
+  await expect(registry).toContainText('发布说明偏好');
+  await expect(registry).not.toContainText('交付语言与结构');
+  await page.screenshot({ path: test.info().outputPath('personal-memory-pagination-desktop.png') });
+  await next.click();
+  await expect(pagination).toContainText('当前显示 11–12 条，共 12 条');
+  await expect(registry).toContainText('窄屏导航验收');
+  await expect(next).toBeDisabled();
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect(previous).toBeEnabled();
+  await previous.scrollIntoViewIfNeeded();
+  await page.screenshot({ path: test.info().outputPath('personal-memory-pagination-mobile.png') });
+  await previous.click();
+  await expect(pagination).toContainText('当前显示 6–10 条，共 12 条');
+  await expect(registry).toContainText('发布说明偏好');
+  await previous.click();
+  await expect(pagination).toContainText('当前显示 1–5 条，共 12 条');
+  await expect(registry).toContainText('交付语言与结构');
+
+  await page.getByRole('textbox', { name: '搜索个人记忆' }).fill('窄屏导航验收');
+  await expect(pagination).toContainText('当前显示 1–1 条，共 1 条');
+  await expect(registry).toContainText('窄屏导航验收');
+  await expect(next).toBeDisabled();
+  expect(writes).toEqual([]);
+});
+
+test('fills a regular personal memory page without stretching a single search result', async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 1900, height: 1170 });
+  await page.goto('/?demo');
+  await page.getByRole('menuitem', { name: '个人记忆' }).click();
+  const list = page.locator('[data-dashboard-scroll="personal-memory-list"]');
+  await expect(list.locator('.dashboard-memory-table-row')).toHaveCount(5);
+  const emptySpace = await list.evaluate((element) => {
+    const lastRow = [...element.querySelectorAll('.dashboard-memory-table-row')].at(-1)!;
+    return element.getBoundingClientRect().bottom - lastRow.getBoundingClientRect().bottom;
+  });
+  expect(emptySpace).toBeLessThanOrEqual(12);
+  await page.screenshot({ path: test.info().outputPath('personal-memory-filled-page.png') });
+
+  await page.getByRole('textbox', { name: '搜索个人记忆' }).fill('窄屏导航验收');
+  const result = list.locator('.dashboard-memory-table-row');
+  await expect(result).toHaveCount(1);
+  expect((await result.boundingBox())?.height).toBeLessThan(160);
+});
+
+test('keeps personal memory page controls steady on hover and press', async ({ page }) => {
+  await page.goto('/?demo');
+  await page.getByRole('menuitem', { name: '个人记忆' }).click();
+  const pagination = page.getByLabel('个人记忆分页');
+  await pagination.getByRole('button', { name: '下一页', exact: true }).click();
+  await expect(pagination).toContainText('当前显示 6–10 条');
+  for (const theme of ['light', 'dark'] as const) {
+    await setDashboardTheme(page, theme);
+    for (const name of ['上一页', '下一页']) {
+      const button = pagination.getByRole('button', { name, exact: true });
+      await page.mouse.move(0, 0);
+      const before = await button.boundingBox();
+      await button.hover();
+      await page.waitForTimeout(250);
+      expect(await button.boundingBox()).toEqual(before);
+      await expect(button).toHaveCSS('border-top-width', '1px');
+      await expect(button).not.toHaveCSS('background-color', 'rgba(0, 0, 0, 0)');
+      await pagination.screenshot({
+        path: test.info().outputPath(`personal-memory-hover-${theme}-${name}.png`),
+      });
+      await page.mouse.down();
+      expect(await button.boundingBox()).toEqual(before);
+      await page.mouse.move(0, 0);
+      await page.mouse.up();
+    }
+  }
+});
+
+test('keeps personal memory rows fixed while switching the selected record', async ({ page }) => {
+  await page.setViewportSize({ width: 1900, height: 1170 });
+  await page.goto('/?demo');
+  await page.getByRole('menuitem', { name: '个人记忆' }).click();
+  const list = page.locator('[data-dashboard-scroll="personal-memory-list"]');
+  await expect(list.locator('.dashboard-memory-table-row')).toHaveCount(5);
+  for (const category of ['评审范围', '官网工作台迭代', '评审范围']) {
+    const row = list.locator('.dashboard-memory-table-row').filter({ hasText: category });
+    const frames = page.evaluate(async () => {
+      const samples: number[][] = [];
+      const end = performance.now() + 350;
+      while (performance.now() < end) {
+        samples.push([
+          ...[...document.querySelectorAll('.dashboard-memory-table-row')].flatMap((element) => {
+            const rect = element.getBoundingClientRect();
+            return [rect.x, rect.y, rect.width, rect.height];
+          }),
+          document.querySelector('[data-dashboard-scroll="personal-memory-list"]')!.scrollTop,
+          document.querySelector('[data-dashboard-scroll="workspace"]')!.scrollTop,
+          ...[
+            '.dashboard-memory-workspace',
+            '.dashboard-memory-registry',
+            '.dashboard-memory-table-body',
+            '.dashboard-memory-inspector',
+          ].flatMap((selector) => {
+            const rect = document.querySelector(selector)!.getBoundingClientRect();
+            return [rect.y, rect.height];
+          }),
+        ]);
+        await new Promise(requestAnimationFrame);
+      }
+      return samples;
+    });
+    await row.click();
+    await expect(row).toHaveAttribute('aria-pressed', 'true');
+    await expect(page.locator('.dashboard-memory-inspector-head > strong')).toHaveText(category);
+    const samples = await frames;
+    const drift = samples[0].map(
+      (_, index) =>
+        Math.max(...samples.map((sample) => sample[index])) -
+        Math.min(...samples.map((sample) => sample[index])),
+    );
+    expect(Math.max(...drift)).toBeLessThanOrEqual(0.01);
+  }
+});
+
+async function stubLongPersonalMemoryPage(page: Page) {
+  const { DEMO_PLUGIN_PAGES } = await import('../../../domains/dashboard/web/demo.js');
+  const source = DEMO_PLUGIN_PAGES.find((entry) => entry.pluginId === 'comet.personal-memory')!;
+  const records = Array.from({ length: 33 }, (_, index) => ({
+    ...source.data.management.records[0],
+    id: `scroll-memory-${index + 1}`,
+    category: `个人记忆 ${String(index + 1).padStart(2, '0')}`,
+    text: `个人记忆 ${String(index + 1).padStart(2, '0')}：${'长内容用于验证列表和详情可独立滚动，分页始终可操作。'.repeat(35)}`,
+    memoryType: 'core-profile',
+    status: 'proven',
+    scope: 'global',
+  }));
+  const pageOf = (offset = 0, query = '') => {
+    const matching = records.filter((record) => record.text.includes(query));
+    return {
+      records: matching.slice(offset, offset + 32),
+      conflicts: [],
+      total: matching.length,
+      offset,
+      truncated: offset + 32 < matching.length,
+      ...(offset + 32 < matching.length ? { nextOffset: offset + 32 } : {}),
+    };
+  };
+  await stubContextPages(page, (pluginId) =>
+    pluginId === source.pluginId
+      ? {
+          ...source,
+          data: {
+            ...source.data,
+            management: pageOf(),
+            status: {
+              ...source.data.status,
+              counts: { active: records.length, history: 0, tombstones: 0 },
+            },
+          },
+        }
+      : DEMO_PLUGIN_PAGES.find((entry) => entry.pluginId === pluginId),
+  );
+  await page.route('**/plugins/comet.personal-memory/invoke', async (route) => {
+    const { capability, input } = route.request().postDataJSON();
+    expect(capability).toBe('manage');
+    await route.fulfill({ json: { result: pageOf(input.offset, input.query) } });
+  });
+}
+
+for (const viewport of [
+  { width: 2200, height: 1100 },
+  { width: 1600, height: 900 },
+  { width: 1280, height: 720 },
+  { width: 1280, height: 640 },
+]) {
+  test(`scrolls personal memory panes and keeps pagination reachable at ${viewport.width}x${viewport.height}`, async ({
+    page,
+  }) => {
+    await page.setViewportSize(viewport);
+    await stubLongPersonalMemoryPage(page);
+    await page.goto('/');
+    await page.getByRole('menuitem', { name: '个人记忆' }).click();
+    const list = page.locator('[data-dashboard-scroll="personal-memory-list"]');
+    const inspector = page.getByLabel('记忆应用详情', { exact: true });
+    const pagination = page.getByLabel('个人记忆分页');
+    const shell = page.locator('[data-dashboard-scroll="workspace"]');
+    await expect(list.locator('.dashboard-memory-table-row')).toHaveCount(32);
+    await expect
+      .poll(() => list.evaluate((element) => element.scrollHeight > element.clientHeight))
+      .toBe(true);
+    await expect(pagination).toBeInViewport({ ratio: 1 });
+    await list.hover();
+    await page.mouse.wheel(0, 100000);
+    await expect.poll(() => list.evaluate((element) => element.scrollTop)).toBeGreaterThan(0);
+    await expect(list.locator('.dashboard-memory-table-row').last()).toBeInViewport({ ratio: 1 });
+    const listTop = await list.evaluate((element) => element.scrollTop);
+    await expect
+      .poll(() => inspector.evaluate((element) => element.scrollHeight > element.clientHeight))
+      .toBe(true);
+    await inspector.hover();
+    await page.mouse.wheel(0, 100000);
+    await expect.poll(() => inspector.evaluate((element) => element.scrollTop)).toBeGreaterThan(0);
+    await expect(inspector.getByRole('heading', { name: '证据来源' })).toBeInViewport();
+    expect(await list.evaluate((element) => element.scrollTop)).toBe(listTop);
+    expect(await shell.evaluate((element) => element.scrollTop)).toBe(0);
+    await expect(pagination).toBeInViewport({ ratio: 1 });
+
+    await page.getByRole('menuitem', { name: 'Classic 工作流' }).click();
+    await page.getByRole('menuitem', { name: '个人记忆' }).click();
+    await expect.poll(() => list.evaluate((element) => element.scrollTop)).toBeCloseTo(listTop, 0);
+    await pagination.getByRole('button', { name: '下一页', exact: true }).click();
+    await expect(pagination).toContainText('当前显示 33–33 条');
+    await expect(list).toContainText('个人记忆 33');
+    await pagination.getByRole('button', { name: '上一页', exact: true }).click();
+    await expect(list.locator('.dashboard-memory-table-row')).toHaveCount(32);
+    await page.getByRole('textbox', { name: '搜索个人记忆', exact: true }).fill('个人记忆 17');
+    await expect(list.locator('.dashboard-memory-table-row')).toHaveCount(1);
+    await expect(list).toContainText('个人记忆 17');
+    await expect(pagination).toBeInViewport({ ratio: 1 });
+    await page.getByRole('textbox', { name: '搜索个人记忆', exact: true }).fill('');
+    await expect(list.locator('.dashboard-memory-table-row')).toHaveCount(32);
+    await list.hover();
+    await page.mouse.wheel(0, 100000);
+    await expect(list.locator('.dashboard-memory-table-row').last()).toBeInViewport({ ratio: 1 });
+  });
+}
+
+for (const viewport of [
+  { width: 1100, height: 760 },
+  { width: 820, height: 900 },
+  { width: 390, height: 844 },
+]) {
+  test(`keeps personal memory page scrolling below the desktop layout at ${viewport.width}px`, async ({
+    page,
+  }) => {
+    await page.setViewportSize(viewport);
+    await stubLongPersonalMemoryPage(page);
+    await page.goto('/');
+    if (viewport.width < 1024)
+      await page.getByRole('button', { name: /^(打开导航|展开导航)$/u }).click();
+    await page.getByRole('menuitem', { name: '个人记忆' }).click();
+    const list = page.locator('[data-dashboard-scroll="personal-memory-list"]');
+    await expect(list.locator('.dashboard-memory-table-row')).toHaveCount(32);
+    await expect(page.getByLabel('记忆应用详情', { exact: true })).toBeHidden();
+    const firstRow = list.locator('.dashboard-memory-table-row').first();
+    await firstRow.hover();
+    await page.mouse.wheel(0, 100000);
+    await expect(list.locator('.dashboard-memory-table-row').last()).toBeInViewport();
+    const pagination = page.getByLabel('个人记忆分页');
+    await expect(pagination).toBeInViewport({ ratio: 1 });
+    await expect
+      .poll(() => page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1))
+      .toBe(true);
+    await pagination.getByRole('button', { name: '下一页', exact: true }).click();
+    await expect(pagination).toContainText('当前显示 33–33 条');
+  });
+}
 
 test('pages application history without rendering or reloading the complete ledger', async ({
   page,
@@ -321,11 +616,18 @@ test('retains the selected trace node and cached data during a failed refresh', 
     await import('../../../domains/dashboard/web/src/change-trace-demo.js');
   await stubContextPages(page, (id) => DEMO_PLUGIN_PAGES.find((entry) => entry.pluginId === id));
   let fail = false;
-  await page.route('**/change-traces?*', (route) =>
-    fail
+  let indexReads = 0;
+  let releaseRefresh!: () => void;
+  const refreshGate = new Promise<void>((resolve) => {
+    releaseRefresh = resolve;
+  });
+  await page.route('**/change-traces?*', async (route) => {
+    indexReads++;
+    if (fail) await refreshGate;
+    return fail
       ? route.fulfill({ status: 503, json: { error: 'unavailable' } })
-      : route.fulfill({ json: DEMO_CHANGE_TRACE_INDEX }),
-  );
+      : route.fulfill({ json: DEMO_CHANGE_TRACE_INDEX });
+  });
   await page.route('**/change-trace?*', (route) =>
     fail
       ? route.fulfill({ status: 503, json: { error: 'unavailable' } })
@@ -340,12 +642,135 @@ test('retains the selected trace node and cached data during a failed refresh', 
   const node = panel.getByRole('button', { name: '查看节点 build.implement', exact: true });
   await node.click();
   fail = true;
-  await panel.getByRole('button', { name: /刷新链路/u }).click();
+  await page.getByRole('button', { name: '立即刷新', exact: true }).click();
+  await expect.poll(() => indexReads).toBeGreaterThan(1);
+  await expect(panel.getByRole('heading', { name: 'repair-session-expiry' })).toBeVisible();
+  await expect(panel.locator('.ant-skeleton')).toHaveCount(0);
+  releaseRefresh();
   await expect(panel).toContainText('最新数据同步失败，当前显示缓存');
   await expect(node).toHaveAttribute('aria-pressed', 'true');
   await expect(panel.getByRole('complementary', { name: '链路节点详情' })).toContainText(
     '完成会话校验',
   );
+});
+
+test('keeps loaded Observability panels visible when returning to a tab', async ({ page }) => {
+  const { DEMO_PLUGIN_PAGES } = await import('../../../domains/dashboard/web/demo.js');
+  const { DEMO_CHANGE_TRACE_INDEX, DEMO_CHANGE_TRACES } =
+    await import('../../../domains/dashboard/web/src/change-trace-demo.js');
+  const { DEMO_RUNTIME_PERFORMANCE, DEMO_RUNTIME_INSIGHTS } =
+    await import('../../../domains/dashboard/web/src/runtime-performance-demo.js');
+  await stubContextPages(page, (id) => DEMO_PLUGIN_PAGES.find((entry) => entry.pluginId === id));
+  let performanceReads = 0;
+  let releasePerformance!: () => void;
+  const performanceGate = new Promise<void>((resolve) => {
+    releasePerformance = resolve;
+  });
+  await page.route('**/runtime-performance?*', async (route) => {
+    performanceReads++;
+    if (performanceReads === 2) await performanceGate;
+    return route.fulfill({ json: DEMO_RUNTIME_PERFORMANCE.all });
+  });
+  await page.route('**/runtime-insights', (route) =>
+    route.fulfill({ json: DEMO_RUNTIME_INSIGHTS }),
+  );
+  let traceReads = 0;
+  let releaseTrace!: () => void;
+  const traceGate = new Promise<void>((resolve) => {
+    releaseTrace = resolve;
+  });
+  await page.route('**/change-traces?*', async (route) => {
+    traceReads++;
+    if (traceReads === 2) await traceGate;
+    return route.fulfill({ json: DEMO_CHANGE_TRACE_INDEX });
+  });
+  await page.route('**/change-trace?*', (route) =>
+    route.fulfill({
+      json: DEMO_CHANGE_TRACES[new URL(route.request().url()).searchParams.get('traceId')!],
+    }),
+  );
+  await page.goto('/');
+  await page.getByRole('menuitem', { name: '可观测' }).click();
+  const performance = page.getByRole('region', { name: '运行性能', exact: true });
+  await expect(performance.locator('.runtime-performance-metrics')).toContainText('92.6');
+  await expect(performance.getByRole('region', { name: 'Runtime 健康' })).toContainText(
+    '常驻服务已连接',
+  );
+  await page.getByRole('tab', { name: 'Change 链路', exact: true }).click();
+  const trace = page.getByRole('region', { name: 'Change 链路', exact: true });
+  await expect(trace.getByRole('heading', { name: 'repair-session-expiry' })).toBeVisible();
+  await page.getByRole('tab', { name: '运行性能', exact: true }).click();
+  await expect.poll(() => performanceReads).toBe(2);
+  await expect(performance.locator('.runtime-performance-metrics')).toContainText('92.6');
+  await expect(performance.locator('.ant-skeleton')).toHaveCount(0);
+  await expect(performance).not.toContainText('正在刷新');
+  await expect(performance).toContainText('每 30 秒同步');
+  releasePerformance();
+  await page.getByRole('tab', { name: 'Change 链路', exact: true }).click();
+  await expect.poll(() => traceReads).toBe(2);
+  await expect(trace.getByRole('heading', { name: 'repair-session-expiry' })).toBeVisible();
+  await expect(trace.locator('.ant-skeleton')).toHaveCount(0);
+  releaseTrace();
+  await page.getByRole('tab', { name: '运行性能', exact: true }).click();
+  await page.locator('.comet-language-switch').getByText('EN', { exact: true }).click();
+  const englishPerformance = page.getByRole('region', {
+    name: 'Runtime performance',
+    exact: true,
+  });
+  await expect(englishPerformance.locator('.runtime-performance-sync')).toHaveText(
+    'Syncs every 30 seconds',
+  );
+  await setDashboardTheme(page, 'dark');
+  await page.setViewportSize({ width: 390, height: 844 });
+  expect(
+    await englishPerformance
+      .locator('.runtime-performance-toolbar')
+      .evaluate((element) => element.scrollWidth <= element.clientWidth),
+  ).toBe(true);
+});
+
+test('keeps the Change trace refresh button still during automatic polling', async ({ page }) => {
+  const { DEMO_PLUGIN_PAGES } = await import('../../../domains/dashboard/web/demo.js');
+  const { DEMO_CHANGE_TRACE_INDEX, DEMO_CHANGE_TRACES } =
+    await import('../../../domains/dashboard/web/src/change-trace-demo.js');
+  await page.clock.install();
+  await stubContextPages(page, (id) => DEMO_PLUGIN_PAGES.find((entry) => entry.pluginId === id));
+  let indexReads = 0;
+  let releasePoll!: () => void;
+  const pollGate = new Promise<void>((resolve) => {
+    releasePoll = resolve;
+  });
+  let releaseManual!: () => void;
+  const manualGate = new Promise<void>((resolve) => {
+    releaseManual = resolve;
+  });
+  await page.route('**/change-traces?*', async (route) => {
+    indexReads++;
+    if (indexReads === 2) await pollGate;
+    if (indexReads === 3) await manualGate;
+    return route.fulfill({ json: DEMO_CHANGE_TRACE_INDEX });
+  });
+  await page.route('**/change-trace?*', (route) =>
+    route.fulfill({
+      json: DEMO_CHANGE_TRACES[new URL(route.request().url()).searchParams.get('traceId')!],
+    }),
+  );
+  await page.goto('/');
+  await page.getByRole('menuitem', { name: '可观测' }).click();
+  await page.getByRole('tab', { name: 'Change 链路', exact: true }).click();
+  const panel = page.getByRole('region', { name: 'Change 链路', exact: true });
+  await expect(panel.getByRole('heading', { name: 'repair-session-expiry' })).toBeVisible();
+  await page.clock.runFor(15_000);
+  await expect.poll(() => indexReads).toBe(2);
+  await expect(panel.getByRole('button', { name: '刷新链路' })).not.toHaveClass(/ant-btn-loading/u);
+  await expect(panel.getByRole('heading', { name: 'repair-session-expiry' })).toBeVisible();
+  releasePoll();
+  const refresh = panel.getByRole('button', { name: '刷新链路' });
+  await refresh.click();
+  await expect.poll(() => indexReads).toBe(3);
+  await expect(refresh).toHaveClass(/ant-btn-loading/u);
+  releaseManual();
+  await expect(refresh).not.toHaveClass(/ant-btn-loading/u);
 });
 
 test('opens a linked child run even when the current change and search exclude it', async ({
@@ -1362,13 +1787,15 @@ test('restores memory and knowledge reading state when switching workspaces', as
     .locator('.dashboard-memory-filter-rail button')
     .filter({ hasText: '协作约定' })
     .click();
-  await page.getByLabel('搜索个人记忆').fill('Dashboard');
+  await page.getByRole('textbox', { name: '搜索个人记忆', exact: true }).fill('Dashboard');
   await page.getByRole('menuitem', { name: '项目知识' }).click();
   await expect(page.locator('.comet-header-search')).toHaveCount(0);
   await page.getByRole('tab', { name: '项目规范', exact: true }).click();
   await page.getByLabel('搜索项目知识记录').fill('测试');
   await page.getByRole('menuitem', { name: '个人记忆' }).click();
-  await expect(page.getByLabel('搜索个人记忆')).toHaveValue('Dashboard');
+  await expect(page.getByRole('textbox', { name: '搜索个人记忆', exact: true })).toHaveValue(
+    'Dashboard',
+  );
   await expect(memory.locator('.dashboard-memory-filter-rail button.is-active')).toContainText(
     '协作约定',
   );
@@ -4567,7 +4994,7 @@ test('keeps personal memory context and application history easy to scan', async
   await expect(contextItems).toHaveCount(4);
   await expect(contextBar).toContainText('本地提供器');
   await expect(contextBar).toContainText('当前项目');
-  await expect(contextBar).toContainText('3 条记忆');
+  await expect(contextBar).toContainText('11 条记忆');
   await expect(contextBar).toContainText('历史：1 条');
   await expect(contextItems.first()).toHaveCSS('font-size', '13px');
   await expect(contextItems.nth(1)).toHaveCSS('border-left-width', '1px');
@@ -6585,7 +7012,10 @@ for (const workspace of ['个人记忆', '项目知识'] as const) {
     expect(
       await page.evaluate(() => (window as DashboardTestWindow).pluginMotionTransforms),
     ).toEqual([]);
-    const search = page.getByLabel(personal ? '搜索个人记忆' : '搜索项目知识记录');
+    const search = page.getByRole('textbox', {
+      name: personal ? '搜索个人记忆' : '搜索项目知识记录',
+      exact: true,
+    });
     await search.fill('Dashboard');
     await search.fill('');
     const count = await page.evaluate(
@@ -7171,7 +7601,7 @@ test('keeps plugin content visible during refresh after a structured first-load 
   release();
   const surface = page.locator('.dashboard-tool-page-memory');
   await expect(surface).toBeVisible();
-  const search = page.getByLabel('搜索个人记忆');
+  const search = page.getByRole('textbox', { name: '搜索个人记忆', exact: true });
   await search.fill('Dashboard');
   const before = requests;
   await page.getByRole('button', { name: '立即刷新', exact: true }).click();

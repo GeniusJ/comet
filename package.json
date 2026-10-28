@@ -1,6 +1,6 @@
 {
   "name": "@rpamis/comet",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "Agent Skill Harness For Turning Ideas Into Evaluated Workflows",
   "keywords": [
     "comet",
@@ -96,6 +96,10 @@
     "dev": "tsc --watch",
     "test": "vitest run",
     "test:sdk": "vitest run test/domains/engine test/domains/workflow-application test/domains/workflow-generation test/domains/workflow-creation test/domains/eval/application-eval.test.ts test/domains/comet-plugin/plugin-sdk.test.ts test/domains/comet-classic/classic-sdk test/domains/comet-classic/classic-application.test.ts test/domains/comet-native/native-sdk test/domains/comet-native/native-application.test.ts test/domains/comet-native/native-cli-v4-surface.test.ts test/app/runtime-command.test.ts test/app/runtime-application.test.ts test/app/runtime-application-compact.test.ts test/app/native-runtime-dispatch.test.ts test/app/application-distribution.test.ts test/app/application-eval.test.ts test/scripts/sdk-api.test.ts test/scripts/sdk-fixtures.test.ts",
+    "check:badcase-registration": "node scripts/lint/badcase-registration.mjs",
+    "test:core-regressions": "node scripts/lint/core-regressions.mjs",
+    "test:release-regressions": "node scripts/release/verify-release.mjs --regressions-only",
+    "release:verify": "node scripts/release/verify-release.mjs",
     "test:native-parallel": "vitest run test/domains/comet-native/native-parallel-worktree.test.ts",
     "test:script-smoke": "vitest run test/domains/comet-classic/comet-scripts.test.ts",
     "test:openspec-upstream": "node test/helpers/openspec-upstream.mjs",
@@ -118,7 +122,7 @@
     "prepare": "node scripts/release/prepare.js",
     "prepack": "node scripts/release/npm-readme.mjs apply",
     "postpack": "node scripts/release/npm-readme.mjs restore",
-    "prepublishOnly": "node scripts/release/prepublish-check.js && node build.js",
+    "prepublishOnly": "node scripts/release/verify-release.mjs",
     "postinstall": "node scripts/install/postinstall.js",
     "benchmark:workflow-scale": "node scripts/benchmark/workflow-scale-benchmark.mjs"
   },
@@ -134,22 +138,25 @@
   "packageManager": "pnpm@10.18.3",
   "overrides": {
     "brace-expansion": "5.0.12",
-    "fast-uri": "3.1.8",
+    "fast-uri": "3.1.9",
     "katex": "0.18.2",
     "source-map-js": "1.2.2",
     "esbuild": "0.28.2",
     "postcss": "8.5.26",
-    "undici": "7.29.1"
+    "undici": "7.30.1"
   },
   "pnpm": {
     "overrides": {
       "brace-expansion": "5.0.12",
-      "fast-uri": "3.1.8",
+      "fast-uri": "3.1.9",
       "katex": "0.18.2",
       "source-map-js": "1.2.2",
       "esbuild": "0.28.2",
       "postcss": "8.5.26",
-      "undici": "7.29.1"
+      "undici": "7.30.1"
+    },
+    "patchedDependencies": {
+      "vitest@4.1.12": "config/dependency-patches/vitest@4.1.12.patch"
     }
   },
   "engines": {
@@ -165,7 +172,7 @@
     "@types/react": "^19.2.17",
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^6.1.1",
-    "@vitest/coverage-v8": "^4.1.11",
+    "@vitest/coverage-v8": "^4.1.12",
     "esbuild": "0.28.2",
     "eslint": "^10.4.0",
     "husky": "^9.1.7",
@@ -179,7 +186,7 @@
     "typescript": "^5.9.3",
     "typescript-eslint": "^8.59.3",
     "vite": "8.2.4",
-    "vitest": "^4.1.11"
+    "vitest": "^4.1.12"
   },
   "dependencies": {
     "@ant-design/icons": "^6.3.2",
@@ -193,7 +200,7 @@
     "ajv": "^8.17.1",
     "antd": "^6.6.2",
     "commander": "^15.0.0",
-    "dompurify": "^3.4.16",
+    "dompurify": "^3.4.17",
     "es-module-lexer": "2.3.2",
     "highlight.js": "^11.12.0",
     "jsonc-parser": "3.3.1",

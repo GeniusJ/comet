@@ -73,7 +73,7 @@ _JUDGE_KEYS = {
     "COMET_EVAL_MAIN_CREDENTIALS",
 }
 _CREDENTIAL_NAME_RE = re.compile(
-    r"(?:API_KEY|AUTH_TOKEN|ACCESS_TOKEN|PERSONAL_ACCESS_TOKEN|PASSWORD|SECRET|CREDENTIALS?|(?:^|_)(?:KEY|TOKEN))$",
+    r"(?:API[_-]?KEY|AUTH[_-]?TOKEN|ACCESS[_-]?TOKEN|PERSONAL[_-]?ACCESS[_-]?TOKEN|CLAIM[_-]?TOKEN|PASSWORD|SECRET|CREDENTIALS?|(?:^|_)(?:KEY|TOKEN))$",
     re.I,
 )
 
@@ -495,7 +495,7 @@ def missing_credentials(
     if judge:
         if not adapter.required_credentials:
             return ()
-        if len(adapter.required_credentials) == 1:
+        if not adapter.custom or len(adapter.required_credentials) == 1:
             return (
                 ()
                 if any(

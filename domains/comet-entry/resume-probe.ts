@@ -28,7 +28,6 @@ import {
   assertNativePortableChangeNotOrphaned,
   inspectPristineNativeSdkChange,
   inspectNativeSdkRun,
-  listNativeSdkChangeNames,
 } from '../comet-native/native-runtime-ownership.js';
 import {
   isNativePortableChange,
@@ -49,7 +48,11 @@ import type {
   NativeProjectPaths,
 } from '../comet-native/native-types.js';
 import type { NativePortableState } from '../comet-native/native-portable-types.js';
-import { readSdkChangeOwner } from '../workflow-contract/change-runtime-owner.js';
+import {
+  listSdkResumeCandidates,
+  readSdkChangeOwner,
+} from '../workflow-contract/change-runtime-owner.js';
+import { isNativeSdkRunRecoveryRequiredError } from '../comet-native/native-sdk-state-store.js';
 import { resolveCometEntry } from './resolve-entry.js';
 import type { CometEntryResolutionSource, CometEntrySkill, CometWorkflow } from './types.js';
 
@@ -80,6 +83,7 @@ export interface CometEntryResumeProbeResult {
   changeName: string | null;
   phase: string | null;
   nextCommand: '/comet-native' | '/comet-classic' | null;
+  diagnosticCommand?: string;
   confidence: CometResumeProbeConfidence;
   reasonCode: string;
   reason: string;
@@ -96,36 +100,130 @@ interface ResultOptions {
   confidence: CometResumeProbeConfidence;
   reasonCode: string;
   reason: string;
+  diagnosticCommand?: string;
   evidence?: CometResumeProbeEvidence[];
   candidates?: CometEntryResumeProbeCandidate[];
 }
 
-const RESUME_WORDS = [
-  'continue',
-  'resume',
-  'carry on',
-  'finish',
-  '继续',
-  '接着',
-  '恢复',
-  '跑完',
-  '提交',
-  '验证',
-  '归档',
-  '修刚才',
-] as const;
+interface ResumeIntent {
+  positiveText: string;
+  negativeText: string;
+  resumeLike: boolean;
+  commitLike: boolean;
+  commitOnly: boolean;
+  currentChange: boolean;
+  excludesCurrentChange: boolean;
+  outsideChange: boolean;
+  optedOut: boolean;
+}
 
-const OPT_OUT_WORDS = [
-  'do not resume',
-  "don't resume",
-  'without comet',
-  'skip comet',
-  '不要恢复',
-  '不走 comet',
-  '不要走 comet',
-  '直接解释',
-  '只回答',
-] as const;
+const RESUME_PATTERN =
+  /(?:\b(?:continue|resume|carry on|finish|verify|archive)(?![a-z0-9_.-])|继续|接着|恢复|跑完|验证|归档|修刚才)/u;
+const COMMIT_PATTERN = /(?:\bcommit(?![a-z0-9_.-])|提交)/u;
+const CURRENT_CHANGE_PATTERN =
+  /(?:\b(?:current|selected|this|active)\s+(?:comet\s+)?change\b|(?:当前|选中|这个|本次|正在处理的)(?:的)?\s*(?:change|需求|变更))/u;
+const NEGATION_PATTERN =
+  /(?:\b(?:do not|don't|does not|doesn't|never|not)(?!\s+only\b)\s+|不要|不用|无需|不必|别|暂不|先不|不再|不需要|不(?=走|继续|恢复|处理|启动|进入|执行))/u;
+
+function normalizeIntentText(utterance: string): string {
+  return utterance
+    .normalize('NFKC')
+    .toLowerCase()
+    .replace(/[’‘]/gu, "'")
+    .replace(/\s+/gu, ' ')
+    .replace(/([\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])/gu, '$1')
+    .trim();
+}
+
+function resolveResumeIntent(utterance: string): ResumeIntent {
+  const text = normalizeIntentText(utterance);
+  // 否定句中的动作和 change 名称不能成为恢复授权；后续只用肯定部分选择目标。
+  const positive: string[] = [];
+  const negative: string[] = [];
+  for (const clause of text.split(/[,;!?。！？；，\r\n]+|\.(?:\s|$)|\bbut\b|但是/gu)) {
+    const negation = NEGATION_PATTERN.exec(clause);
+    if (!negation) {
+      positive.push(clause);
+    } else {
+      positive.push(clause.slice(0, negation.index));
+      negative.push(clause.slice(negation.index));
+    }
+  }
+  const positiveText = positive.join(' ').trim();
+  const negativeText = negative.join(' ').trim();
+  const compact = text.replace(/\s+/gu, '');
+  const optedOut =
+    /\b(?:without|skip|avoid|no)\s+(?:the\s+)?comet\b/u.test(positiveText) ||
+    /(?:不走|不要走)comet|直接解释|只回答/u.test(compact) ||
+    negative.some((clause) => {
+      const compactClause = clause.replace(/\s+/gu, '');
+      const workflow = /\bcomet\b|\bworkflow\b|流程/u.test(clause);
+      const workflowAction =
+        /\b(?:start|continue|resume|run|enter|load|use|trigger)\b|启动|开启|继续|恢复|进入|加载|使用|执行|走/u.test(
+          clause,
+        );
+      // 拒绝新建流程不等于拒绝恢复已有流程。
+      const newOnly = /\bnew\b|新建|新的|新流程/u.test(clause) && !RESUME_PATTERN.test(clause);
+      return (
+        (workflow && workflowAction && !newOnly) ||
+        /^(?:do not|don't|never)\s+(?:resume|continue|carry on)\s*(?:it|now|yet|please)?$/u.test(
+          clause.trim(),
+        ) ||
+        /^(?:不要|别|暂不|先不|不再)(?:恢复|继续|接着)(?:了|执行)?$/u.test(compactClause)
+      );
+    });
+  return {
+    positiveText,
+    negativeText,
+    resumeLike: RESUME_PATTERN.test(
+      positiveText.replace(
+        /\b(?:continue|resume|finish)(?:\s+(?:to|the|with))?\s+(?:git\s+)?commit(?:ting)?\b|(?:继续|接着|恢复|跑完)(?:执行)?(?:git\s*)?提交/gu,
+        '',
+      ),
+    ),
+    commitLike: COMMIT_PATTERN.test(positiveText),
+    commitOnly: /\b(?:just|only|simply)\b|只|仅|单纯|直接/u.test(positiveText),
+    currentChange: CURRENT_CHANGE_PATTERN.test(positiveText),
+    excludesCurrentChange: CURRENT_CHANGE_PATTERN.test(negativeText),
+    outsideChange:
+      /\b(?:another|different|unrelated)\s+(?:change|changes|files?|code|work)\b|(?:另一个|另外|其他|无关)(?:的)?\s*(?:change|修改|变更|文件|代码|需求)/u.test(
+        positiveText,
+      ),
+    optedOut,
+  };
+}
+
+function requestScopeDecision(
+  intent: ResumeIntent,
+  names: readonly string[],
+): Pick<ResultOptions, 'action' | 'confidence' | 'reasonCode' | 'reason'> | null {
+  const explicitChange =
+    intent.currentChange || namesInUtterance(intent.positiveText, names).length > 0;
+  if (intent.outsideChange && !explicitChange) {
+    return {
+      action: 'out_of_scope',
+      confidence: 'low',
+      reasonCode: 'request-unrelated',
+      reason: 'user requested work outside the current Comet change',
+    };
+  }
+  if (!intent.commitLike || intent.resumeLike || explicitChange) {
+    return null;
+  }
+  return intent.commitOnly
+    ? {
+        action: 'out_of_scope',
+        confidence: 'low',
+        reasonCode: 'commit-only-request',
+        reason: 'committing existing files alone does not request a Comet workflow',
+      }
+    : {
+        action: 'ask_user',
+        confidence: 'low',
+        reasonCode: 'commit-scope-ambiguous',
+        reason: 'Does this commit belong to the active Comet change or to unrelated files?',
+      };
+}
 
 const GENERIC_RELATED_TOKENS = new Set([
   'acceptance',
@@ -199,16 +297,13 @@ function result(options: ResultOptions): CometEntryResumeProbeResult {
     changeName: options.change?.name ?? null,
     phase: options.change?.phase ?? null,
     nextCommand,
+    ...(options.diagnosticCommand ? { diagnosticCommand: options.diagnosticCommand } : {}),
     confidence: options.confidence,
     reasonCode: options.reasonCode,
     reason: options.reason,
     evidence: options.evidence ?? [],
     candidates: options.candidates ?? [],
   };
-}
-
-function includesAny(text: string, words: readonly string[]): boolean {
-  return words.some((word) => text.includes(word));
 }
 
 function escapeRegExp(value: string): string {
@@ -393,6 +488,7 @@ async function resolveNativeResumeProbe(
   projectRoot: string,
   input: CometEntryResumeProbeInput,
   entrySource: CometEntryResolutionSource,
+  intent: ResumeIntent,
 ): Promise<CometEntryResumeProbeResult> {
   const config = await readCachedProjectConfig(projectRoot);
   if (!config?.native) {
@@ -402,14 +498,23 @@ async function resolveNativeResumeProbe(
   const paths = await nativeProjectPaths(projectRoot, config.native.artifact_root, {
     readOnly: true,
   });
-  const sdkNames = await listNativeSdkChangeNames(projectRoot, { readOnly: true });
-  const legacyNames = await listNativeChangeNames(paths);
-  const knownNames = [...new Set([...legacyNames, ...sdkNames])].sort((left, right) =>
-    left.localeCompare(right, 'en'),
+  // Closed owners are not active resume candidates. Their Run bodies are only
+  // inspected when explicitly named, so damaged history cannot block current work.
+  const { active: sdkNames, history: historicalNames } = await listSdkResumeCandidates(
+    projectRoot,
+    'native',
   );
-  const explicitlyNamed = namesInUtterance(input.utterance, knownNames);
+  const legacyNames = await listNativeChangeNames(paths);
+  const knownNames = [...new Set([...legacyNames, ...sdkNames, ...historicalNames])].sort(
+    (left, right) => left.localeCompare(right, 'en'),
+  );
+  const explicitlyNamed = namesInUtterance(intent.positiveText, knownNames);
   // A named request needs the named Run, not every unrelated historical Run.
-  const inspectedNames = explicitlyNamed.length > 0 ? explicitlyNamed : knownNames;
+  const historicalNameSet = new Set(historicalNames);
+  const inspectedNames =
+    explicitlyNamed.length > 0
+      ? explicitlyNamed
+      : knownNames.filter((name) => !historicalNameSet.has(name));
   const sdkObservations = new Map<string, ReturnType<typeof inspectNativeSdkRun>>();
   const inspectSdk = (name: string) => {
     let observation = sdkObservations.get(name);
@@ -419,16 +524,22 @@ async function resolveNativeResumeProbe(
     }
     return observation;
   };
-  const sdkNameSet = new Set(sdkNames);
+  const sdkNameSet = new Set([...sdkNames, ...historicalNames]);
   const names = (
     await inspectCandidates(inspectedNames, async (name) => {
       if (!sdkNameSet.has(name)) return name;
-      const { run, state } = await inspectSdk(name);
-      if (run.status === 'cancelled')
-        return (await isNativeSdkCancellationComplete({ projectRoot, run })) ? null : name;
-      return (run.status === 'running' || run.status === 'waiting') && state.status !== 'done'
-        ? name
-        : null;
+      try {
+        const { run, state } = await inspectSdk(name);
+        if (run.status === 'cancelled')
+          return (await isNativeSdkCancellationComplete({ projectRoot, run })) ? null : name;
+        return (run.status === 'running' || run.status === 'waiting') && state.status !== 'done'
+          ? name
+          : null;
+      } catch {
+        // An unreadable active Run may still own work. Keep it as an invalid
+        // candidate instead of choosing a different change or hiding its name.
+        return name;
+      }
     })
   ).filter((name): name is string => name !== null);
   let selectedName: string | null = null;
@@ -444,6 +555,16 @@ async function resolveNativeResumeProbe(
     selectionError = error instanceof Error ? error.message : String(error);
   }
   if (names.length === 0) {
+    const excludedScope = intent.outsideChange ? requestScopeDecision(intent, []) : null;
+    if (excludedScope) {
+      return result({
+        workflow: 'native',
+        skill: 'comet-native',
+        entrySource,
+        ...excludedScope,
+        evidence: [{ source: 'user', quote: input.utterance.trim() }],
+      });
+    }
     return result({
       workflow: 'native',
       skill: 'comet-native',
@@ -456,9 +577,10 @@ async function resolveNativeResumeProbe(
     });
   }
 
-  const utterance = input.utterance.trim();
-  const lower = utterance.toLowerCase();
-  const resumeLike = includesAny(lower, RESUME_WORDS);
+  const utterance = intent.positiveText;
+  const { resumeLike } = intent;
+  const currentChangeCommit = intent.commitLike && intent.currentChange;
+  const resumeRequested = resumeLike || currentChangeCommit;
   const named = namesInUtterance(utterance, names);
   const targetName = named[0] ?? selectedName ?? (names.length === 1 ? names[0] : null);
   const candidates = await nativeResumeCandidates(
@@ -468,7 +590,38 @@ async function resolveNativeResumeProbe(
     targetName,
     inspectSdk,
   );
-  if (!input.agent_context.non_trivial_work && !resumeLike) {
+  const excludedNames = namesInUtterance(intent.negativeText, knownNames);
+  const excludedCurrent = intent.excludesCurrentChange
+    ? (selectedName ?? (knownNames.length === 1 ? knownNames[0] : null))
+    : null;
+  if (
+    (intent.excludesCurrentChange && named.length === 0) ||
+    (targetName && (excludedNames.includes(targetName) || targetName === excludedCurrent))
+  ) {
+    return result({
+      workflow: 'native',
+      skill: 'comet-native',
+      entrySource,
+      action: 'out_of_scope',
+      confidence: 'low',
+      reasonCode: 'resume-target-excluded',
+      reason: 'user excluded this change from the requested work',
+      evidence: [{ source: 'user', quote: input.utterance.trim() }],
+      candidates,
+    });
+  }
+  const scopeDecision = requestScopeDecision(intent, names);
+  if (scopeDecision) {
+    return result({
+      workflow: 'native',
+      skill: 'comet-native',
+      entrySource,
+      ...scopeDecision,
+      evidence: [{ source: 'user', quote: input.utterance.trim() }],
+      candidates,
+    });
+  }
+  if (!input.agent_context.non_trivial_work && !resumeLike && !intent.commitLike) {
     return result({
       workflow: 'native',
       skill: 'comet-native',
@@ -500,10 +653,10 @@ async function resolveNativeResumeProbe(
       workflow: 'native',
       skill: 'comet-native',
       entrySource,
-      action: resumeLike ? 'ask_user' : 'out_of_scope',
+      action: resumeRequested ? 'ask_user' : 'out_of_scope',
       confidence: 'low',
-      reasonCode: resumeLike ? 'multiple-native-changes' : 'request-unrelated',
-      reason: resumeLike
+      reasonCode: resumeRequested ? 'multiple-native-changes' : 'request-unrelated',
+      reason: resumeRequested
         ? 'multiple active Native changes require an explicit name or Native selection'
         : 'request does not identify an active Native change',
       ...(selectionError
@@ -517,6 +670,7 @@ async function resolveNativeResumeProbe(
   let targetState: NativeChangeState | NativePortableState | null = null;
   let targetPortableStatus: NativePortableStatusProjection | null = null;
   let targetStateError: string | null = null;
+  let recoverableCheckpoint = false;
   if (target) {
     try {
       if (await readSdkChangeOwner(projectRoot, 'native', target.name, { readOnly: true })) {
@@ -535,11 +689,33 @@ async function resolveNativeResumeProbe(
         targetState = await readNativeChange(paths, target.name);
       }
     } catch (error) {
-      targetStateError = error instanceof Error ? error.message : String(error);
+      if (
+        isNativeSdkRunRecoveryRequiredError(error) &&
+        error.change === target.name &&
+        !historicalNameSet.has(target.name) &&
+        path.resolve(error.projectRoot) === path.resolve(projectRoot)
+      ) {
+        try {
+          // The store already validated the checkpoint and workspace. Reading
+          // the portable state stays read-only; the Native entry will diagnose
+          // and restore the same Run before continuing any work.
+          targetState = await readNativePortableChange(paths, target.name);
+          if (targetState.archived || targetState.status === 'done')
+            throw new Error(`Native change ${target.name} is already archived or complete`, {
+              cause: error,
+            });
+          target.phase = targetState.phase;
+          recoverableCheckpoint = true;
+        } catch (stateError) {
+          targetStateError = stateError instanceof Error ? stateError.message : String(stateError);
+        }
+      } else {
+        targetStateError = error instanceof Error ? error.message : String(error);
+      }
     }
   }
   if (!target || targetStateError || !targetState) {
-    if (!resumeLike && named.length === 0) {
+    if (!resumeRequested && named.length === 0) {
       return result({
         workflow: 'native',
         skill: 'comet-native',
@@ -560,7 +736,8 @@ async function resolveNativeResumeProbe(
       change: { name: targetName, phase: target?.phase ?? 'invalid' },
       confidence: 'low',
       reasonCode: 'native-change-invalid',
-      reason: targetStateError ?? `selected Native change ${targetName} is unavailable`,
+      reason: `${targetStateError ?? `selected Native change ${targetName} is unavailable`}; diagnose with comet native doctor ${targetName} --json before deciding how to recover`,
+      diagnosticCommand: `comet native doctor ${targetName} --json`,
       evidence: [{ source: 'state', quote: `change: ${targetName}` }],
       candidates,
     });
@@ -568,10 +745,10 @@ async function resolveNativeResumeProbe(
 
   const exactName = named[0] === target.name;
   const related =
-    !resumeLike && !exactName
+    !resumeLike && !exactName && !currentChangeCommit
       ? await nativeRelatedEvidence(paths, target, targetState, utterance)
       : [];
-  if (!resumeLike && !exactName && related.length === 0) {
+  if (!resumeLike && !exactName && !currentChangeCommit && related.length === 0) {
     return result({
       workflow: 'native',
       skill: 'comet-native',
@@ -630,12 +807,19 @@ async function resolveNativeResumeProbe(
     action: 'auto_resume',
     change: { name: target.name, phase: target.phase },
     confidence: 'high',
-    reasonCode: exactName
-      ? 'native-change-named'
-      : selectedName === target.name
-        ? 'native-change-selected'
-        : 'single-native-change-related',
-    reason: 'configured Native workflow has one unambiguous related resume target',
+    reasonCode: recoverableCheckpoint
+      ? 'native-checkpoint-recoverable'
+      : exactName
+        ? 'native-change-named'
+        : selectedName === target.name
+          ? 'native-change-selected'
+          : 'single-native-change-related',
+    reason: recoverableCheckpoint
+      ? `Native Run ${target.name} has a validated portable checkpoint. Enter Native and inspect with comet native doctor ${target.name} --json; confirm the original execution has stopped and reconcile unknown results before restoring the same Run.`
+      : 'configured Native workflow has one unambiguous related resume target',
+    ...(recoverableCheckpoint
+      ? { diagnosticCommand: `comet native doctor ${target.name} --json` }
+      : {}),
     evidence: [
       { source: 'state', quote: `phase: ${target.phase}` },
       ...(exactName ? [{ source: 'user' as const, quote: target.name }] : related),
@@ -664,7 +848,7 @@ async function resolveCometEntryResumeProbeImpl(
 ): Promise<CometEntryResumeProbeResult> {
   const input = normalizeInput(rawInput);
   const utterance = input.utterance.trim();
-  const lower = utterance.toLowerCase();
+  const intent = resolveResumeIntent(utterance);
   if (input.agent_context.already_in_comet_flow) {
     return result({
       action: 'out_of_scope',
@@ -673,7 +857,7 @@ async function resolveCometEntryResumeProbeImpl(
       reason: 'already in Comet flow',
     });
   }
-  if (includesAny(lower, OPT_OUT_WORDS)) {
+  if (intent.optedOut) {
     return result({
       action: 'out_of_scope',
       confidence: 'low',
@@ -715,15 +899,40 @@ async function resolveCometEntryResumeProbeImpl(
   if (entry.workflow === 'classic') {
     const classicInput: ClassicResumeProbeInput = {
       schema_version: CLASSIC_RESUME_PROBE_SCHEMA_VERSION,
-      utterance: input.utterance,
+      utterance: intent.positiveText,
       locale: input.locale,
       agent_context: input.agent_context,
     };
     try {
-      return mapClassicResult(
+      const classic = mapClassicResult(
         await resolveClassicResumeProbe(projectRoot, classicInput),
         entry.source,
       );
+      if (classic.action === 'none') return classic;
+      const names = classic.candidates.map(({ name }) => name);
+      if (intent.excludesCurrentChange || namesInUtterance(intent.negativeText, names).length > 0) {
+        return result({
+          workflow: 'classic',
+          skill: 'comet-classic',
+          entrySource: entry.source,
+          action: 'out_of_scope',
+          confidence: 'low',
+          reasonCode: 'resume-target-excluded',
+          reason: 'user excluded this change from the requested work',
+          evidence: [{ source: 'user', quote: utterance }],
+        });
+      }
+      const scopeDecision = requestScopeDecision(intent, names);
+      return scopeDecision
+        ? result({
+            workflow: 'classic',
+            skill: 'comet-classic',
+            entrySource: entry.source,
+            ...scopeDecision,
+            evidence: [{ source: 'user', quote: utterance }],
+            candidates: classic.candidates,
+          })
+        : classic;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       return result({
@@ -740,7 +949,7 @@ async function resolveCometEntryResumeProbeImpl(
   }
 
   try {
-    return await resolveNativeResumeProbe(projectRoot, input, entry.source);
+    return await resolveNativeResumeProbe(projectRoot, input, entry.source, intent);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     return result({

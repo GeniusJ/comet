@@ -1146,6 +1146,12 @@ describe('skills', () => {
         timeout: 20_000,
       });
     const configureNativeBuildChange = async (projectRoot: string): Promise<void> => {
+      // Hook 安装用例需要独立仓库边界，不能继承临时目录外的 Git 元数据。
+      const initialized = spawnSync('git', ['init', '--quiet', '-b', 'main'], {
+        cwd: projectRoot,
+        encoding: 'utf8',
+      });
+      expect(initialized.status, initialized.stderr).toBe(0);
       await writeProjectConfig(projectRoot, defaultProjectConfig('.'));
       const paths = await nativeProjectPaths(projectRoot, '.');
       await ensureNativeDirectories(paths);
@@ -2780,7 +2786,7 @@ describe('skills', () => {
         'utf8',
       );
 
-      expect(zhComet).toContain('决策点是阻塞点');
+      expect(zhComet).toContain('需要新决定时，等待明确答复后再继续');
       expect(zhComet).toContain('CometIntentFrame');
       expect(zhComet).toContain('comet classic intent route --stdin');
       expect(zhComet).toContain('最小示例与目标选择规则');
@@ -2824,10 +2830,13 @@ describe('skills', () => {
       expect(zhScripts).toContain('comet classic intent route --stdin');
       expect(zhScripts).not.toContain('<comet-intent-script>');
       expect(zhComet).toContain('`comet-classic/reference/decision-point.md`');
-      expect(zhDecisionPoint).toContain('存在 `AskUserQuestion` 时，使用它展示单选/多选选项');
+      expect(zhDecisionPoint).toContain('存在 `AskUserQuestion` 就使用它展示单选/多选选项');
       expect(zhDecisionPoint).toContain('若无法使用 `AskUserQuestion`');
       expect(zhDecisionPoint).toContain('本会话后续决策点不得反复重试它');
-      expect(zhDecisionPoint).toContain('否则在对话中提出明确选项并等待用户回复');
+      expect(zhDecisionPoint).toContain('否则在对话中提出明确选项');
+      expect(zhDecisionPoint).toContain('结束当前回复');
+      expect(zhDecisionPoint).toContain('需要提问时');
+      expect(zhDecisionPoint).toContain('等待实际答复后再执行依赖该决定的命令');
       expect(zhDecisionPoint).toContain('不得用推荐规则、默认值、历史偏好');
       expect(zhOpen).toContain('### 1b. 整理需求并确定 Change 名称');
       expect(zhOpen).toContain('范围与命名都明确时直接继续');
@@ -3211,9 +3220,7 @@ describe('skills', () => {
         'utf8',
       );
 
-      expect
-        .soft(enComet)
-        .toContain('Decision points block dependent work until the user answers explicitly');
+      expect.soft(enComet).toContain('Wait for an explicit answer when a new decision is needed');
       expect(enComet).toContain('CometIntentFrame');
       expect(enComet).toContain('comet classic intent route --stdin');
       expect
@@ -3260,12 +3267,15 @@ describe('skills', () => {
       expect(enScripts).not.toContain('<comet-intent-script>');
       expect
         .soft(enDecisionPoint)
-        .toContain('Use `AskUserQuestion` for single-select or multi-select choices');
+        .toContain('use `AskUserQuestion` for single-select or multi-select choices');
       expect(enDecisionPoint).toContain('If `AskUserQuestion` cannot be used');
       expect(enDecisionPoint).toContain('Do not repeatedly retry it at later decision points');
-      expect
-        .soft(enDecisionPoint)
-        .toContain('otherwise present clear text options and wait for the reply');
+      expect.soft(enDecisionPoint).toContain('otherwise present clear text options');
+      expect(enDecisionPoint).toContain('end the current response');
+      expect(enDecisionPoint).toContain('When a question is needed');
+      expect(enDecisionPoint).toContain(
+        'wait for the actual answer before running dependent commands',
+      );
       expect
         .soft(enDecisionPoint)
         .toContain('Never substitute recommendations, defaults, historical preferences');

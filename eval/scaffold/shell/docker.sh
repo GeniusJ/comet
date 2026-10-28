@@ -119,6 +119,7 @@ ENV_KEYS=(
     ANTHROPIC_DEFAULT_OPUS_MODEL_NAME
     ANTHROPIC_DEFAULT_SONNET_MODEL_NAME
     CLAUDE_CODE_SUBAGENT_MODEL
+    ENABLE_TOOL_SEARCH
     COMET_EVAL_CUSTOM_AGENT_ID
     COMET_EVAL_CUSTOM_EXECUTABLE
     COMET_EVAL_CUSTOM_CREDENTIALS
@@ -627,11 +628,49 @@ eval_runtime_volume() {
     printf 'comet-eval-data-%s' "$(sha256_text "$1" | cut -c1-24)"
 }
 
+prepare_eval_git_excludes() {
+    local dir="$1" image="$2" windir
+    [[ -f "$dir/.eval-classic-git-excludes" ]] || return 0
+    [[ "$(tr -d '\r\n' < "$dir/.eval-classic-git-excludes")" == "comet.eval.classic-git-excludes.v1" ]] || {
+        echo 'Invalid controller-owned Classic Git exclusion marker' >&2
+        return 1
+    }
+    windir=$(_winpath "$dir")
+    # 仅隔离控制器工具；不修改用户 .gitignore，业务输入仍由真实 Git 和 Runtime 校验。
+    docker run --rm ${EVAL_LABEL_ARGS[@]+"${EVAL_LABEL_ARGS[@]}"} \
+        -v "$windir://workspace" "$image" sh -ec '
+        git -C /workspace rev-parse --git-dir >/dev/null 2>&1 || git -C /workspace init -q
+        test -d /workspace/.git && test ! -L /workspace/.git || {
+            echo "Classic Eval requires an isolated Git directory" >&2; exit 1;
+        }
+        mkdir -p /workspace/.git/info
+        file=/workspace/.git/info/exclude
+        if ! grep -qxF "# >>> Comet Eval tooling >>>" "$file" 2>/dev/null; then
+            printf "\n" >> "$file"
+            cat >> "$file" <<EOF
+# >>> Comet Eval tooling >>>
+/.claude/
+/CLAUDE.md
+/AGENTS.md
+/_eval_current_comet/
+/_eval_target_skills/
+/_eval_trusted_oracles/
+/.eval-*
+/current-comet-package.json
+/current-comet.sh
+/Dockerfile
+# <<< Comet Eval tooling <<<
+EOF
+        fi
+    ' </dev/null
+}
+
 # 当前 Runtime 位于 /workspace 之外；每个用例的执行和校验容器共享同一卷。
 prepare_eval_runtime_data() {
     local dir="$1" image="$2" volume owner
     COMET_RUNTIME_MOUNT_ARGS=()
     [[ -d "$dir/_eval_current_comet" || -f "$dir/.include-current-comet-cli" ]] || return 0
+    prepare_eval_git_excludes "$dir" "$image" || return 1
     volume=$(eval_runtime_volume "$dir") || return 1
     owner=$(docker image inspect --format '{{.Config.User}}' "$image") || return 1
     owner="${owner//$'\r'/}"
@@ -883,7 +922,10 @@ docker_run_agent() (
 
     local windir
     windir=$(_winpath "$dir")
-    trap 'turn_status=$?; trap - EXIT; if ! cleanup_agent_turn "$container_name"; then echo "Agent container cleanup is incomplete for $container_name" >&2; exit 125; fi; exit "$turn_status"' EXIT
+    local cleanup_command
+    printf -v cleanup_command 'turn_status=$?; trap - EXIT; if ! cleanup_agent_turn %q; then echo %q >&2; exit 125; fi; exit "$turn_status"' \
+        "$container_name" "Agent container cleanup is incomplete for $container_name"
+    trap "$cleanup_command" EXIT
     trap 'exit 143' TERM
     trap 'exit 130' INT
     if [[ -n "$TIMEOUT_CMD" ]]; then

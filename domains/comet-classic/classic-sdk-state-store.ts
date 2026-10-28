@@ -1,3 +1,4 @@
+import { readClassicSdkDeliveryCheckpoint } from './classic-sdk-delivery-checkpoint.js';
 import { runWithoutClassicOperationObservations } from './classic-command-context.js';
 import { isClassicSdkApprovedUpgrade } from './classic-sdk-profile.js';
 import { isClassicSdkCancellationComplete } from './classic-sdk-run-lifecycle.js';
@@ -107,6 +108,7 @@ export function createClassicSdkStateStore(
     store?: RuntimeStore<WorkflowRun>;
     identity?: ApplicationIdentity;
     readOnly?: boolean;
+    allowBranchRebind?: boolean;
   } = {},
   projectionRead = false,
 ): RuntimeStore<WorkflowRun> {
@@ -213,7 +215,9 @@ export function createClassicSdkStateStore(
       !['full', 'hotfix', 'tweak'].includes(profile) ||
       saved.workflow.id !== `comet-classic-${profile}` ||
       (state.workflow !== profile && !isClassicSdkApprovedUpgrade(saved, profile)) ||
-      (state.boundBranch !== null && state.boundBranch !== liveGitBranch(projectRoot))
+      (!options.allowBranchRebind &&
+        state.boundBranch !== null &&
+        state.boundBranch !== liveGitBranch(projectRoot))
     ) {
       throw new Error(`Classic portable Run checkpoint for ${runId} does not match its state`);
     }
@@ -382,6 +386,28 @@ export function createClassicSdkStateStore(
           (options.readOnly && marker.revision === run.revision && !equal(marker.state, state)))
       ) {
         throw new Error(`Classic SDK state projection marker is invalid for ${runId}`);
+      }
+      const deliveryCheckpoint = readClassicSdkDeliveryCheckpoint(
+        documentData?.[PORTABLE_RUN_CHECKPOINT_KEY],
+        run,
+        { projection: projectionRead },
+      );
+      if (deliveryCheckpoint) {
+        // Git 已交付的归档保存交付前基线；最终 commit 不能写回它自己的提交内容。
+        // 只有完整历史与原基线一致的 delivery 后续状态才使用权威 Runtime 回执。
+        if (
+          source === null ||
+          !hasClassicManagedRunMarker(source) ||
+          !equal(fileState, deliveryCheckpoint.state) ||
+          (marker &&
+            (marker.revision > deliveryCheckpoint.revision ||
+              (marker.revision === deliveryCheckpoint.revision &&
+                !equal(marker.state, deliveryCheckpoint.state)))) ||
+          (options.identity && !equal(documentData.application_checkpoint, options.identity))
+        ) {
+          recoveryRequired(runId, 'the immutable archived delivery checkpoint has changed');
+        }
+        return run;
       }
       if (fileState) {
         const base = marker?.state ?? state;

@@ -50,6 +50,8 @@ export interface NativeBriefValidationOptions {
   compact?: boolean;
   /** Require the directory structure section under Scope (document constraints v3). */
   structure?: boolean;
+  /** Portable Shape validates its actual complete document without a size budget. */
+  maxBytes?: number | null;
 }
 
 export class NativeDocumentConstraintError extends Error {
@@ -332,25 +334,33 @@ function validateBriefStructureSection(scopeBody: string, briefRef: string): Nat
     findings.push({
       code: 'brief-structure-missing',
       message:
-        'Brief scope must include a "## Directory structure"/「## 目录结构」 section with the subsections Created/新建, Modified/修改, Deleted/删除, and Not created/明确不建',
+        'Brief scope must include a "## Directory structure"/「## 目录结构」 section. Add the categories needed to describe the affected paths and responsibilities',
       path: briefRef,
     });
     return findings;
   }
   const subsections = briefStructureSubsectionBodies(body);
+  if (subsections.size === 0) {
+    return [
+      {
+        code: 'brief-structure-subsection-missing',
+        message: `Brief directory structure needs at least one populated category: ${NATIVE_BRIEF_STRUCTURE_SUBSECTIONS.map(nativeBriefStructureSubsectionLabel).join(', ')}. Add a level-three heading and describe the affected paths and responsibilities`,
+        path: briefRef,
+      },
+    ];
+  }
   const incomplete: string[] = [];
-  for (const subsection of NATIVE_BRIEF_STRUCTURE_SUBSECTIONS) {
-    const content = subsections.get(subsection);
-    if (content === undefined || markdownBody(content).length === 0 || isTemplateOnly(content)) {
+  for (const [subsection, content] of subsections) {
+    if (markdownBody(content).length === 0 || isTemplateOnly(content)) {
       incomplete.push(nativeBriefStructureSubsectionLabel(subsection));
     }
   }
   if (incomplete.length > 0) {
     findings.push({
       code: 'brief-structure-subsection-missing',
-      message: `Brief directory structure subsections are missing or empty: ${incomplete.join(
+      message: `Brief directory structure categories are empty or contain only placeholders: ${incomplete.join(
         ', ',
-      )}. Keep every heading and write "None"/「无」 when there is no content`,
+      )}. Describe the affected paths and responsibilities, or omit unused categories`,
       path: briefRef,
     });
   }
@@ -369,7 +379,10 @@ export async function validateNativeBrief(
       await readNativeBoundedTextFile({
         root: changeDir,
         ref: briefRef,
-        maxBytes: NATIVE_ARTIFACT_VALIDATION_LIMITS.maxFileBytes,
+        maxBytes:
+          options.maxBytes === undefined
+            ? NATIVE_ARTIFACT_VALIDATION_LIMITS.maxFileBytes
+            : options.maxBytes,
       })
     ).text;
   } catch (error) {

@@ -1,3 +1,10 @@
+import {
+  prepareClassicArchiveInputs,
+  assertClassicArchiveUnchanged,
+  recordClassicArchiveManifest,
+  recoverClassicArchiveManifest,
+  readClassicArchiveManifest,
+} from './classic-sdk-archive-manifest.js';
 import { resolveClassicStateFile } from './classic-state-file.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
@@ -24,6 +31,7 @@ import {
   recordClassicArchiveRequirements,
 } from './classic-artifact-requirements.js';
 import { annotatedMarkdown, archivedClassicDocumentRef } from './classic-archive-annotation.js';
+import { classicArchiveDocumentOutputs } from './classic-sdk-archive-documents.js';
 import { assertClassicSdkArchiveReady } from './classic-sdk-archive-preflight.js';
 import { classicSdkRemoteIdentity } from './classic-sdk-remote.js';
 import { resolveClassicLayout } from './classic-layout.js';
@@ -37,6 +45,7 @@ import { hasClassicManagedRunMarker, type ClassicState } from './classic-state.j
 interface ClassicSdkArchiveInput {
   runId: string;
   projectRoot: string;
+  confirmedProposalHash?: string;
 }
 
 function archiveNameMatches(name: string, change: string): boolean {
@@ -156,7 +165,7 @@ export async function classicArchivedArtifactMatches(
     return false;
   const digest = (text: string) => createHash('sha256').update(text).digest('hex');
   // 回执不能自选任意变换：原指针和注记种类必须来自 Archive 固定输入的文档结果。
-  const outputs = (archiveAction.input as { outputs?: Record<string, unknown> }).outputs;
+  const { outputs } = classicArchiveDocumentOutputs(run, archiveAction);
   const plan = outputs?.['full.build.plan'] as
     { plan?: string; designEvidence?: { ref?: string } } | undefined;
   const designDoc =
@@ -245,7 +254,7 @@ export async function runClassicSdkArchive(
   run: Readonly<WorkflowRun>,
   action: Readonly<RuntimeAction>,
   projectRoot: string,
-): Promise<Pick<RuntimeOutcome, 'status' | 'output'>> {
+): Promise<Pick<RuntimeOutcome, 'status' | 'output' | 'artifacts'>> {
   let context: Awaited<ReturnType<typeof classicArchiveContext>>;
   try {
     context = await classicArchiveContext(run, action, projectRoot);
@@ -260,10 +269,30 @@ export async function runClassicSdkArchive(
     };
   }
   const { active, runInput, layout, before } = context;
-  await recordArchiveDocuments(projectRoot, run, action, runInput.changeDir);
-  await recordClassicArchiveRequirements(projectRoot, active.target);
+  let archiveInputs: Awaited<ReturnType<typeof prepareClassicArchiveInputs>>;
+  try {
+    await recordArchiveDocuments(projectRoot, run, action, runInput.changeDir);
+    await recordClassicArchiveRequirements(projectRoot, active.target);
+    archiveInputs = await prepareClassicArchiveInputs(
+      projectRoot,
+      run,
+      action,
+      path.relative(projectRoot, layout.specsDir).replaceAll('\\', '/'),
+    );
+    // 清单读取期间发生的输入变化也必须在副作用开始前拒绝。
+    await assertClassicSdkArchiveReady(run, projectRoot);
+  } catch (error) {
+    return {
+      status: 'failed',
+      output: {
+        archiveStarted: false,
+        reason: error instanceof Error ? error.message : String(error),
+      },
+    };
+  }
   const result = await executeClassicOpenSpec(['archive', runInput.change, '--yes'], projectRoot);
   if (result.exitCode !== 0) {
+    const diagnostic = [result.stderr, result.stdout].filter(Boolean).join('\n');
     if (result.executionStarted === false)
       return {
         status: 'failed',
@@ -272,7 +301,26 @@ export async function runClassicSdkArchive(
           reason: result.stderr ?? 'OpenSpec Archive did not start',
         },
       };
-    throw new Error(result.stderr ?? `OpenSpec Archive exited with code ${result.exitCode}`);
+    // 已收到进程退出结果后才核对副作用；超时或连接中断仍由原领取方恢复。
+    if (!result.executionCompleted)
+      throw new Error(diagnostic || 'OpenSpec Archive execution has an unresolved result');
+    try {
+      await assertClassicArchiveUnchanged(projectRoot, run, action);
+    } catch (error) {
+      throw new Error(
+        [diagnostic, error instanceof Error ? error.message : String(error)]
+          .filter(Boolean)
+          .join('\n'),
+        { cause: error },
+      );
+    }
+    return {
+      status: 'failed',
+      output: {
+        archiveStarted: true,
+        reason: diagnostic || `OpenSpec Archive exited with code ${result.exitCode}`,
+      },
+    };
   }
   const after = await archiveEntries(layout.archiveDir, runInput.change);
   const created = [...after].filter((name) => !before.has(name));
@@ -315,6 +363,13 @@ export async function runClassicSdkArchive(
 
   return {
     status: 'succeeded',
+    artifacts: await recordClassicArchiveManifest(
+      projectRoot,
+      run,
+      action,
+      archiveRef,
+      archiveInputs,
+    ),
     output: { archiveDirectory: path.relative(projectRoot, archived.target).replaceAll('\\', '/') },
   };
 }
@@ -415,16 +470,28 @@ export async function recoverClassicSdkArchive(
       `Classic Archive executor may still be running. Wait for its result. Only after confirming the original executor has stopped, use comet state check ${input.runId} archive --recover --json to obtain markUnknownRequest, submit it through runtime dispatch, then retry comet archive ${input.runId} --recover. Do not replay Archive.`,
     );
   }
-  if (
-    state.archived &&
-    run.actions.some(
-      (candidate) =>
-        candidate.ref === 'classic-archive' &&
-        candidate.status === 'succeeded' &&
-        candidate.claim?.executorId === 'comet-classic-archive',
-    )
-  )
-    return run;
+  if (state.archived) {
+    const completed = run.actions
+      .slice()
+      .reverse()
+      .find(
+        (candidate) =>
+          candidate.ref === 'classic-archive' &&
+          candidate.status === 'succeeded' &&
+          candidate.claim?.executorId === 'comet-classic-archive',
+      );
+    if (completed) {
+      const archiveRef = (completed.outcome?.output as { archiveDirectory: string })
+        .archiveDirectory;
+      try {
+        await readClassicArchiveManifest(projectRoot, run, completed, archiveRef);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+        await recoverClassicArchiveManifest(projectRoot, run, completed, archiveRef);
+      }
+      return run;
+    }
+  }
   const action = run.actions.filter((candidate) => candidate.status === 'unknown');
   const lost = action.length === 1 ? action[0] : null;
   if (
@@ -490,17 +557,12 @@ export async function recoverClassicSdkArchive(
   const problems = await classicArchivedRequirementsProblems(projectRoot, archived.target);
   if (problems.length) throw new Error(problems.join('\n'));
   const archiveRef = path.relative(projectRoot, archived.target).replaceAll('\\', '/');
-  await annotateIfPresent(
+  const artifacts = await recoverClassicArchiveManifest(
     projectRoot,
-    archivedClassicDocumentRef(state.designDoc, identity.changeDir, archiveRef),
-    archiveName,
-    'status: final',
-  );
-  await annotateIfPresent(
-    projectRoot,
-    archivedClassicDocumentRef(state.plan, identity.changeDir, archiveRef),
-    archiveName,
-    '',
+    run,
+    lost,
+    archiveRef,
+    input.confirmedProposalHash,
   );
   return runtime.recordOutcome({
     runId: run.runId,
@@ -512,6 +574,7 @@ export async function recoverClassicSdkArchive(
       claimToken: lost.claim.token,
       outcomeId: `${lost.id}:${lost.attempt}:recovered:${run.revision}`,
       status: 'succeeded',
+      artifacts,
       output: {
         archiveDirectory: path.relative(projectRoot, archived.target).replaceAll('\\', '/'),
       },

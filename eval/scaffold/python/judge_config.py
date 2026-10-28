@@ -158,10 +158,15 @@ def _messages_url(base_url: str) -> str:
 
 
 def _run_judge_http(prompt: str, invocation: JudgeInvocation, timeout: int = 120) -> str:
+    # Claude Code 的 [1m] 是上下文选项；HTTP 请求使用去掉该后缀的模型 ID。
+    model = invocation.model
+    if len(model) > 4 and model.lower().endswith("[1m]"):
+        model = model[:-4]
     body = json.dumps(
         {
-            "model": invocation.model,
-            "max_tokens": 2048,
+            "model": model,
+            # 推理模型共用输出预算；2048 token 曾在评分文本前耗尽。
+            "max_tokens": 8192,
             "messages": [{"role": "user", "content": prompt}],
         }
     ).encode("utf-8")

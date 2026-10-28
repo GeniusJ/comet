@@ -20,6 +20,12 @@ import {
 import { resolveClassicStateFile } from './classic-state-file.js';
 import type { ClassicProfile, ClassicState } from './classic-state.js';
 
+export const classicSdkCheckInstruction =
+  '执行当前检查 Action；Runtime 会绑定原命令、输入快照和收据，并校验后续证据。默认单次真实执行；--local 不是执行位置开关，而是允许确定性检查复用。任务要求每阶段真实执行、命令有副作用或读取外部状态时，禁止添加 --local；只有任务允许且完整输入和执行条件确定时才显式选择复用。使用 --json 时解析完整 stdout，stderr 单独保留，不合并后截断解析。';
+
+export const classicSdkDeliveryCheckInstruction =
+  '交付修复检查已固定原 Verify 命令。将 data.continuation.request 原样保存为 JSON 文件，按 data.continuation.commandArgs 调用 runtime dispatch；不使用 check run 或 check rerun 重新登记检查。Runtime 仍校验原命令、输入和收据，不重放 Archive。检查成功后展示新交付范围，结束当前回复并等待用户针对本范围的实际回答。使用 --json 时解析完整 stdout，stderr 单独保留。';
+
 /** 仅投影本次读取或提交的 Run；后续操作仍须重新校验版本与证据。 */
 export function classicSdkNextAction(run: WorkflowRun) {
   if (run.status === 'completed') return { kind: 'done' } as const;
@@ -46,6 +52,13 @@ export function classicSdkNextAction(run: WorkflowRun) {
       attempt: action.attempt,
       inputHash: action.inputHash,
       ...(ref ? { ref } : {}),
+      ...(ref === 'classic-check'
+        ? {
+            instruction: action.stepId.endsWith('.delivery.check')
+              ? classicSdkDeliveryCheckInstruction
+              : classicSdkCheckInstruction,
+          }
+        : {}),
     };
   }
   const evidence = run.evidenceWaits?.find((wait) => wait.status === 'pending');
@@ -65,6 +78,14 @@ export function classicSdkNextAction(run: WorkflowRun) {
         waitId: decision.id,
         proposalHash: decision.proposalHash,
         choices: decision.choices,
+        instruction:
+          decision.stepId.endsWith('.design.confirm') ||
+          decision.stepId.endsWith('.delivery.confirm')
+            ? '核对当前提案与已有批准、委托授权的对象、范围和条件。授权仍覆盖时记录依据并继续；超出授权、发生实质变化或用户明确要求逐阶段确认时，展示待决定内容并等待答复。不得把 Agent 自行判断写成用户确认。' +
+              (decision.stepId.endsWith('.delivery.confirm')
+                ? '本次重检完成后核对当前交付范围与原授权；用户明确要求审阅本次范围后确认时，先展示并结束当前回复，等待实际答复。'
+                : '')
+            : '核对当前提案是否已有有效批准或委托授权；授权覆盖时记录依据，否则展示选项并等待用户决定。',
       }
     : null;
 }
@@ -72,7 +93,7 @@ export function classicSdkNextAction(run: WorkflowRun) {
 export async function inspectClassicSdkRun(
   projectRoot: string,
   name: string,
-  options: { readOnly?: boolean } = {},
+  options: { readOnly?: boolean; allowBranchRebind?: boolean } = {},
 ): Promise<{
   run: WorkflowRun;
   state: ClassicState;
@@ -90,7 +111,7 @@ export async function inspectClassicSdkRun(
       `Classic change ${name} belongs to application ${owner.application}; use comet runtime dispatch --application ${owner.application} to continue its Run. Built-in commands cannot bypass composition checks.`,
     );
   const profile = owner.application.slice('classic-'.length) as ClassicProfile;
-  const store = createClassicSdkStateStore(projectRoot, { readOnly: options.readOnly });
+  const store = createClassicSdkStateStore(projectRoot, options);
   const saved = await store.read(owner.runId);
   const application = classicSdkApplicationForRun(profile, saved);
   let initialRead = true;

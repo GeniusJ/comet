@@ -210,13 +210,15 @@ comet state check <name> open
 
 随后检查关键产物的内容：proposal 应说明问题、目标、范围和非目标；design 应说明高层决策与数据流；tasks 应列出明确任务。schema 返回 specs 等其他产物时，也必须按对应的 instructions 检查内容，不能因为 proposal、design、tasks 三个文件已经存在就跳过。
 
-### 5. 请用户确认产物
+### 5. 核对授权并完成 Open
 
-全部 OpenSpec 产物完成且内容完整性检查通过后，使用当前有效响应的 `runtimeFormat`；归属信息缺失或发生外部变化时才运行 `comet state next <name> --json`。SDK change 再运行 `comet guard <change-name> open --json` 取得预检结果、内容摘要和 `data.approvalHash`；预检未通过时先修复问题。随后**必须按 `comet-classic/reference/decision-point.md` 的协议暂停并等待用户确认**。不得在用户确认前应用阶段守卫或自动进入下一阶段。
+全部 OpenSpec 产物完成且内容完整性检查通过后，使用当前有效响应的 `runtimeFormat`；归属信息缺失或发生外部变化时才运行 `comet state next <name> --json`。SDK change 再运行 `comet guard <change-name> open --json` 取得预检结果、内容摘要和 `data.approvalHash`；预检未通过时先修复问题。随后按 `comet-classic/reference/decision-point.md` 核对授权；没有覆盖当前产物的有效授权时，先请用户决定，再应用阶段守卫。
 
-最终审视同时确认 change 名称、范围和产物内容；不得因 Step 1b 已完成解析而省略，也不得在此之前再增加一次常规摘要/命名确认。
+最终审视核对 change 名称、范围和产物内容是否符合已获授权的要求；名称与范围已明确时，不另加常规摘要或命名确认。
 
-用户确认问题必须以单选题形式呈现，包含以下摘要和选项：
+按 `comet-classic/reference/decision-point.md` 核对当前产物与已有授权。授权仍覆盖当前内容时，记录依据并继续；需要新决定时才展示待确认内容并等待答复。
+
+需要用户确认时，以单选题形式呈现，包含以下摘要和选项：
 
 **摘要内容**：
 

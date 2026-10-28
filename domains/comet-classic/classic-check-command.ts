@@ -1,6 +1,15 @@
+import { resolveClassicCheckTimeout } from './classic-project-config.js';
 import { randomUUID } from 'node:crypto';
 import path from 'node:path';
-import { RuntimeProtocolError } from '../engine/runtime.js';
+import {
+  RuntimeProtocolError,
+  createMemoryRuntimeStore,
+  createRuntime,
+  defineWorkflow,
+  hashRuntimeValue,
+  preserveRuntimeExecutionOrigins,
+  type WorkflowRun,
+} from '../engine/runtime.js';
 import type { ClassicCommandHandler } from './classic-cli.js';
 import {
   classicCommandInvocationCwd,
@@ -14,6 +23,11 @@ import { resolveClassicChangeRuntimeOwner } from './classic-runtime-ownership.js
 import { executeClassicSdkCommandCheck } from './classic-sdk-check.js';
 import { findClassicSdkWorkspace, type inspectClassicSdkRun } from './classic-sdk-status.js';
 import { classicSdkEntryData } from './classic-sdk-output.js';
+import {
+  canReopenClassicVerification,
+  classicSdkApplicationForRun,
+} from './classic-sdk-revision-application.js';
+import { createClassicSdkStateStore } from './classic-sdk-state-store.js';
 import {
   executeCommandCheck,
   latestCommandCheck,
@@ -52,9 +66,10 @@ export async function executeClassicSdkCheckCommand(
     projectRoot,
     argv: requestedArgv,
     cwd = '.',
-    timeoutMs = 300_000,
+    timeoutMs: requestedTimeout,
     reusable = false,
   } = options;
+  const timeoutMs = await resolveClassicCheckTimeout(projectRoot, requestedTimeout);
   if (inspected.state.phase !== scope) {
     throw new Error(`Classic SDK change ${name} is in ${inspected.state.phase}, not ${scope}`);
   }
@@ -133,10 +148,90 @@ export async function executeClassicSdkCheckCommand(
       if (
         error instanceof RuntimeProtocolError &&
         error.code === 'EVIDENCE_REJECTED' &&
-        inspected.profile === 'full' &&
+        scope === 'verify' &&
+        canReopenClassicVerification(checked)
+      ) {
+        const entry = await classicSdkEntryData(name, { run: checked, projectRoot });
+        return {
+          run: checked,
+          entry,
+          result: {
+            exitCode: 1,
+            stdout: '',
+            stderr: error.message,
+            data: {
+              ...entry,
+              issues: [{ code: 'CLASSIC_EVIDENCE_DRIFT', message: error.message }],
+              continuation: {
+                ...entry.continuation,
+                mode: 'reconcile' as const,
+                automatic: false,
+                commandArgs: [
+                  'comet',
+                  'state',
+                  'reopen-verification',
+                  name,
+                  '--expected-revision',
+                  String(checked.revision),
+                  '--json',
+                ],
+                requiredInputs: [],
+                instruction:
+                  '检查证据已失效。保留当前修改，重开 Verify 并重新验收；不得提交旧收据。',
+                request: undefined,
+              },
+            },
+          },
+        };
+      }
+      if (
+        error instanceof RuntimeProtocolError &&
+        error.code === 'EVIDENCE_REJECTED' &&
         scope === 'build'
       ) {
-        await inspected.runtime.invalidateEvidence(submission);
+        if (inspected.profile === 'full') {
+          // Full already has this transition, including when a preset Run was
+          // upgraded to full while retaining its original workflow identity.
+          await inspected.runtime.invalidateEvidence(submission);
+          throw error;
+        }
+        const application = classicSdkApplicationForRun(inspected.profile, checked, {
+          upgradeBuildCheckRecovery: true,
+        });
+        const definition = defineWorkflow(application.workflow);
+        const hash = hashRuntimeValue(definition);
+        if (hash === checked.workflow.hash) {
+          await inspected.runtime.invalidateEvidence(submission);
+        } else {
+          // 旧内置定义不含失效转移。在内存完成校验与状态迁移，再一次 CAS 发布。
+          const upgraded = preserveRuntimeExecutionOrigins(checked);
+          upgraded.workflow.hash = hash;
+          upgraded.definitionHashes[JSON.stringify([definition.id, definition.version])] = hash;
+          const store = createMemoryRuntimeStore<WorkflowRun>();
+          await store.restoreCheckpoint!(checked.runId, null, upgraded);
+          const runtime = createRuntime({
+            store,
+            workflows: [application.workflow],
+            transitionHandlers: [application.transitionHandler],
+            evidenceValidators: application.evidenceValidators,
+            validators: application.validators,
+            executors: application.executors,
+            commandValidators: application.commandValidators,
+          });
+          const revised = await runtime.invalidateEvidence(submission);
+          if (
+            !(await createClassicSdkStateStore(projectRoot).compareAndSwap(
+              checked.runId,
+              checked.revision,
+              revised,
+            ))
+          ) {
+            throw new RuntimeProtocolError(
+              'REVISION_CONFLICT',
+              'Run 已变化，未提交检查恢复；重新读取当前状态',
+            );
+          }
+        }
       }
       throw error;
     }
@@ -180,7 +275,7 @@ export const classicCheckCommand: ClassicCommandHandler = withProjectContext(asy
   if (sdkWorkspace) {
     if (rerun) throw new Error('Classic SDK check rerun requires a new pending check Action');
     let cwd = '.';
-    let timeoutMs = 300_000;
+    let timeoutMs: number | undefined;
     let reusable = false;
     for (let index = 3; index < separator; index += 1) {
       const option = args[index];
@@ -249,7 +344,7 @@ export const classicCheckCommand: ClassicCommandHandler = withProjectContext(asy
     };
   }
   let cwd = path.relative(root, classicCommandInvocationCwd()) || '.';
-  let timeoutMs = 300_000;
+  let timeoutMs: number | undefined;
   let reusable = false;
   let incremental = false;
   for (let index = 3; index < separator; index += 1) {
@@ -260,8 +355,6 @@ export const classicCheckCommand: ClassicCommandHandler = withProjectContext(asy
     else if (option === '--timeout-ms' && index + 1 < separator) timeoutMs = Number(args[++index]);
     else throw new Error(`Unknown or incomplete check option: ${option}`);
   }
-  if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 3_600_000)
-    throw new Error('Check timeout must be 1..3600000 milliseconds');
   const recorded = await executeCommandCheck(root, change.directory, context.run, {
     scope: scope as 'build' | 'verify',
     argv: args.slice(separator + 1),

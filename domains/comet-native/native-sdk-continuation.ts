@@ -1,4 +1,11 @@
+import {
+  nativeSdkVerifyDecisions,
+  nativeSdkVerifyWaitDecisions,
+} from './native-sdk-verify-decision.js';
+import path from 'node:path';
+import { inspectGitWorktree } from '../../platform/paths/git-worktree.js';
 import { nativeSdkCompletedCheckInputDrift } from './native-sdk-checks.js';
+import { nativeRecoveryForContinuation } from './native-recovery.js';
 import { nativeTaskContextRequest } from './native-task-context.js';
 import {
   hashRuntimeValue,
@@ -26,6 +33,7 @@ import {
   NATIVE_SDK_ARCHIVE_STEPS,
   nativeSdkRetryableArchivePreflight,
   nativeSdkRetryableArchiveFinalization,
+  inspectNativeSdkPendingArchiveDrift,
 } from './native-sdk-archive.js';
 import { collectNativeSdkShapeProposal } from './native-sdk-application.js';
 import { nativeProjectPaths } from './native-paths.js';
@@ -35,9 +43,11 @@ import {
   type EditReviewObservation,
 } from '../workflow-contract/edit-review.js';
 import { nativeEditReviewScope } from './native-edit-review.js';
+import { inspectNativePortableAcceptanceDrift } from './native-portable-requirements.js';
 import {
   nativeSdkRequirementsRevisionAllowed,
   nativeSdkStoppedBuilderWait,
+  nativeSdkPendingBuilderRevisionHash,
 } from './native-sdk-revise.js';
 import {
   NATIVE_SUPERVISOR_COORDINATION_MODES,
@@ -149,7 +159,7 @@ function nativeSdkOutcomeOutput(
         { name: '<check-name>', result: '<passed|failed|not-run>', note: '<actual-result>' },
       ],
       knownLimits: ['<actual-limit-or-remove-entry>'],
-      submittedAt: '<ISO-8601-UTC-time>',
+      submittedAt: '<YYYY-MM-DDTHH:mm:ss.sssZ; use new Date().toISOString()>',
       verificationChecks: [check],
       ...(action.stepId === 'supervisor.parent.builder'
         ? { candidateCommit: '<current-integration-HEAD>' }
@@ -229,8 +239,8 @@ function nativeSdkOutcomeAlternatives(
   return {
     outcomeTemplateInstruction:
       state.language === 'zh-CN'
-        ? '用实际结果替换全部占位值，删除不适用的列表项。succeeded 表示任务已完成，验收是否通过由 verdict 表达。保留原领取身份，禁止直接提交未填写的模板。'
-        : 'Replace every placeholder with observed results; remove unused list entries. succeeded means the task finished, not that acceptance passed. Keep the original claim identity. Never submit this template unchanged.',
+        ? '完整保存 stdout JSON，stderr 另存；一次解析并提取 data.outcomeRequest、data.contextRequest 和 data.action。不要用 head 或 tail 截断 JSON，不要把后台任务提示当作 JSON。SDK inspect 的 data 是原始 Run，不含 Native 状态投影的 continuation 或 pendingActions。使用当前模板，不通过检索 Comet Runtime 源码猜字段；仅在返回缺项或实际错误缺少诊断时再调查。用实际结果替换全部占位值，删除不适用的列表项。succeeded 表示任务已完成，验收是否通过由 verdict 表达。已知无法独立验收时，执行自己的 contextRequest 后如实提交 blocked，不为得到结果而重跑检查或假装已独立审查。保留原领取身份，禁止直接提交未填写的模板。'
+        : 'Save complete stdout JSON and keep stderr separate. Parse it once to extract data.outcomeRequest, data.contextRequest and data.action. Do not truncate JSON with head or tail, or parse a background-task notice as JSON. SDK inspect returns the raw Run in data, without the Native status projection continuation or pendingActions. Use the current templates instead of searching Comet Runtime source to guess fields; investigate only missing fields or actual errors without a diagnosis. Replace every placeholder with observed results and remove unused entries. succeeded means the task finished, not that acceptance passed. When independent review is known to be unavailable, execute your contextRequest and report blocked honestly; do not rerun checks or pretend an independent review occurred. Keep the original claim identity. Never submit this template unchanged.',
     failureOutcomeRequest: {
       ...request,
       outcome: {
@@ -364,6 +374,7 @@ export async function projectNativeSdkDispatchResult(options: {
   const hasClaimedContext = activeActions?.some(
     (current) => current.id === action.id && 'contextRequest' in current,
   );
+  const contextRequest = activeActions?.find((current) => current.id === action.id)?.contextRequest;
   return {
     schema: 'comet.native.dispatch-result.v1' as const,
     runId: run.runId,
@@ -371,10 +382,11 @@ export async function projectNativeSdkDispatchResult(options: {
     workflow: run.workflow,
     status: run.status,
     workspace: { projectRoot: options.projectRoot },
+    ...(outcomeRequest ? { outcomeRequest } : {}),
+    ...(contextRequest ? { contextRequest } : {}),
+    ...nativeSdkOutcomeAlternatives(run, action, state),
     state,
     action,
-    ...(outcomeRequest ? { outcomeRequest } : {}),
-    ...nativeSdkOutcomeAlternatives(run, action, state),
     ...projection,
     ...(hasClaimedContext ? { continuation: continuationWithoutContext } : {}),
     ...(activeActions ? { activeActions } : {}),
@@ -466,29 +478,47 @@ function sdkShapeContinuation(
   };
 }
 
-function sdkLoopStopContinuation(state: NativePortableState, proposalHash: string) {
+function sdkLoopStopContinuation(
+  run: WorkflowRun,
+  state: NativePortableState,
+  proposalHash: string,
+) {
   const continuation = nativePortableContinuation(state);
-  if (!continuation.commandAlternatives) {
-    throw new Error('Native SDK Verify stop has no recovery choices');
+  const decisions = nativeSdkVerifyDecisions(run, state).filter(
+    ({ wait }) => wait.proposalHash === proposalHash,
+  );
+  if (
+    state.loop.next_action === 'resolve-verifier-blocker' &&
+    !decisions.some(({ action }) => action === 'resolve-verifier-blocker')
+  ) {
+    // 旧定义的 Wait 只有 repair；先精确迁移，不能展示执行时必然被拒的 retry。
+    return {
+      ...continuation,
+      action: 'none' as const,
+      disposition: 'blocked' as const,
+      mode: 'reconcile' as const,
+      requiresUserDecision: false,
+      commandArgs: ['comet', 'native', 'doctor', state.name, '--repair'],
+      commandAlternatives: undefined,
+      requiredInputs: [],
+      inputOptions: [],
+      userCommunication: {
+        required: false,
+        message: null,
+        suggestedReply: null,
+        agentInstruction:
+          state.language === 'zh-CN'
+            ? '更新原 Run 的恢复选项，然后重新读取 continuation。保留候选和检查；只有用户明确决定后才重新验收或修复实现，不需要重新确认需求。'
+            : 'Update the original Run recovery choices, then read its continuation again. Preserve the candidate and checks; retry verification or repair only after an explicit user decision. Do not reset the requirements.',
+      },
+    };
   }
   return {
     ...continuation,
-    commandAlternatives: continuation.commandAlternatives.map((alternative) => {
-      if (alternative.name !== 'revise-implementation' || !alternative.commandArgs) {
-        return alternative;
-      }
-      const position = alternative.commandArgs.indexOf('--expected-state-version');
-      if (position < 0) throw new Error('Native SDK repair command lacks its state version');
-      return {
-        ...alternative,
-        commandArgs: [
-          ...alternative.commandArgs.slice(0, position),
-          '--proposal-hash',
-          proposalHash,
-          ...alternative.commandArgs.slice(position),
-        ],
-      };
-    }),
+    commandAlternatives: [
+      ...decisions.map(({ action, wait }) => sdkDecision(state, action, wait.proposalHash)),
+      sdkDecision(state, 'revise-requirements'),
+    ],
   };
 }
 
@@ -535,11 +565,333 @@ function sdkDecision(
 }
 
 /** 从同一 Run 投影下一步；SDK 不使用 compat Runner 输入或 workspace finish 决定。 */
-export async function projectNativeSdkContinuation(options: {
+export async function projectNativeSdkContinuation(
+  options: Parameters<typeof projectNativeSdkContinuationValue>[0],
+) {
+  const projection = await projectNativeSdkContinuationValue(options);
+  const pendingArchive =
+    options.state.phase === 'archive' &&
+    projection.continuation.action === 'archive' &&
+    !options.run.actions.some((action) => ['running', 'unknown'].includes(action.status))
+      ? nativeSdkNextAction(options.run, options.state)
+      : undefined;
+  const approved = [...options.run.waits]
+    .reverse()
+    .find(
+      (wait) =>
+        wait.stepId === 'verify.confirm' &&
+        wait.status === 'resolved' &&
+        wait.decision?.choice === 'approved',
+    );
+  if (pendingArchive && approved) {
+    const paths = await nativeProjectPaths(
+      options.projectRoot,
+      (options.run.input as { artifactRootRef: string }).artifactRootRef,
+      { readOnly: true },
+    );
+    const shape = await inspectNativePortableAcceptanceDrift({ paths, state: options.state });
+    if (shape.drifted && shape.reviewRequired) {
+      const scope = nativeEditReviewScope(paths, options.state);
+      const reviews = options.editReviews ?? (await inspectEditReviews(scope));
+      const edit = await editReviewContinuation(scope, reviews, true);
+      const requiresRevision =
+        edit?.mode === 'reconcile' &&
+        reviews.some(
+          (review) =>
+            review.applied &&
+            review.receipt?.authority.kind !== 'runtime-superseded' &&
+            review.receipt?.decision === 'requirements-changed',
+        );
+      if (!requiresRevision) {
+        const commandArgs =
+          edit?.commandArgs ??
+          sdkCommandArgs(
+            ['comet', 'edit-review', 'prepare-applied', 'native', options.state.name],
+            options.projectRoot,
+          );
+        const recovery = nativeRecoveryForContinuation({
+          state: options.state,
+          projectRoot: options.projectRoot,
+          reason: shape.reason ?? 'Review the user-edited formal comments',
+          continuation: {
+            disposition: 'blocked',
+            commandArgs: commandArgs ? [...commandArgs] : null,
+            requiredInputs: [...(edit?.requiredInputs ?? [])],
+          },
+        })!;
+        recovery.code = 'shape-drift';
+        return {
+          ...projection,
+          continuation: {
+            ...projection.continuation,
+            disposition:
+              edit?.mode === 'ask'
+                ? ('await-user' as const)
+                : edit?.mode === 'reconcile'
+                  ? ('blocked' as const)
+                  : ('continue' as const),
+            mode: edit?.mode ?? ('execute' as const),
+            action: 'review-edit' as const,
+            requiresUserDecision: edit?.mode === 'ask',
+            commandArgs,
+            commandAlternatives: undefined,
+            requiredInputs: edit?.requiredInputs ?? [],
+            inputOptions: [],
+            recovery,
+            userCommunication: {
+              required: false,
+              message: null,
+              suggestedReply: null,
+              agentInstruction:
+                edit?.instruction ??
+                '正式材料中的注释已经由用户修改。保留当前文件，准备独立复核并对比原批准内容；不要重建需求或覆盖用户修改。',
+            },
+          },
+        };
+      }
+    }
+    if (shape.drifted) {
+      const decision = sdkDecision(options.state, 'revise-requirements');
+      const commandArgs = sdkCommandArgs(decision.commandArgs, options.projectRoot);
+      const recovery = nativeRecoveryForContinuation({
+        state: options.state,
+        projectRoot: options.projectRoot,
+        reason: shape.reason ?? 'Approved requirements changed',
+        continuation: { disposition: 'blocked', commandArgs, requiredInputs: [] },
+      })!;
+      recovery.code = 'shape-drift';
+      recovery.affectedPaths = (shape.affectedSources ?? []).map((source) =>
+        path.resolve(paths.changesDir, options.state.name, source),
+      );
+      return {
+        ...projection,
+        continuation: {
+          ...projection.continuation,
+          disposition: 'continue' as const,
+          mode: 'execute' as const,
+          action: 'repair' as const,
+          requiresUserDecision: false,
+          commandArgs,
+          requiredInputs: ['summary'],
+          inputOptions: decision.inputOptions,
+          commandAlternatives: [{ ...decision, commandArgs, requiredInputs: ['summary'] }],
+          recovery,
+          userCommunication: {
+            required: false,
+            message: null,
+            suggestedReply: null,
+            agentInstruction:
+              options.state.language === 'zh-CN'
+                ? '正式需求已变化。先检查用户的修改；已有授权时在同一 Run 修订需求并保留现有代码，再展示完整新 Shape 供用户确认。没有授权时先询问，不能沿用旧批准。'
+                : 'Inspect the changed requirements. If already authorized, revise them on the same Run and preserve the implementation, then present the complete new Shape for confirmation. Ask when authorization is missing; do not reuse the old approval.',
+          },
+        },
+      };
+    }
+    let drift: Awaited<ReturnType<typeof inspectNativeSdkPendingArchiveDrift>>;
+    try {
+      drift = await inspectNativeSdkPendingArchiveDrift({
+        run: options.run,
+        action: pendingArchive,
+        projectRoot: options.projectRoot,
+      });
+    } catch (error) {
+      const recovery = nativeRecoveryForContinuation({
+        state: options.state,
+        projectRoot: options.projectRoot,
+        reason: error instanceof Error ? error.message : String(error),
+        continuation: { disposition: 'blocked', commandArgs: null, requiredInputs: [] },
+      })!;
+      return {
+        ...projection,
+        continuation: {
+          ...projection.continuation,
+          disposition: 'blocked' as const,
+          mode: 'reconcile' as const,
+          action: 'none' as const,
+          commandArgs: null,
+          recovery,
+          userCommunication: {
+            required: false,
+            message: null,
+            suggestedReply: null,
+            agentInstruction: `归档输入检查未完成：${recovery.reason}。先核对原因，不要执行归档。`,
+          },
+        },
+      };
+    }
+    if (drift) {
+      if (options.implementationRevisionAvailable === false) {
+        const recovery = nativeRecoveryForContinuation({
+          state: options.state,
+          projectRoot: options.projectRoot,
+          reason: drift.message,
+          continuation: { disposition: 'blocked', commandArgs: null, requiredInputs: [] },
+        })!;
+        recovery.code =
+          drift.reason === 'candidate-drift' ? 'candidate-drift' : 'verification-report-drift';
+        return {
+          ...projection,
+          continuation: {
+            ...projection.continuation,
+            disposition: 'blocked' as const,
+            mode: 'reconcile' as const,
+            action: 'none' as const,
+            commandArgs: null,
+            recovery,
+            userCommunication: {
+              required: false,
+              message: null,
+              suggestedReply: null,
+              agentInstruction:
+                '当前固定应用没有实现修订入口。保留原 Run 和用户修改，检查该应用支持的恢复方式；不要执行归档或更换固定应用。',
+            },
+          },
+        };
+      }
+      const decision = sdkDecision(options.state, 'revise-implementation', approved.proposalHash);
+      const commandArgs = sdkCommandArgs(decision.commandArgs, options.projectRoot);
+      const recovery = nativeRecoveryForContinuation({
+        state: options.state,
+        projectRoot: options.projectRoot,
+        reason: drift.message,
+        continuation: { disposition: 'blocked', commandArgs, requiredInputs: [] },
+      })!;
+      recovery.code =
+        drift.reason === 'candidate-drift' ? 'candidate-drift' : 'verification-report-drift';
+      const chinese = options.state.language === 'zh-CN';
+      return {
+        ...projection,
+        continuation: {
+          ...projection.continuation,
+          disposition: 'continue' as const,
+          mode: 'execute' as const,
+          action: 'repair' as const,
+          requiresUserDecision: false,
+          commandArgs,
+          requiredInputs: ['summary'],
+          inputOptions: decision.inputOptions,
+          commandAlternatives: [{ ...decision, commandArgs, requiredInputs: ['summary'] }],
+          userCommunication: {
+            required: false,
+            message: null,
+            suggestedReply: null,
+            agentInstruction:
+              (drift.reason === 'report-missing'
+                ? chinese
+                  ? '原 verification.md 已缺失；保留用户移动或修改的文件，重新验收后生成当前报告。'
+                  : 'The original verification.md is missing; preserve any moved or edited files and generate a current report after revalidation. '
+                : drift.reason === 'report-drift'
+                  ? chinese
+                    ? '先读取用户修改的 verification.md，将补充内容作为待核对输入，不把旧报告视为新验收结论。'
+                    : 'First read the user-edited verification.md and assess its notes as inputs, not as proof that the new candidate passed. '
+                  : '') +
+              (chinese
+                ? '先检查用户的实际修改。已有授权且仍在已确认需求范围内时，执行当前修订命令，保留现有工作并重新验收；需求变化或缺少授权时先确认。不要重跑原一次性检查。'
+                : 'Inspect the actual edits first. If continued work is already authorized and remains within approved requirements, run the revision command, retain the work and independently verify it. Reconfirm changed requirements or ask when authorization is missing. Do not repeat original one-shot checks.'),
+          },
+          recovery,
+        },
+      };
+    }
+  }
+  const stopped = [...options.run.actions]
+    .reverse()
+    .find((action) => ['failed', 'unknown', 'running'].includes(action.status));
+  const output = stopped?.outcome?.output as
+    { message?: string; blockers?: unknown[]; reason?: string } | null | undefined;
+  const candidateDrift = Boolean(
+    output?.reason === 'candidate-drift' &&
+    options.state.phase === 'verify' &&
+    stopped &&
+    options.run.actions.indexOf(stopped) >
+      options.run.actions
+        .map(
+          (action: RuntimeAction) =>
+            ['build.builder', 'supervisor.parent.builder'].includes(action.stepId) &&
+            action.status === 'succeeded',
+        )
+        .lastIndexOf(true),
+  );
+  const reason =
+    typeof output?.message === 'string'
+      ? output.message
+      : (Array.isArray(output?.blockers)
+          ? output.blockers.filter((entry) => typeof entry === 'string').join('; ')
+          : '') ||
+        stopped?.reason ||
+        options.run.reason ||
+        projection.continuation.userCommunication.message ||
+        undefined;
+  const recovery = nativeRecoveryForContinuation({
+    state: options.state,
+    continuation: candidateDrift
+      ? {
+          ...projection.continuation,
+          disposition: 'blocked',
+          commandArgs:
+            projection.continuation.commandAlternatives?.find(
+              (option) => option.name === 'revise-implementation',
+            )?.commandArgs ?? projection.continuation.commandArgs,
+        }
+      : projection.continuation,
+    projectRoot: options.projectRoot,
+    reason,
+  });
+  if (recovery && stopped) {
+    recovery.owner = {
+      actionId: stopped.id,
+      attempt: stopped.attempt,
+      executorId: stopped.claim?.executorId ?? null,
+      sessionId: stopped.claim?.sessionId ?? null,
+    };
+    if (stopped.stepId === 'archive.prepare') recovery.code = 'archive-preflight-blocked';
+    else if (['unknown', 'running'].includes(stopped.status))
+      recovery.code = 'execution-unresolved';
+    if (candidateDrift) recovery.code = 'candidate-drift';
+  }
+  if (candidateDrift && !options.state.loop.stop_reason) {
+    const chinese = options.state.language === 'zh-CN';
+    const repair = projection.continuation.commandAlternatives?.find(
+      (option) => option.name === 'revise-implementation',
+    );
+    if (repair) {
+      // 用户已授权继续当前工作时，核对现有修改即可安排修复；这不是接受新候选或扩大授权。
+      const authorizedRepair = { ...repair, requiredInputs: ['summary'] };
+      projection.continuation = {
+        ...projection.continuation,
+        disposition: 'continue',
+        mode: 'execute',
+        action: 'repair',
+        requiresUserDecision: false,
+        commandArgs: authorizedRepair.commandArgs,
+        requiredInputs: authorizedRepair.requiredInputs,
+        inputOptions: authorizedRepair.inputOptions,
+        commandAlternatives: projection.continuation.commandAlternatives?.map((option) =>
+          option.name === 'revise-implementation' ? authorizedRepair : option,
+        ),
+        userCommunication: {
+          required: false,
+          message: null,
+          suggestedReply: null,
+          agentInstruction: chinese
+            ? '先检查实际修改。若用户已有授权继续且改动仍在已确认需求范围内，执行 revise-implementation，保留现有工作和原检查，再建立后继候选并独立验收；不重建需求或重复原一次性检查。若需求或验收标准变化，走需求修订并重新确认；缺少继续授权或需要新增权限时先询问。不得自动接受新候选或沿用失效证据。'
+            : 'Inspect the actual edits first. If the user has already authorized continued work and the edits remain within approved requirements, run revise-implementation, retain the existing work and original checks, and independently verify a successor candidate; do not recreate requirements or repeat original one-shot checks. If requirements or acceptance criteria changed, revise and reconfirm them; ask when continued work or additional permissions are not authorized. Do not automatically accept the successor or reuse invalid evidence.',
+        },
+      };
+    }
+  }
+  return recovery
+    ? { ...projection, continuation: { ...projection.continuation, recovery } }
+    : projection;
+}
+
+async function projectNativeSdkContinuationValue(options: {
   run: WorkflowRun;
   state: NativePortableState;
   projectRoot: string;
   applicationId?: string;
+  implementationRevisionAvailable?: boolean;
   skillExecutors?: readonly RuntimeExecutor[];
   editReviews?: readonly EditReviewObservation[];
   cancellationObservation?: Awaited<ReturnType<typeof inspectNativeSdkCancellation>>;
@@ -909,7 +1261,7 @@ export async function projectNativeSdkContinuation(options: {
     };
   } else if (verifyWait?.stepId === 'verify.checks-stop') {
     continuation = {
-      ...sdkLoopStopContinuation(state, verifyWait.proposalHash),
+      ...sdkLoopStopContinuation(run, state, verifyWait.proposalHash),
       userCommunication: communication(
         localized(
           'Preserve failed, interrupted, or input-invalidated check receipts. Ask for a repair or requirements decision before creating a new candidate; do not retry the original check or report that it never ran.',
@@ -919,9 +1271,13 @@ export async function projectNativeSdkContinuation(options: {
       ),
     };
   } else if (verifyWait?.stepId === 'verify.stop') {
-    continuation = sdkLoopStopContinuation(state, verifyWait.proposalHash);
+    continuation = sdkLoopStopContinuation(run, state, verifyWait.proposalHash);
   } else if (verifyWait) {
     const retry = verifyWait.stepId === 'verify.retry';
+    const decisions = nativeSdkVerifyDecisions(run, state).filter(
+      ({ wait }) => wait.id === verifyWait.id,
+    );
+    const oneShotChecks = !retry && !decisions.some(({ action }) => action === 'retry-verifier');
     continuation = {
       ...base,
       disposition: 'await-user',
@@ -929,20 +1285,18 @@ export async function projectNativeSdkContinuation(options: {
       requiresUserDecision: true,
       action: retry ? 'retry-verifier' : 'confirm-skill-coordinated-pass',
       requiredInputs: ['summary', 'user-decision'],
-      commandAlternatives: retry
-        ? [sdkDecision(state, 'retry-verifier', verifyWait.proposalHash)]
-        : [
-            sdkDecision(state, 'accept-result', verifyWait.proposalHash),
-            sdkDecision(state, 'revise-implementation', verifyWait.proposalHash),
-            ...(verifyWait.choices.includes('reverify')
-              ? [sdkDecision(state, 'retry-verifier', verifyWait.proposalHash)]
-              : []),
-            sdkDecision(state, 'revise-requirements'),
-          ],
+      commandAlternatives: [
+        ...decisions.map(({ action, wait }) => sdkDecision(state, action, wait.proposalHash)),
+        ...(!retry ? [sdkDecision(state, 'revise-requirements')] : []),
+      ],
       userCommunication: communication(
         localized(
-          'Summarize the result and evidence, then wait for an explicit decision before executing the matching option.',
-          '简要说明结果和证据，等待用户明确决定后执行对应选项。',
+          oneShotChecks
+            ? 'Summarize the result and evidence, then wait for an explicit decision. Reverification is unavailable because the current checks include one-shot commands; do not replay them. Accept the valid result or revise the candidate and confirm a new verification plan.'
+            : 'Summarize the result and evidence, then wait for an explicit decision before executing the matching option.',
+          oneShotChecks
+            ? '简要说明结果和证据，等待用户明确决定。当前检查包含不可重复执行的命令，因此不提供重新验收；不能重放它们。可接受有效结果，或修订候选并确认新的验证方式。'
+            : '简要说明结果和证据，等待用户明确决定后执行对应选项。',
         ),
         retry
           ? localized(
@@ -950,8 +1304,12 @@ export async function projectNativeSdkContinuation(options: {
               '验收未正常返回可用结果。是否保留当前候选和检查，重新尝试独立验收？',
             )
           : localized(
-              'Verification passed. Accept the result for Archive, revise the implementation, or revise the requirements?',
-              '验收已通过。请选择接受结果进入归档、修改实现，或调整需求。',
+              oneShotChecks
+                ? 'Verification passed. The checks include one-shot commands, so reverification is unavailable. Accept the result for Archive, revise the implementation, or revise the requirements?'
+                : 'Verification passed. Accept the result for Archive, revise the implementation, or revise the requirements?',
+              oneShotChecks
+                ? '验收已通过。检查包含不可重复执行的命令，因此不能重新验收。请选择接受结果进入归档、修改实现，或调整需求。'
+                : '验收已通过。请选择接受结果进入归档、修改实现，或调整需求。',
             ),
       ),
     };
@@ -1096,6 +1454,25 @@ export async function projectNativeSdkContinuation(options: {
     };
   } else if (
     active.length === 1 &&
+    active[0].stepId === 'repair.implementation' &&
+    active[0].ref === 'native-revise-implementation' &&
+    active[0].claim?.executorId === 'comet-native-revise-implementation' &&
+    ['running', 'unknown'].includes(active[0].status)
+  ) {
+    continuation = {
+      ...base,
+      disposition: 'continue',
+      mode: 'execute',
+      commandArgs: ['comet', 'native', 'next', state.name],
+      userCommunication: communication(
+        localized(
+          'Recheck the original read-only implementation revision with its existing claim; this does not assume the original process stopped and does not execute Archive.',
+          '使用原领取信息重新核对只读实现修订；不假定原进程已停止，也不执行 Archive。',
+        ),
+      ),
+    };
+  } else if (
+    active.length === 1 &&
     active[0].status === 'unknown' &&
     active[0].stepId === 'verify.revalidate' &&
     active[0].ref === 'native-report-revalidate' &&
@@ -1110,6 +1487,28 @@ export async function projectNativeSdkContinuation(options: {
         localized(
           `Report revalidation stopped: ${active[0].reason ?? 'unknown result'}. Run next to repeat only the read-only validation with the original claim. Changed checks require fresh verification; unresolved storage or permission errors remain blocked.`,
           `报告复核停止：${active[0].reason ?? '结果未知'}。执行 next，只重读校验并保留原领取记录；检查失效后重新验收，未解决的存储或权限错误仍保持阻塞。`,
+        ),
+      ),
+    };
+  } else if (
+    state.phase === 'archive' &&
+    active.length === 1 &&
+    active[0].status === 'unknown' &&
+    NATIVE_SDK_ARCHIVE_STEPS.some(
+      ([stepId, ref]) => active[0].stepId === stepId && active[0].ref === ref,
+    )
+  ) {
+    continuation = {
+      ...base,
+      action: 'archive',
+      disposition: 'blocked',
+      mode: 'reconcile',
+      commandArgs: ['comet', 'native', 'archive', state.name, '--recover'],
+      requiredInputs: ['original-archive-writer-stopped', 'archive-conflict-resolution'],
+      userCommunication: communication(
+        localized(
+          `The original Archive step stopped: ${active[0].reason ?? 'its outcome is unresolved'}. Confirm the original writer stopped and resolve the reported path or permission conflict, then run the recovery command. It reconciles the same transaction and Action; completed checks and applied Specs are retained.`,
+          `原归档步骤已停止：${active[0].reason ?? '执行结果尚未核对'}。确认原写入进程已停止，处理报告中的路径或权限冲突后执行恢复命令。恢复会核对同一事务和 Action，保留已完成检查及已应用规格。`,
         ),
       ),
     };
@@ -1186,6 +1585,17 @@ export async function projectNativeSdkContinuation(options: {
             : ['comet', 'native', archive ? 'archive' : 'next', state.name],
       ...(handoff
         ? {
+            ...(action.stepId === 'build.builder' && nativeSdkPendingBuilderRevisionHash(run)
+              ? {
+                  commandAlternatives: [
+                    sdkDecision(
+                      state,
+                      'revise-requirements',
+                      nativeSdkPendingBuilderRevisionHash(run)!,
+                    ),
+                  ],
+                }
+              : {}),
             requiredInputs: ['request-json-file', 'session-id', 'claim-token'],
             inputOptions: [
               {
@@ -1225,10 +1635,15 @@ export async function projectNativeSdkContinuation(options: {
                 'Use the pending Action claimRequest with a real stable session ID and unique claim token. After the claim succeeds, the receiving Agent reads its contextRequest before starting work. Use the returned Action input; Verifiers need a separate read-only session. Submit the original Action outcome, then follow the returned Run.',
                 '在待执行 Action 的 claimRequest 中填入真实稳定的会话标识和唯一领取令牌。领取成功后，接收 Agent 先执行自己的 contextRequest，再按返回的 Action 输入开展工作；Verifier 必须使用独立只读会话。提交原 Action 的结果后按返回的 Run 继续。',
               )
-            : localized(
-                'Execute the next Runtime-owned Action and follow its returned state. It revalidates current evidence before committing.',
-                '执行下一项 Runtime 自有 Action，并按返回状态继续；Runtime 会在提交前重新校验当前证据。',
-              ),
+            : archive
+              ? localized(
+                  'Execute Archive once and follow the returned state. If the platform returns a background handle, wait for that original task with its wait/output tool. After completion, parse its original stdout as one complete JSON document and keep stderr separate. Do not poll unrelated processes, parse task-status decorations as JSON, or start another Archive while this task is running.',
+                  '只执行一次 Archive，并按返回状态继续。平台返回后台句柄时，使用对应的等待或输出工具跟踪原任务。完成后把原 stdout 作为一个完整 JSON 文档解析，stderr 另存；不要轮询无关进程、把任务状态提示当作 JSON，或在原任务运行时再启动 Archive。',
+                )
+              : localized(
+                  'Execute the next Runtime-owned Action and follow its returned state. It revalidates current evidence before committing.',
+                  '执行下一项 Runtime 自有 Action，并按返回状态继续；Runtime 会在提交前重新校验当前证据。',
+                ),
       ),
     };
   } else if (active.length > 0) {
@@ -1305,6 +1720,25 @@ export async function projectNativeSdkContinuation(options: {
       },
     };
   }
+  if (
+    state.workspace.change_branch &&
+    !state.archived &&
+    !['completed', 'cancelled'].includes(run.status) &&
+    inspectGitWorktree(projectRoot).currentBranch !== state.workspace.change_branch
+  ) {
+    continuation = {
+      ...continuation,
+      disposition: 'blocked',
+      mode: 'reconcile',
+      action: 'none',
+      commandArgs: ['comet', 'native', 'select', state.name, '--rebind'],
+      commandAlternatives: undefined,
+      requiredInputs: ['confirm-current-branch-ownership', 'settle-original-executions'],
+      userCommunication: communication(
+        `当前分支与需求绑定的 ${state.workspace.change_branch} 不一致。切回原分支继续；确认当前分支接管且原执行已结束后，执行 select --rebind，保留同一 Run 和已有工作。`,
+      ),
+    };
+  }
   return {
     continuation: bindSdkContinuation(continuation, projectRoot),
     ...(state.phase === 'shape' ||
@@ -1375,8 +1809,25 @@ export async function projectNativeSdkContinuation(options: {
       ? {
           pendingWaits: waits.map((wait) => ({
             ...wait,
+            ...(['verify.stop', 'verify.checks-stop', 'verify.retry', 'verify.confirm'].includes(
+              wait.stepId,
+            )
+              ? {
+                  choices: nativeSdkVerifyWaitDecisions(state, wait, run).map(
+                    ({ choice }) => choice,
+                  ),
+                }
+              : {}),
             commandArgs: dispatchCommandArgs,
-            decisionRequests: wait.choices.map((choice) => ({
+            decisionRequests: ([
+              'verify.stop',
+              'verify.checks-stop',
+              'verify.retry',
+              'verify.confirm',
+            ].includes(wait.stepId)
+              ? nativeSdkVerifyWaitDecisions(state, wait, run).map(({ choice }) => choice)
+              : wait.choices
+            ).map((choice) => ({
               operation: 'resolve-wait',
               runId: run.runId,
               expectedRevision: run.revision,
@@ -1384,6 +1835,9 @@ export async function projectNativeSdkContinuation(options: {
               proposalHash: wait.proposalHash,
               decisionId: '<decision-id>',
               choice,
+              ...(wait.stepId === 'verify.stop' && choice === 'retry'
+                ? { reason: '<summary>' }
+                : {}),
             })),
           })),
         }

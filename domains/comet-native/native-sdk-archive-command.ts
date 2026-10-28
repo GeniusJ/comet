@@ -2,6 +2,7 @@ import { reconcileNativeSdkExecutionStops } from './native-sdk-check-execution.j
 import { settleNativeSdkCancellation } from './native-sdk-cancellation-cleanup.js';
 import { nativeProjectPaths } from './native-paths.js';
 import { readNativePortableTransaction } from './native-portable-transactions.js';
+import { inspectNativeSdkArchiveFinalization } from './native-portable-archive.js';
 import { importNativeSdkArchiveOriginals } from './native-sdk-archive-originals.js';
 import { NativeUsageError, success, type DispatchResult } from './native-cli-shared.js';
 import {
@@ -10,6 +11,7 @@ import {
   NATIVE_SDK_ARCHIVE_STEPS,
   nativeSdkRetryableArchivePreflight,
   nativeSdkRetryableArchiveFinalization,
+  inspectNativeSdkPendingArchiveDrift,
 } from './native-sdk-archive.js';
 import { recoverNativeSdkSupervisorCleanupOutcome } from './native-sdk-supervisor-cleanup.js';
 import {
@@ -21,7 +23,8 @@ import { loadOwnedNativeSdkRuntime, inspectNativeSdkRun } from './native-runtime
 import { restoreNativeSupervisorChildArchiveMaterials } from './native-sdk-supervisor-archive.js';
 import { parseNativePortableState } from './native-portable-state.js';
 import { randomUUID } from 'node:crypto';
-import type { WorkflowRun } from '../engine/runtime.js';
+import { assertNativeSdkCandidateUnchanged } from './native-sdk-checks.js';
+import { hashRuntimeValue, type WorkflowRun, type RuntimeValue } from '../engine/runtime.js';
 import { nativeSdkNextAction, nativeSdkPendingActions } from './native-sdk-continuation.js';
 
 function pendingArchiveAction(run: WorkflowRun) {
@@ -47,7 +50,45 @@ export async function backfillNativeSdkSupervisorChildArchiveMaterials(options: 
   return restoreNativeSupervisorChildArchiveMaterials(options, inspection);
 }
 
-export async function archiveNativeSdkChange(options: {
+export async function archiveNativeSdkChange(
+  options: Parameters<typeof archiveNativeSdkChangeValue>[0],
+): Promise<DispatchResult> {
+  try {
+    const result = await archiveNativeSdkChangeValue(options);
+    const data =
+      result.data && typeof result.data === 'object'
+        ? (result.data as Record<string, unknown>)
+        : {};
+    if (result.exitCode === 0 || data.schema === 'comet.native.sdk-status.v1') return result;
+    const inspection = await inspectNativeSdkRun(options.projectRoot, options.name, {
+      readOnly: true,
+    });
+    return { ...result, data: { ...(await projectNativeSdkStatus(options, inspection)), ...data } };
+  } catch (error) {
+    if (error instanceof NativeUsageError) throw error;
+    const inspection = await inspectNativeSdkRun(options.projectRoot, options.name, {
+      readOnly: true,
+    }).catch(() => null);
+    const unresolved = inspection?.run.actions.find(
+      (action) =>
+        ['running', 'unknown'].includes(action.status) &&
+        NATIVE_SDK_ARCHIVE_STEPS.some(
+          ([stepId, ref]) => action.stepId === stepId && action.ref === ref,
+        ),
+    );
+    if (!inspection || inspection.state.phase !== 'archive' || !unresolved) throw error;
+    return {
+      ...success('archive', {
+        change: options.name,
+        ...(await projectNativeSdkStatus(options, inspection)),
+      }),
+      exitCode: 73,
+      error: { code: 'blocked', message: error instanceof Error ? error.message : String(error) },
+    };
+  }
+}
+
+async function archiveNativeSdkChangeValue(options: {
   projectRoot: string;
   name: string;
   dryRun: boolean;
@@ -77,6 +118,36 @@ export async function archiveNativeSdkChange(options: {
   }
   const inspection = await inspectNativeSdkRun(options.projectRoot, options.name);
   let { run, state } = inspection;
+  if (options.recover && run.status === 'completed' && state.archived) {
+    const applied = run.outputs['archive.execute']?.value as { archiveRef?: string } | undefined;
+    const completed = [...run.actions]
+      .reverse()
+      .find((action) => action.stepId === 'archive.finalize' && action.status === 'succeeded');
+    if (!applied?.archiveRef || !completed?.outcome)
+      throw new Error('Native completed Archive lacks its original finalization receipt');
+    const receipt = await inspectNativeSdkArchiveFinalization({
+      paths: await nativeProjectPaths(options.projectRoot, inspection.artifactRootRef, {
+        readOnly: true,
+      }),
+      state,
+      runId: run.runId,
+      archiveRef: applied.archiveRef,
+      history: true,
+    });
+    if (
+      hashRuntimeValue(receipt as unknown as RuntimeValue) !==
+      hashRuntimeValue(completed.outcome.output)
+    )
+      throw new Error('Native completed Archive differs from its original receipt');
+    return success('archive', {
+      change: options.name,
+      alreadyArchived: true,
+      historicalRecovery: true,
+      currentImplementationRevalidated: false,
+      receipt,
+      ...(await projectNativeSdkStatus(options, inspection)),
+    });
+  }
   if (!options.dryRun) {
     run = await reconcileNativeSdkExecutionStops(
       options.projectRoot,
@@ -189,9 +260,67 @@ export async function archiveNativeSdkChange(options: {
         }
       : result;
   }
-  const pending = run.actions.find((action) => action.status === 'pending');
+  let pending = run.actions.find((action) => action.status === 'pending');
+  if (
+    !options.dryRun &&
+    pending?.stepId === 'verify.revalidate' &&
+    nativeSdkPendingActions(run).length === 1 &&
+    nativeSdkNextAction(run, state)?.id === pending.id &&
+    !run.actions.some((action) => ['running', 'unknown'].includes(action.status)) &&
+    run.waits.some(
+      (wait) =>
+        wait.stepId === 'verify.confirm' &&
+        wait.status === 'resolved' &&
+        wait.decision?.choice === 'approved',
+    )
+  ) {
+    const { runtime, executors } = await loadOwnedNativeSdkRuntime(
+      options.projectRoot,
+      options.name,
+    );
+    const executor = executors.find((entry) => entry.supports(pending!));
+    if (!executor) throw new Error('Native accepted result has no revalidation executor');
+    run = await runtime.execute({
+      runId: run.runId,
+      expectedRevision: run.revision,
+      actionId: pending.id,
+      executorId: executor.id,
+      context: { requestId: randomUUID(), projectRoot: options.projectRoot },
+    });
+    state = parseNativePortableState(run.state);
+    inspection.run = run;
+    inspection.state = state;
+    pending = run.actions.find((action) => action.status === 'pending');
+  }
   if (options.dryRun) {
-    const ready = state.phase === 'archive' && pendingArchiveAction(run) !== null;
+    let ready = state.phase === 'archive' && pendingArchiveAction(run) !== null;
+    const blockers: string[] = [];
+    if (!ready)
+      blockers.push(
+        run.reason ??
+          `Native Archive is waiting at ${pending?.stepId ?? state.loop.next_action ?? state.phase}`,
+      );
+    if (ready) {
+      try {
+        if (pending?.stepId.startsWith('archive.')) {
+          const drift = await inspectNativeSdkPendingArchiveDrift({
+            run,
+            action: pending,
+            projectRoot: options.projectRoot,
+          });
+          if (drift) throw new Error(drift.message);
+        } else {
+          await assertNativeSdkCandidateUnchanged({
+            run,
+            projectRoot: options.projectRoot,
+            requireEvidence: true,
+          });
+        }
+      } catch (error) {
+        ready = false;
+        blockers.push((error as Error).message);
+      }
+    }
     const delivery =
       ready && pending?.stepId === 'supervisor.parent.deliver'
         ? await inspectNativeSdkSupervisorDelivery(run, pending, options.projectRoot)
@@ -202,11 +331,16 @@ export async function archiveNativeSdkChange(options: {
       phase: state.phase,
       status: run.status,
       ready,
+      blockers,
       ...(delivery ? { delivery } : {}),
     });
   }
   if (state.phase !== 'archive' || run.status === 'cancelled') {
     return {
+      ...success('archive', {
+        change: options.name,
+        ...(await projectNativeSdkStatus(options, { ...inspection, run, state })),
+      }),
       command: 'archive',
       exitCode: 73,
       error: {

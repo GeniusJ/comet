@@ -9,13 +9,13 @@ Classic has five phases: Open → Design → Build → Verify → Archive. OpenS
 
 ## 1. Resolve the Target and Workspace
 
-On a new task or host change, read and perform the [host capability check](../comet/reference/host-check.md) before approving Open. When execution configuration changes, check only capabilities required by the new strategy.
+For a new task or host change, perform the [host capability check](../comet/reference/host-check.md) before approving Open. When execution configuration changes, check only capabilities required by the new strategy.
 
 Before starting or resuming, resolve artifact paths with `comet-classic/reference/classic-layout.md` and follow “CLI Bootstrap” in `comet-classic/reference/scripts.md`. Use the public Comet CLI and its OpenSpec adapter. Read only sections needed for the current action; reuse valid instructions already in context.
 
 - When Classic was not explicitly invoked and existing work may need to resume: read Ambient Resume in `comet-classic/reference/context-recovery.md` and follow `comet resume-probe . --stdin --json`. Only `auto_resume` enters automatically; for `ask_user` ask by `reason` using the Ambient Resume table's question and options; `out_of_scope`/`none` does not enter.
 - When starting a new request or the target change is unclear: read the minimal example and target-selection rules in `comet-classic/reference/intent-frame.md`. List active changes, fill a CometIntentFrame, and run `comet classic intent route --stdin`. The Agent extracts intent fields from evidence; Runtime computes the route. Follow its result without inventing a separate set of prose scoring rules.
-- When the target change is explicit and Runtime has initialized it, bind its workspace below. New SDK changes use `comet-state.yaml`; historical `.comet.yaml` files are read and written in place, and compat initialization still uses the old name. Use Runtime ownership returned by `state next`, not the mere presence of the state file, to choose the recovery path. Do not bind early when several active changes exist and none has been selected. A genuinely new change goes to `/comet-open` or the matching preset Skill, which prepares the workspace before initializing; `workspace resolve` reports not-found for an uninitialized change.
+- When the target change is explicit and Runtime has initialized it, bind its workspace below. New SDK changes use `comet-state.yaml`; historical `.comet.yaml` files are read and written in place, and compat initialization still uses the old name. Use Runtime ownership returned by `state next`, not the mere presence of the state file, to choose the recovery path. Bind only after selecting among active changes. A new change goes to `/comet-open` or the matching preset Skill, which prepares the workspace before initializing; `workspace resolve` reports not-found for an uninitialized change.
 
 ```bash
 comet classic workspace resolve <change-name> --json
@@ -23,27 +23,27 @@ comet classic workspace resolve <change-name> --json
 comet state select <change-name> --json
 ```
 
-If both `comet-state.yaml` and `.comet.yaml` exist for the same change, including a dangling symlink, stop, preserve both, and check their origins. Do not silently choose one, overwrite either, or rename them automatically.
+If both `comet-state.yaml` and `.comet.yaml` exist, including dangling symlinks, stop, preserve both, and check their origins; never silently select, overwrite, or rename either.
 
-Continue directly when the selection response contains current Runtime ownership, phase, revision, and nextAction. Run `comet state next <change-name> --json` only for missing information, external state changes, or an expired response.
+Continue from selection when it supplies Runtime ownership, phase, revision, and nextAction. Run `comet state next <change-name> --json` only for missing information, external changes, or an expired response.
 
-Transfer the actual state file, change documents, referenced artifacts, code, and project configuration together. A checkpoint does not include separate child worktrees or uncommitted code. For a copied SDK change whose actual state file contains `run_checkpoint`, named `state select` or `state next` restores the saved phase, Actions, and approvals. Confirm the original device's execution process has stopped before continuing external work. Reconcile an Action with an unknown outcome before retrying it. Only when an older state file has no checkpoint and the normal entry explicitly reports missing Run history, inspect the formal documents, explain that explicit restoration returns to Open and requires fresh approvals and checks, and obtain the user's consent before running `comet state restore <change-name> --confirmed`.
+Transfer the actual state file, change documents, referenced artifacts, code, and project configuration together; checkpoints omit separate child worktrees and uncommitted code. For a copied SDK change with `run_checkpoint`, named `state select` or `state next` restores its saved phase, Actions, and approvals. Confirm the original device's execution stopped before continuing external work; reconcile unknown outcomes before retrying. Only if an older state has no checkpoint and the entry reports missing Run history, inspect formal documents, explain that restoration returns to Open and needs fresh approvals/checks, and obtain consent before `comet state restore <change-name> --confirmed`.
 
-When the response already includes `agent.continuation.mode`, first follow the shared rules in `comet-classic/reference/auto-transition.md`. Use `mode` to execute, wait, ask, reconcile, or finish; the `nextAction.kind` routing below is only for older responses without `mode`.
+When `agent.continuation.mode` exists, follow `comet-classic/reference/auto-transition.md`: execute, wait, ask, reconcile, or finish. Use `nextAction.kind` below only for older responses without `mode`.
 
-Use `data.runtimeFormat` to distinguish `sdk` from `compat`, then follow the returned phase, configuration, and `data.nextAction.kind`. Only an SDK `action` loads the returned Skill. For `decision`, `evidence`, or `reconcile`, first resolve the current Run's decision, evidence, or claimed Action; never replay it as a fresh Skill action. Keep the original routing for compat changes. Send a new full change to `/comet-open`, which prepares the workspace, creates OpenSpec artifacts, and initializes an SDK Run. Send confirmed hotfix/tweak choices to their preset Skills. Do not call `/opsx:new` directly. On ownership conflicts or malformed state, follow “Entry Errors and Recovery” in context-recovery.md and stop; do not infer phase from artifacts or create another state record.
+Use `data.runtimeFormat` (`sdk` or `compat`), phase, configuration, and `data.nextAction.kind`. Only an SDK `action` loads the returned Skill. For `decision`, `evidence`, or `reconcile`, first resolve the current Run's decision, evidence, or claimed Action; never replay it as a fresh Skill action. Keep the original routing for compat changes. Send a new full change to `/comet-open`, which prepares the workspace, creates OpenSpec artifacts, and initializes an SDK Run. Send confirmed hotfix/tweak choices to their preset Skills. Do not call `/opsx:new` directly. On ownership conflicts or malformed state, follow “Entry Errors and Recovery” in context-recovery.md and stop; do not infer phase from artifacts or create another state record.
 
-A new full change must have its workspace selected before Open creates artifacts. Full-workflow `isolation` may be `current`, `branch`, or `worktree`; prepare a Worktree for explicit parallel-work requests, and otherwise follow `comet-classic/reference/workspace.md`. Hotfix/tweak confirm and bind workspaces during their own initialization. Resume in the bound workspace. If branch ownership has changed, rebind according to the user's confirmed choice; ask only when valid authorization is missing.
+Select a new full change's workspace before Open creates artifacts. Full-workflow `isolation` may be `current`, `branch`, or `worktree`; use Worktree for explicit parallel work, otherwise follow `comet-classic/reference/workspace.md`. Hotfix/tweak bind workspaces during initialization. Resume in the bound workspace; rebind changed branch ownership according to existing user authorization, asking only if it is missing.
 
 ## 2. Load the Current Phase
 
-Reuse command results and context for the same tasks. Continue from returned state and `agent.continuation`; query only for missing fields, workspace changes, lost context on recovery, or external changes. Select checks by risk; Verify owns one final integrated review of the completed implementation.
+Reuse results and context for the same tasks. Follow returned state and `agent.continuation`; query only for missing fields, workspace or external changes, or lost recovery context. Choose checks by risk; Verify owns the final integrated review.
 
-After binding the workspace and phase, and on phase changes, Agent handoffs or context recovery, follow [Task Context and Artifact Language](reference/scripts.md#task-context-and-artifact-language). Use the continuation or claimed Action's `contextRequest` for a snapshot once per entry or recovery. Use the configured artifact language and expand only missing Context Manifest content. Report actual usage outcomes and save a checkpoint at task end.
+On workspace/phase entry, phase changes, Agent handoff or recovery, follow [Task Context and Artifact Language](reference/scripts.md#task-context-and-artifact-language). Take one snapshot using the continuation or claimed Action's `contextRequest`; use the configured artifact language and expand only missing Context Manifest content. Report actual usage outcomes and save a checkpoint at task end.
 
-Memory learning submits only reusable user information; never save task summaries, progress, command output, or test results as Personal Memory. Complete the learning check in the task context reference before task completion and record `submitted`, `no-observation`, or `not-run`.
+Before completion, record the task-context learning check as `submitted`, `no-observation`, or `not-run`. Personal Memory stores reusable user information, never task summaries, progress, command output, or test results.
 
-Project experience and personal preferences are stored separately: before task completion, write project-validated and reusable experience to Project Memory with `comet knowledge remember`; only user preferences and stable collaboration habits go to Personal Memory. See [Task Context and Artifact Language](reference/scripts.md#task-context-and-artifact-language) for the commands and filtering rules.
+Save validated project experience with `comet knowledge remember`. Project experience and personal preferences are stored separately; Personal Memory holds user preferences and stable collaboration habits. Commands and filtering rules: [Task Context and Artifact Language](reference/scripts.md#task-context-and-artifact-language).
 
 | Runtime route or phase        | Entry and responsibility                                                                                        |
 | ----------------------------- | --------------------------------------------------------------------------------------------------------------- |
@@ -55,6 +55,16 @@ Project experience and personal preferences are stored separately: before task c
 | verify                        | `/comet-verify`: run acceptance checks, reverify repairs, and perform the only final integrated review          |
 | archive / verify_result: pass | `/comet-archive`: confirm archiving, commit only this change's files, and complete the selected delivery method |
 
+The corresponding Skill performs phase work; load it before authoring artifacts, calling OpenSpec, or advancing. Resolve `decision`, `evidence`, and `reconcile` on the current Run without repeating phase work.
+
+For new full / Open, or an Action specifying `comet-open`:
+
+**Immediately execute:** Use the Skill tool to load the comet-open skill. Skipping this step is prohibited.
+
+For an Action specifying `comet-design`:
+
+**Immediately execute:** Use the Skill tool to load the comet-design skill. Skipping this step is prohibited.
+
 Recommend a lightweight workflow only for a new request. Enter directly when its risk fits the preset and the user has explicitly selected it. When the Agent makes the recommendation, explain why, present hotfix/tweak and full with their effects, and wait for confirmation. Never silently downgrade an existing full change. Assess public APIs, data migrations, security, concurrency, and cross-module design by their actual risks; a small file count does not waive necessary steps.
 
 For hotfix/tweak, SDK must read and follow [Preset scope](reference/sdk-methods.md#preset-scope) and reuse valid `rulings.md` authorization; Compat follows the chosen preset's `reference/compat.md`. Review scope when only file count exceeds the threshold, asking only when a new decision is needed. Upgrade after the user's choice, using the Run continuation or matching Compat command. Use `verify_mode` for verification depth; keep workflow and escalation decisions separate.
@@ -65,10 +75,10 @@ On session recovery, external changes, or discrepancies between actual work and 
 
 After phase exit checks pass, follow `comet-classic/reference/auto-transition.md`: read `agent.continuation` from the successful result and load only its next Skill. Query again only when reusable state is unavailable, session recovery lacks context, or external state changes. `auto_transition: false` controls the next Skill invocation, not the phase already advanced by Guard. For `NEXT: manual`, show HINT and end the invocation without adding a confirmation question.
 
-Decision points block dependent work until the user answers explicitly. Before the first clarification or confirmation, read `comet-classic/reference/decision-point.md` and follow its options, recommendation reasons, per-option effects, and `AskUserQuestion` priority. Reuse it when already in context. Automatic handoff or a single recommended solution cannot skip these confirmations:
+First check existing approval, delegated authority, and the user's requested confirmation method. Wait for an explicit answer when a new decision is needed. Before the first clarification or confirmation, read `comet-classic/reference/decision-point.md` and follow its options, recommendation reasons, per-option effects, and `AskUserQuestion` priority. Reuse it when already in context. Check authorization for the following matters under that protocol. Continue when existing authority still covers them; ask only when a new decision is needed:
 
 - If the target change, PRD split, or workspace isolation still needs a choice, ask related questions together and wait.
-- At the end of Open, obtain final confirmation of the name, scope, and artifacts. After Design develops a proposal, obtain confirmation of the formal design. In both cases, present a reviewable result before waiting for approval or requested adjustments.
+- At the end of Open, obtain final confirmation of the name, scope, and artifacts. After Design develops a proposal, obtain confirmation of the formal design. In both cases, check current content against existing authority. Present a reviewable result and wait when a user decision is needed.
 - Before Build writes a plan, ask about execution/TDD/review configuration only when it is missing or the user requests a change. After a user-requested `plan-ready` pause, wait for an explicit instruction to continue.
 - In Verify, ask when accepting deviations, resolving implementation/Spec disagreement, or choosing how to proceed after the automatic-repair limit. In Archive, confirm archiving and the delivery method.
 - Ask when upgrading a preset to the full workflow, or when Build needs to expand scope, redesign, or split a change.

@@ -1,3 +1,9 @@
+import {
+  nativeShapeArtifactSnapshot,
+  nativeShapeArtifactContractHash,
+  type NativeShapeSemanticSnapshot,
+} from './native-shape-semantics.js';
+import { nativeShapeReviewAnchorMatches } from './native-shape-review-evidence.js';
 import { createHash, randomUUID } from 'node:crypto';
 import {
   nativeLegacyArchiveGitStatus,
@@ -16,8 +22,12 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   parseGitStatusPaths,
+  parseGitStatusUntrackedPaths,
   readGitStatusPorcelain,
+  readGitStatusPorcelainAsync,
+  readGitStatusObservationAsync,
   runGitCommand,
+  runGitCommandAsync,
   readGitBlobs,
 } from '../../platform/process/git.js';
 import {
@@ -83,7 +93,10 @@ import {
   readNativePortableChange,
   writePortableMutation,
 } from './native-portable-storage.js';
-import { ensureNativePortableAcceptanceCurrentLocked } from './native-portable-requirements.js';
+import {
+  ensureNativePortableAcceptanceCurrentLocked,
+  readNativeApprovedShapeSemanticSnapshot,
+} from './native-portable-requirements.js';
 import { readNativeBoundedTextFile } from './native-bounded-file.js';
 import {
   nativeSourceCommentFingerprint,
@@ -332,10 +345,6 @@ export async function digestNativeInputFileContent(
   return { digest: hash.digest('hex'), size: total };
 }
 
-const NATIVE_IGNORED_INPUT_MAX_FILES = 20_000;
-
-const NATIVE_IGNORED_INPUT_MAX_TOTAL_BYTES = 1024 * 1024 * 1024;
-
 /**
  * Chunk size for streamed base64 digests. It must stay divisible by 3 so that
  * concatenating per-chunk base64 output equals base64-encoding the whole file,
@@ -365,7 +374,40 @@ interface NativeIgnoredInputFile {
 interface NativeIgnoredInputSnapshot {
   complete: boolean;
   files: NativeIgnoredInputFile[];
+  diagnostic?: string;
 }
+
+export interface NativeCheckInputSnapshot {
+  /** 环境敏感的执行摘要，仅用于决定是否复用检查。 */
+  fingerprint: string;
+  /** 检查实际读取的候选和文件内容，复核时不绑定提交命令的 shell。 */
+  contentFingerprint: string;
+  generatedInputFingerprint: string;
+  complete: boolean;
+  diagnostics: string[];
+}
+
+const NATIVE_DEPENDENCY_INPUT_DIRECTORIES = new Set([
+  'node_modules',
+  'vendor',
+  '.venv',
+  'venv',
+  '.pnpm',
+  '.pnpm-store',
+]);
+
+const NATIVE_PROJECT_INPUT_MANIFESTS = new Set([
+  'package.json',
+  'pyproject.toml',
+  'Cargo.toml',
+  'go.mod',
+  'pom.xml',
+  'build.gradle',
+  'build.gradle.kts',
+  'tsconfig.json',
+]);
+
+const NATIVE_WORKTREE_INPUT_DIRECTORIES = new Set(['.worktrees']);
 
 const NATIVE_PHYSICAL_INPUT_EXCLUDED_DIRECTORIES = new Set([
   '.agents',
@@ -383,7 +425,6 @@ const NATIVE_PHYSICAL_INPUT_EXCLUDED_DIRECTORIES = new Set([
   '.tmp',
   '.turbo',
   '.vscode',
-  '.worktrees',
   'coverage',
   'logs',
   'node_modules',
@@ -407,15 +448,22 @@ const NATIVE_RUNTIME_MANAGED_FILES = new Set([
   'verification.md',
 ]);
 
-function nativeRuntimeInputExclusions(projectRoot: string, managedArtifactRoot?: string): string[] {
-  if (!managedArtifactRoot) return [...NATIVE_RUNTIME_INPUT_EXCLUSIONS];
+function nativeOwnedInputExclusions(projectRoot: string, managedArtifactRoot?: string): string[] {
+  const exclusions = [
+    ...NATIVE_RUNTIME_INPUT_EXCLUSIONS,
+    ...[...NATIVE_WORKTREE_INPUT_DIRECTORIES].flatMap((directory) => [
+      `:(exclude,glob)${directory}`,
+      `:(exclude,glob)${directory}/**`,
+    ]),
+  ];
+  if (!managedArtifactRoot) return exclusions;
   const artifactRef = path.relative(projectRoot, managedArtifactRoot).replaceAll('\\', '/');
   if (path.isAbsolute(artifactRef) || artifactRef === '..' || artifactRef.startsWith('../')) {
-    return [...NATIVE_RUNTIME_INPUT_EXCLUSIONS];
+    return exclusions;
   }
   const prefix = artifactRef === '' ? '' : `${artifactRef}/`;
   return [
-    ...NATIVE_RUNTIME_INPUT_EXCLUSIONS,
+    ...exclusions,
     ...['changes', 'archive'].flatMap((directory) =>
       [...NATIVE_RUNTIME_MANAGED_FILES].map(
         (file) => `:(exclude)${prefix}comet/${directory}/**/${file}`,
@@ -424,13 +472,14 @@ function nativeRuntimeInputExclusions(projectRoot: string, managedArtifactRoot?:
   ];
 }
 
-function isNativeRuntimeInputPath(
+function isNativeOwnedInputPath(
   relative: string,
   projectRoot?: string,
   managedArtifactRoot?: string,
 ): boolean {
   const normalized = relative.replaceAll('\\', '/').replace(/^\.\//u, '');
   if (
+    NATIVE_WORKTREE_INPUT_DIRECTORIES.has(normalized.split('/')[0]) ||
     normalized === '.comet/current-change.json' ||
     normalized === '.comet/runtime' ||
     normalized.startsWith('.comet/runtime/')
@@ -460,20 +509,132 @@ function isNativeRuntimeInputPath(
   );
 }
 
-function incompleteNativeIgnoredInputSnapshot(): NativeIgnoredInputSnapshot {
-  return { complete: false, files: [] };
+function incompleteNativeIgnoredInputSnapshot(diagnostic: string): NativeIgnoredInputSnapshot {
+  return { complete: false, files: [], diagnostic };
 }
 
-function nativeGeneratedInputPathspecs(cwdRef: string): string[] {
+function nativeGeneratedInputExclusions(cwdRef: string): string[] {
   const prefix = cwdRef === '.' ? '' : `${cwdRef}/`;
-  return NATIVE_GENERATED_INPUT_DIRECTORIES.flatMap((directory) => [
-    `:(glob)${prefix}${directory}/**`,
-    `:(glob)${prefix}**/${directory}/**`,
+  return ['cache', 'trace', 'trace-build', 'dev'].flatMap((name) => [
+    `:(exclude,glob)${prefix}.next/${name}`,
+    `:(exclude,glob)${prefix}.next/${name}/**`,
   ]);
 }
 
-function sensitiveNativeIgnoredInputPath(relative: string): boolean {
-  return /(?:^|\/)(?:\.env(?:\..*)?|[^/]+\.(?:key|pem|p12|pfx))$/iu.test(relative);
+// Git can return a nested repository directory even when it does not match an
+// inclusive pathspec. Only the declared generated-input roots belong here;
+// non-regular entries within those roots must still fail the complete snapshot.
+function isNativeGeneratedInputPath(relative: string, cwdRefs: readonly string[]): boolean {
+  if (isNativeNextVolatileInputPath(relative)) return false;
+  return cwdRefs.some((cwdRef) => {
+    const prefix = cwdRef === '.' ? '' : `${cwdRef}/`;
+    return NATIVE_GENERATED_INPUT_DIRECTORIES.some((directory) =>
+      relative.startsWith(`${prefix}${directory}/`),
+    );
+  });
+}
+
+function isNativeNextVolatileInputPath(relative: string): boolean {
+  const parts = relative.split('/');
+  const next = parts.lastIndexOf('.next');
+  if (next < 0) return false;
+  const [entry, child] = parts.slice(next + 1);
+  return (
+    entry === 'cache' ||
+    entry === 'trace' ||
+    entry === 'trace-build' ||
+    (entry === 'dev' && child !== undefined && child !== 'types')
+  );
+}
+
+async function nativeGeneratedInputRoots(
+  projectRoot: string,
+  plans: readonly NativeCheckPlan[],
+  stagedIndex: string,
+  ignoredEntries: string,
+): Promise<{ cwdRefs: string[]; discovery: Map<string, string> }> {
+  const roots = new Set(['.', ...plans.map(({ cwdRef }) => cwdRef)]);
+  const discovery = new Map<string, string>();
+  const visit = async (relative: string): Promise<void> => {
+    const parts = relative.split('/').filter(Boolean);
+    if (
+      parts.some(
+        (part) =>
+          NATIVE_DEPENDENCY_INPUT_DIRECTORIES.has(part) ||
+          NATIVE_WORKTREE_INPUT_DIRECTORIES.has(part) ||
+          (NATIVE_PHYSICAL_INPUT_EXCLUDED_DIRECTORIES.has(part) &&
+            !NATIVE_GENERATED_INPUT_DIRECTORIES.includes(
+              part as (typeof NATIVE_GENERATED_INPUT_DIRECTORIES)[number],
+            )),
+      )
+    )
+      return;
+    if (isNativeOwnedInputPath(relative, projectRoot)) return;
+    const generated = parts.findIndex((part) =>
+      NATIVE_GENERATED_INPUT_DIRECTORIES.includes(
+        part as (typeof NATIVE_GENERATED_INPUT_DIRECTORIES)[number],
+      ),
+    );
+    if (generated !== -1) {
+      roots.add(parts.slice(0, generated).join('/') || '.');
+      return;
+    }
+    const target = path.resolve(projectRoot, ...parts);
+    const stat = await fs.lstat(target);
+    if (stat.isSymbolicLink()) throw new Error('Generated input discovery contains a link');
+    if (!stat.isDirectory()) return;
+    discovery.set(target, `${stat.dev}:${stat.ino}:${stat.mtimeMs}:${stat.ctimeMs}`);
+    const directory = await fs.opendir(target);
+    for await (const entry of directory) {
+      if (entry.isDirectory() || entry.isSymbolicLink()) await visit(`${relative}/${entry.name}`);
+    }
+  };
+  // 已跟踪的项目清单覆盖 monorepo 子项目，不扫描 node_modules 寻找项目。
+  for (const entry of stagedIndex.split('\0')) {
+    const relative = entry.slice(entry.indexOf('\t') + 1);
+    if (!NATIVE_PROJECT_INPUT_MANIFESTS.has(path.posix.basename(relative))) continue;
+    if (relative.split('/').some((part) => NATIVE_DEPENDENCY_INPUT_DIRECTORIES.has(part))) continue;
+    roots.add(path.posix.dirname(relative));
+  }
+  // --directory collapses ignored dependency trees to one entry. Discover
+  // generated roots from those entries without asking Git to descend into
+  // node_modules with a recursive **/dist pathspec.
+  for (const entry of ignoredEntries.split('\0')) {
+    const parts = entry.replaceAll('\\', '/').split('/').filter(Boolean);
+    for (let index = 0; index < parts.length; index += 1) {
+      if (
+        NATIVE_DEPENDENCY_INPUT_DIRECTORIES.has(parts[index]) ||
+        NATIVE_WORKTREE_INPUT_DIRECTORIES.has(parts[index])
+      )
+        break;
+      if (
+        NATIVE_GENERATED_INPUT_DIRECTORIES.includes(
+          parts[index] as (typeof NATIVE_GENERATED_INPUT_DIRECTORIES)[number],
+        )
+      )
+        roots.add(parts.slice(0, index).join('/') || '.');
+    }
+    if (entry.endsWith('/')) await visit(entry.replace(/\/$/u, ''));
+  }
+  return { cwdRefs: [...roots].sort(), discovery };
+}
+
+/** 一次读取提交和分支；保持既有摘要的字段和值。 */
+function nativeGitHead(projectRoot: string): { head: string; branch: string } {
+  const [head, ref] = runGitCommand(projectRoot, [
+    'rev-parse',
+    'HEAD',
+    '--symbolic-full-name',
+    'HEAD',
+  ]).split(/\r?\n/u);
+  if (!head || !/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/u.test(head) || !ref)
+    throw new Error('Native 检查输入中的 Git HEAD 无效');
+  return { head, branch: ref.startsWith('refs/heads/') ? ref.slice('refs/heads/'.length) : '' };
+}
+
+/** 等待所有探测结束再返回失败，避免残留查询占用工作区。 */
+async function nativeGitQueries(projectRoot: string, commands: readonly (readonly string[])[]) {
+  return mapWithConcurrency(commands, 4, (args) => runGitCommandAsync(projectRoot, args));
 }
 
 async function nativeIgnoredCheckInputSnapshot(
@@ -481,57 +642,195 @@ async function nativeIgnoredCheckInputSnapshot(
   plans: readonly NativeCheckPlan[],
   managedArtifactRoot?: string,
   runnerInputs: ReadonlySet<string> = new Set(),
+  stagedIndex = '',
+  repositories = new Set<string>(),
 ): Promise<NativeIgnoredInputSnapshot> {
-  const cwdRefs = [...new Set(plans.length ? plans.map(({ cwdRef }) => cwdRef) : ['.'])];
-  if (cwdRefs.length === 0) return { complete: true, files: [] };
-
   let ignoredPaths: string[];
+  let realRoot: string;
   try {
-    ignoredPaths = [
-      ...new Set(
-        runGitCommand(projectRoot, [
+    realRoot = await fs.realpath(projectRoot);
+    if (repositories.has(realRoot))
+      return incompleteNativeIgnoredInputSnapshot('项目生成输入包含重复的子仓库路径');
+    repositories.add(realRoot);
+    const ignoredEntries = runGitCommand(projectRoot, [
+      'ls-files',
+      '--others',
+      '--ignored',
+      '--exclude-standard',
+      '--directory',
+      '-z',
+    ]);
+    const { cwdRefs, discovery } = await nativeGeneratedInputRoots(
+      projectRoot,
+      plans,
+      stagedIndex,
+      ignoredEntries,
+    );
+    const selections: Array<{ ref: string; exclusions: string[] }> = [];
+    const roots = new Map<string, string | null>();
+    const rootStamp = (info: import('node:fs').Stats) =>
+      `${info.dev}:${info.ino}:${info.birthtimeMs}:${info.mode}`;
+    for (const cwdRef of cwdRefs) {
+      for (const directory of [
+        ...NATIVE_GENERATED_INPUT_DIRECTORIES,
+        '.next/types',
+        '.next/dev/types',
+      ]) {
+        const ref = cwdRef === '.' ? directory : `${cwdRef}/${directory}`;
+        const target = path.resolve(projectRoot, ...ref.split('/'));
+        try {
+          const info = await fs.lstat(target);
+          roots.set(target, rootStamp(info));
+          if (
+            info.isSymbolicLink() ||
+            (await fs.realpath(target)) !== path.resolve(realRoot, ...ref.split('/'))
+          ) {
+            return incompleteNativeIgnoredInputSnapshot(
+              `项目生成输入目录包含链接或超出工作区：${ref}`,
+            );
+          }
+          if (directory !== '.next/types')
+            selections.push({
+              ref,
+              exclusions:
+                directory === '.next/dev/types' ? [] : nativeGeneratedInputExclusions(cwdRef),
+            });
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+          roots.set(target, null);
+        }
+      }
+    }
+    const dependencyExclusions = [...NATIVE_DEPENDENCY_INPUT_DIRECTORIES].map(
+      (directory) => `:(exclude,glob)**/${directory}/**`,
+    );
+    // 多个 glob 路径会让 Git 进入无关的 ignored 依赖和本地工作区。
+    // 每次只选择一个实际存在的字面目录；并行查询仍受统一上限约束。
+    const selected = (
+      await nativeGitQueries(
+        projectRoot,
+        selections.map(({ ref, exclusions }) => [
           'ls-files',
           '--others',
           '--ignored',
           '--exclude-standard',
           '-z',
           '--',
-          ...cwdRefs.flatMap(nativeGeneratedInputPathspecs),
-        ])
+          `:(literal)${ref}/`,
+          ...exclusions,
+          ...dependencyExclusions,
+          ...nativeOwnedInputExclusions(projectRoot, managedArtifactRoot),
+          ...[...runnerInputs].map((relative) => `:(exclude,literal)${relative}`),
+        ]),
+      )
+    ).join('\0');
+    for (const [directory, before] of discovery) {
+      const stat = await fs.lstat(directory);
+      if (`${stat.dev}:${stat.ino}:${stat.mtimeMs}:${stat.ctimeMs}` !== before)
+        return incompleteNativeIgnoredInputSnapshot('项目生成输入的父目录在采样期间发生变化');
+    }
+    // 只复查根的存在与身份；Next cache/trace 等已排除内容可改变目录时间。
+    for (const [target, before] of roots) {
+      const after = await fs
+        .lstat(target)
+        .then(rootStamp)
+        .catch((error: NodeJS.ErrnoException) => {
+          if (error.code === 'ENOENT') return null;
+          throw error;
+        });
+      if (after !== before)
+        return incompleteNativeIgnoredInputSnapshot('项目生成输入目录在采样期间发生变化');
+    }
+    ignoredPaths = [
+      ...new Set(
+        selected
           .split('\0')
           .filter(Boolean)
-          .map((relative) => relative.replaceAll('\\', '/')),
+          .map((relative) => relative.replaceAll('\\', '/'))
+          .filter(
+            (relative) =>
+              isNativeGeneratedInputPath(relative, cwdRefs) &&
+              !runnerInputs.has(relative) &&
+              !isNativeOwnedInputPath(relative, projectRoot, managedArtifactRoot),
+          ),
       ),
     ].sort();
   } catch {
-    return incompleteNativeIgnoredInputSnapshot();
+    return incompleteNativeIgnoredInputSnapshot('无法列出项目生成输入；本次检查不能复用旧证据');
   }
-  if (ignoredPaths.length > NATIVE_IGNORED_INPUT_MAX_FILES) {
-    return incompleteNativeIgnoredInputSnapshot();
-  }
-
   const files: NativeIgnoredInputFile[] = [];
-  let totalBytes = 0;
   for (const relative of ignoredPaths) {
     if (runnerInputs.has(relative)) continue;
-    if (isNativeRuntimeInputPath(relative, projectRoot, managedArtifactRoot)) continue;
+    if (isNativeOwnedInputPath(relative, projectRoot, managedArtifactRoot)) continue;
     const target = path.resolve(projectRoot, ...relative.split('/'));
-    if (!isInsidePath(projectRoot, target) || sensitiveNativeIgnoredInputPath(relative)) {
-      return incompleteNativeIgnoredInputSnapshot();
+    if (!isInsidePath(projectRoot, target)) {
+      return incompleteNativeIgnoredInputSnapshot(`项目生成输入超出工作区：${relative}`);
     }
     try {
+      const realTarget = await fs.realpath(target);
+      if (
+        !isInsidePath(realRoot, realTarget) ||
+        realTarget !== path.resolve(realRoot, ...relative.split('/'))
+      ) {
+        return incompleteNativeIgnoredInputSnapshot(
+          `项目生成输入路径包含链接或超出工作区：${relative}`,
+        );
+      }
       const before = await fs.lstat(target);
-      if (!before.isFile() || totalBytes + before.size > NATIVE_IGNORED_INPUT_MAX_TOTAL_BYTES) {
-        return incompleteNativeIgnoredInputSnapshot();
+      if (!before.isFile()) {
+        return incompleteNativeIgnoredInputSnapshot(`项目生成输入不是普通文件：${relative}`);
       }
       const { digest, size } = await digestNativeInputFileContent(target);
-      totalBytes += size;
       files.push({ path: relative, digest, size });
     } catch {
-      return incompleteNativeIgnoredInputSnapshot();
+      return incompleteNativeIgnoredInputSnapshot(`项目生成输入无法稳定读取：${relative}`);
     }
   }
-  return { complete: true, files };
+  // 父仓 ls-files 不进入 gitlink；每个子仓必须按自己的 ignore 规则收集生成输入。
+  for (const [relative] of parseGitlinksInIndex(stagedIndex)) {
+    if (relative.split('/').some((part) => NATIVE_DEPENDENCY_INPUT_DIRECTORIES.has(part))) continue;
+    try {
+      const child = path.resolve(projectRoot, ...relative.split('/'));
+      const info = await fs.lstat(child);
+      const realChild = await fs.realpath(child);
+      if (
+        !info.isDirectory() ||
+        info.isSymbolicLink() ||
+        realChild !== path.resolve(realRoot, ...relative.split('/')) ||
+        !isInsidePath(realRoot, realChild) ||
+        (await fs.realpath(runGitCommand(child, ['rev-parse', '--show-toplevel']))) !== realChild
+      )
+        return incompleteNativeIgnoredInputSnapshot(`项目生成输入子仓库不可用：${relative}`);
+      const childPlans = plans.flatMap((plan) => {
+        const cwdRef = path.posix.relative(relative, plan.cwdRef);
+        return cwdRef === '..' || cwdRef.startsWith('../') || path.posix.isAbsolute(cwdRef)
+          ? []
+          : [{ ...plan, cwdRef: cwdRef || '.' }];
+      });
+      const childInputs = new Set(
+        [...runnerInputs]
+          .filter((ref) => ref.startsWith(`${relative}/`))
+          .map((ref) => ref.slice(relative.length + 1)),
+      );
+      const snapshot = await nativeIgnoredCheckInputSnapshot(
+        child,
+        childPlans,
+        managedArtifactRoot,
+        childInputs,
+        runGitCommand(child, ['ls-files', '--stage', '-z']),
+        repositories,
+      );
+      if (!snapshot.complete)
+        return incompleteNativeIgnoredInputSnapshot(`子仓库 ${relative}：${snapshot.diagnostic}`);
+      files.push(...snapshot.files.map((file) => ({ ...file, path: `${relative}/${file.path}` })));
+    } catch {
+      return incompleteNativeIgnoredInputSnapshot(`无法完整读取子仓库生成输入：${relative}`);
+    }
+  }
+  return {
+    complete: true,
+    files: files.sort((left, right) => left.path.localeCompare(right.path, 'en')),
+  };
 }
 
 async function nativePhysicalCheckInputSnapshot(
@@ -539,10 +838,17 @@ async function nativePhysicalCheckInputSnapshot(
   plans: readonly NativeCheckPlan[],
   managedArtifactRoot?: string,
   runnerInputs: ReadonlySet<string> = new Set(),
+  kind: 'check' | 'candidate' = 'check',
 ): Promise<NativeIgnoredInputSnapshot> {
-  const cwdRefs = [...new Set(plans.length ? plans.map(({ cwdRef }) => cwdRef) : ['.'])];
+  // 根配置和 lockfile 也可影响子目录内的检查。
+  const cwdRefs = ['.'];
+  void plans;
   const files = new Map<string, NativeIgnoredInputFile>();
-  let totalBytes = 0;
+  let diagnostic = '';
+  const unreadable = (relative: string, reason: string): false => {
+    diagnostic = `工作区输入无法完整读取：${relative || '.'}（${reason}）`;
+    return false;
+  };
   const isGeneratedDirectory = (name: string): boolean =>
     NATIVE_GENERATED_INPUT_DIRECTORIES.includes(
       name as (typeof NATIVE_GENERATED_INPUT_DIRECTORIES)[number],
@@ -557,17 +863,25 @@ async function nativePhysicalCheckInputSnapshot(
     try {
       entries = await fs.readdir(directory, { withFileTypes: true });
     } catch {
-      return false;
+      return unreadable(relativeDirectory, '无法列出目录');
     }
     entries.sort((left, right) => left.name.localeCompare(right.name, 'en'));
     for (const entry of entries) {
       const relative = relativeDirectory ? `${relativeDirectory}/${entry.name}` : entry.name;
       if (runnerInputs.has(relative)) continue;
-      if (isNativeRuntimeInputPath(relative, projectRoot, managedArtifactRoot)) continue;
-      if (entry.isDirectory() && NATIVE_PHYSICAL_INPUT_EXCLUDED_DIRECTORIES.has(entry.name)) {
+      if (isNativeOwnedInputPath(relative, projectRoot, managedArtifactRoot)) continue;
+      const target = path.join(directory, entry.name);
+      if (kind === 'candidate' && isGeneratedDirectory(entry.name)) continue;
+      if (isNativeNextVolatileInputPath(relative)) continue;
+      if (
+        entry.isDirectory() &&
+        (NATIVE_DEPENDENCY_INPUT_DIRECTORIES.has(entry.name) ||
+          (!insideGeneratedDirectory &&
+            NATIVE_PHYSICAL_INPUT_EXCLUDED_DIRECTORIES.has(entry.name) &&
+            !isGeneratedDirectory(entry.name)))
+      ) {
         continue;
       }
-      const target = path.join(directory, entry.name);
       if (entry.isDirectory()) {
         if (
           !(await visit(
@@ -580,21 +894,17 @@ async function nativePhysicalCheckInputSnapshot(
         }
         continue;
       }
-      if (sensitiveNativeIgnoredInputPath(relative)) return false;
-      if (!entry.isFile()) return false;
+      // 候选绑定只保存内容摘要；不能根据文件名否决用户的项目输入。
+      if (!entry.isFile()) return unreadable(relative, '不是普通文件或包含链接');
       try {
-        const before = await fs.lstat(target);
-        if (totalBytes + before.size > NATIVE_IGNORED_INPUT_MAX_TOTAL_BYTES) return false;
         const { digest, size } = await digestNativeInputFileContent(target);
-        totalBytes += size;
         files.set(relative, {
           path: relative,
           digest,
           size,
         });
-        if (files.size > NATIVE_IGNORED_INPUT_MAX_FILES) return false;
       } catch {
-        return false;
+        return unreadable(relative, '文件无法读取或读取期间发生变化');
       }
     }
     return true;
@@ -606,7 +916,7 @@ async function nativePhysicalCheckInputSnapshot(
     if (
       !(await visit(directory, relativeDirectory, isGeneratedDirectory(path.basename(directory))))
     ) {
-      return incompleteNativeIgnoredInputSnapshot();
+      return incompleteNativeIgnoredInputSnapshot(diagnostic);
     }
   }
   return {
@@ -648,15 +958,125 @@ function nativeLocalCheckEvidenceDigest(
   });
 }
 
-export async function nativeCheckInputFingerprint(options: {
+async function nativeCheckWorkingTreeDigest(
+  projectRoot: string,
+  relative: string,
+): Promise<string> {
+  const target = path.resolve(projectRoot, ...relative.split('/'));
+  try {
+    return (await digestNativeInputFileContent(target)).digest;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      return digestNativeCheckInput('comet.native.check-input.missing');
+    }
+    throw error;
+  }
+}
+
+interface NativeCheckInputOptions {
   state: NativePortableState;
   projectRoot: string;
   plans: readonly NativeCheckPlan[];
   managedArtifactRoot?: string;
-}): Promise<string> {
+  /** Archive 材料另有内容绑定，仅从归档期间的生成输入摘要排除。 */
+  generatedInputExclusions?: readonly string[];
+}
+
+export async function nativeCheckInputFingerprint(
+  options: NativeCheckInputOptions,
+): Promise<string> {
+  return (await nativeCheckInputSnapshot(options)).fingerprint;
+}
+
+/** Archive 已分别绑定源码，只读取生成输入，避免每次复核再扫描完整源码树。 */
+export async function nativeGeneratedCheckInputSnapshot(options: NativeCheckInputOptions) {
   const runnerInputs = await nativeRunnerInputArtifactPaths(options.projectRoot);
   const exclusions = [
-    ...nativeRuntimeInputExclusions(options.projectRoot, options.managedArtifactRoot),
+    ...nativeOwnedInputExclusions(options.projectRoot, options.managedArtifactRoot),
+    ...[...runnerInputs].map((relative) => `:(exclude,literal)${relative}`),
+  ];
+  let ignored: NativeIgnoredInputSnapshot = { complete: true, files: [] };
+  let physical: NativeIgnoredInputSnapshot = { complete: true, files: [] };
+  let gitView = false;
+  try {
+    const indexArgs = ['ls-files', '--stage', '-z', '--', ...exclusions];
+    const listing = await runGitCommandAsync(options.projectRoot, [
+      'ls-files',
+      '--stage',
+      '--others',
+      '--exclude-standard',
+      '-t',
+      '-z',
+      '--',
+      ...exclusions,
+    ]);
+    gitView = true;
+    const indexed: string[] = [];
+    const others: string[] = [];
+    for (const entry of listing.split('\0').filter(Boolean)) {
+      if (entry.startsWith('? ')) others.push(entry.slice(2));
+      else if (/^[A-Z] [0-7]{6} [a-f0-9]{40}(?:[a-f0-9]{24})? [0-3]\t/su.test(entry))
+        indexed.push(entry.slice(2));
+      else return { complete: false, fingerprint: null };
+    }
+    const index = indexed.length ? indexed.join('\0') + '\0' : '';
+    const untracked = others.length ? others.join('\0') + '\0' : '';
+    ignored = await nativeIgnoredCheckInputSnapshot(
+      options.projectRoot,
+      options.plans,
+      options.managedArtifactRoot,
+      runnerInputs,
+      `${index}\0${untracked}`,
+    );
+    if (index !== runGitCommand(options.projectRoot, indexArgs))
+      return { complete: false, fingerprint: null };
+  } catch {
+    if (gitView) return { complete: false, fingerprint: null };
+    physical = await nativePhysicalCheckInputSnapshot(
+      options.projectRoot,
+      options.plans,
+      options.managedArtifactRoot,
+      runnerInputs,
+    );
+  }
+  return {
+    complete: ignored.complete && physical.complete,
+    fingerprint: generatedInputsFingerprint(ignored, physical, options.generatedInputExclusions),
+  };
+}
+
+function generatedInputsFingerprint(
+  ignored: NativeIgnoredInputSnapshot,
+  physical: NativeIgnoredInputSnapshot,
+  exclusions: readonly string[] = [],
+) {
+  const included = (ref: string) =>
+    !exclusions.some((excluded) => ref === excluded || ref.startsWith(`${excluded}/`));
+  return canonicalHash('comet.native.generated-inputs.v1', {
+    ignored: {
+      complete: ignored.complete,
+      files: ignored.files.filter(({ path: ref }) => included(ref)),
+    },
+    physical: physical.files.filter(
+      ({ path: ref }) =>
+        included(ref) &&
+        ref
+          .split('/')
+          .some((part) =>
+            NATIVE_GENERATED_INPUT_DIRECTORIES.includes(
+              part as (typeof NATIVE_GENERATED_INPUT_DIRECTORIES)[number],
+            ),
+          ),
+    ),
+  });
+}
+
+export async function nativeCheckInputSnapshot(
+  options: NativeCheckInputOptions,
+): Promise<NativeCheckInputSnapshot> {
+  const runnerInputs = await nativeRunnerInputArtifactPaths(options.projectRoot);
+  const exclusions = [
+    ...nativeOwnedInputExclusions(options.projectRoot, options.managedArtifactRoot),
     ...[...runnerInputs].map((relative) => `:(exclude,literal)${relative}`),
   ];
   const gitSnapshot = {
@@ -669,8 +1089,8 @@ export async function nativeCheckInputFingerprint(options: {
     stagedDiff: null as string | null,
     submodules: null as string | null,
     untracked: [] as Array<{ path: string; digest: string | null; size: number | null }>,
-    ignored: { complete: true, files: [] as NativeIgnoredInputFile[] },
-    physical: { complete: true, files: [] as NativeIgnoredInputFile[] },
+    ignored: { complete: true, files: [] } as NativeIgnoredInputSnapshot,
+    physical: { complete: true, files: [] } as NativeIgnoredInputSnapshot,
     // An incomplete snapshot is represented deterministically. The fast gate
     // below remains null in that case, which forces a fresh check execution;
     // adding a random nonce here would make every retry look like a source edit
@@ -678,38 +1098,62 @@ export async function nativeCheckInputFingerprint(options: {
     reuseNonce: null as string | null,
   };
   let stableGitView = false;
+  let submodulesQuery: Promise<string | null> | undefined;
   try {
-    gitSnapshot.head = runGitCommand(options.projectRoot, ['rev-parse', 'HEAD']);
+    const head = nativeGitHead(options.projectRoot);
+    gitSnapshot.head = head.head;
     stableGitView = true;
-    gitSnapshot.branch = runGitCommand(options.projectRoot, ['branch', '--show-current']);
-    gitSnapshot.status = runGitCommand(options.projectRoot, [
-      'status',
-      '--porcelain=v1',
-      '-z',
-      '--untracked-files=all',
-      '--ignore-submodules=none',
-      '--',
-      ...exclusions,
+    gitSnapshot.branch = head.branch;
+    // Staged content binds through index blob ids: `ls-files --stage` names each
+    // path with its object id, which Git already defines as the content hash.
+    const queries = await Promise.allSettled([
+      nativeGitQueries(options.projectRoot, [
+        ['ls-files', '--stage', '-z', '--', ...exclusions],
+        ['diff', '--name-only', '--ignore-submodules=none', '-z', 'HEAD', '--', ...exclusions],
+      ]),
+      readGitStatusPorcelainAsync(options.projectRoot, exclusions),
     ]);
+    const failure = queries.find((query) => query.status === 'rejected');
+    if (failure?.status === 'rejected') throw failure.reason;
+    const [stagedIndex, changedOutput] = (queries[0] as PromiseFulfilledResult<string[]>).value;
+    const status = (queries[1] as PromiseFulfilledResult<string>).value;
+    // 指纹保留历史 trim 行为；路径解析使用同次读取的完整原文。
+    gitSnapshot.status = status.trim();
+    gitSnapshot.stagedDiff = digestNativeCheckInput(stagedIndex);
+    gitSnapshot.submodules = '';
+    if (hasGitlinksInIndex(stagedIndex)) {
+      submodulesQuery = runGitCommandAsync(options.projectRoot, [
+        'submodule',
+        'status',
+        '--recursive',
+      ]).catch(() => {
+        // 聚合仓可以只有 gitlink 而没有 .gitmodules；实际子仓仍在下方逐一读取。
+        return null;
+      });
+    }
+    const gitlinks = new Map<string, string>();
+    const gitlinkBudget = { repositories: new Set<string>(), indexBytes: 0 };
+    for (const [relative] of parseGitlinksInIndex(stagedIndex)) {
+      try {
+        gitlinks.set(
+          relative,
+          (await readNativeCheckGitlink(options.projectRoot, relative, gitlinkBudget, 0, true))
+            .digest,
+        );
+      } catch {
+        gitSnapshot.complete = false;
+      }
+    }
     // The working-tree binding no longer digests a full `diff --binary` stream
     // (megabytes of patch text on large trees). HEAD is bound separately, so
     // naming the changed paths and hashing each one pins the same information:
     // any working-tree difference changes the path set or one of the digests.
-    const changed = runGitCommand(options.projectRoot, [
-      'diff',
-      '--name-only',
-      '-z',
-      'HEAD',
-      '--',
-      ...exclusions,
-    ])
-      .split('\0')
-      .filter(Boolean)
-      .sort();
+    const changed = changedOutput.split('\0').filter(Boolean).sort();
     gitSnapshot.diff = await mapWithConcurrency(changed, 16, async (relative) => {
-      const target = path.resolve(options.projectRoot, ...relative.split('/'));
       try {
-        const { digest } = await digestNativeInputFileContent(target);
+        const digest =
+          gitlinks.get(relative) ??
+          (await nativeCheckWorkingTreeDigest(options.projectRoot, relative));
         return { path: relative, digest };
       } catch {
         return { path: relative, digest: null };
@@ -718,30 +1162,7 @@ export async function nativeCheckInputFingerprint(options: {
     if (gitSnapshot.diff.some(({ digest }) => digest === null)) {
       gitSnapshot.complete = false;
     }
-    // Staged content binds through index blob ids: `ls-files --stage` names each
-    // path with its object id, which Git already defines as the content hash.
-    const stagedIndex = runGitCommand(options.projectRoot, [
-      'ls-files',
-      '--stage',
-      '-z',
-      '--',
-      ...exclusions,
-    ]);
-    gitSnapshot.stagedDiff = digestNativeCheckInput(stagedIndex);
-    gitSnapshot.submodules = hasGitlinksInIndex(stagedIndex)
-      ? runGitCommand(options.projectRoot, ['submodule', 'status', '--recursive'])
-      : '';
-    const untracked = runGitCommand(options.projectRoot, [
-      'ls-files',
-      '--others',
-      '--exclude-standard',
-      '-z',
-      '--',
-      ...exclusions,
-    ])
-      .split('\0')
-      .filter(Boolean)
-      .sort();
+    const untracked = parseGitStatusUntrackedPaths(status);
     gitSnapshot.untracked = await mapWithConcurrency(untracked, 16, async (relative) => {
       const target = path.resolve(options.projectRoot, ...relative.split('/'));
       try {
@@ -759,6 +1180,7 @@ export async function nativeCheckInputFingerprint(options: {
       options.plans,
       options.managedArtifactRoot,
       runnerInputs,
+      `${stagedIndex}\0${untracked.join('\0')}`,
     );
     if (!gitSnapshot.ignored.complete) {
       gitSnapshot.complete = false;
@@ -779,12 +1201,25 @@ export async function nativeCheckInputFingerprint(options: {
       gitSnapshot.complete = gitSnapshot.physical.complete;
     }
   }
-  return canonicalHash('comet.native.check-input.v1', {
+  if (submodulesQuery) gitSnapshot.submodules = await submodulesQuery;
+  const diagnostics = [gitSnapshot.ignored.diagnostic, gitSnapshot.physical.diagnostic].filter(
+    (entry): entry is string => Boolean(entry),
+  );
+  if (!gitSnapshot.complete && diagnostics.length === 0) {
+    diagnostics.push('工作区输入无法完整读取或在采样时发生变化；不能复用旧检查证据');
+  }
+  // 诊断不进入摘要；保留旧版完整收据的比较能力，不把提示文案当成输入。
+  delete gitSnapshot.ignored.diagnostic;
+  delete gitSnapshot.physical.diagnostic;
+  const content = {
     candidateId: options.state.builder_handoff?.candidate_id ?? null,
     shapeConfirmationHash: options.state.shape_confirmation_hash ?? null,
     acceptance: options.state.acceptance.map(({ id, source, text }) => ({ id, source, text })),
     git: gitSnapshot,
     projectRoot: path.resolve(options.projectRoot),
+  };
+  const fingerprint = canonicalHash('comet.native.check-input.v1', {
+    ...content,
     machineId: os.hostname(),
     execPath: process.execPath,
     node: process.version,
@@ -801,6 +1236,17 @@ export async function nativeCheckInputFingerprint(options: {
       .map(([key, value]) => [key, value ?? null] as const)
       .sort(([left], [right]) => left.localeCompare(right)),
   });
+  return {
+    fingerprint,
+    contentFingerprint: canonicalHash('comet.native.check-content.v1', content),
+    generatedInputFingerprint: generatedInputsFingerprint(
+      gitSnapshot.ignored,
+      gitSnapshot.physical,
+      options.generatedInputExclusions,
+    ),
+    complete: gitSnapshot.complete,
+    diagnostics,
+  };
 }
 
 const NATIVE_CHECK_BOUND_ENV = new Set([
@@ -849,6 +1295,8 @@ interface NativeCheckInputGateOptions {
   plans?: readonly NativeCheckPlan[];
   managedArtifactRoot?: string;
   editReviewScope?: EditReviewScope;
+  shapeSemanticSnapshot?: NativeShapeSemanticSnapshot;
+  legacyShapeSemanticSnapshot?: boolean;
   legacyExecutionBinding?: boolean;
   /** 仅供 Archive 排除另外绑定的事务写入和迁移材料。 */
   archiveOwnedPaths?: readonly string[];
@@ -856,17 +1304,160 @@ interface NativeCheckInputGateOptions {
   legacyArchiveOverlay?: NativeLegacyArchiveOverlay;
 }
 
-async function readNativeCheckInputObservation(options: NativeCheckInputGateOptions) {
+const NATIVE_CHECK_GITLINK_MAX_DEPTH = 32;
+const NATIVE_CHECK_GITLINK_MAX_REPOSITORIES = 256;
+const NATIVE_CHECK_GITLINK_MAX_INDEX_BYTES = 8 * 1024 * 1024;
+
+function parseGitlinksInIndex(indexOutput: string): Map<string, string> {
+  const gitlinks = new Map<string, string>();
+  for (const record of indexOutput.split('\0')) {
+    if (!record.startsWith('160000 ')) continue;
+    const match = record.match(/^160000 ([a-f0-9]{40}(?:[a-f0-9]{24})?) 0\t(.+)$/su);
+    if (!match || gitlinks.has(match[2])) {
+      throw new Error('Native 检查输入中的子模块索引无效或存在冲突');
+    }
+    gitlinks.set(match[2], match[1]);
+  }
+  return gitlinks;
+}
+
+async function readNativeCheckGitlink(
+  projectRoot: string,
+  relative: string,
+  budget: { repositories: Set<string>; indexBytes: number },
+  depth = 0,
+  allowDirty = false,
+): Promise<{ head: string; digest: string; observationHash: string }> {
+  if (
+    depth >= NATIVE_CHECK_GITLINK_MAX_DEPTH ||
+    budget.repositories.size >= NATIVE_CHECK_GITLINK_MAX_REPOSITORIES
+  ) {
+    throw new Error('Native 检查输入中的子模块数量或深度超出读取上限');
+  }
+  const target = path.resolve(projectRoot, ...relative.split('/'));
+  const [physicalRoot, realTarget, before] = await Promise.all([
+    fs.realpath(projectRoot),
+    fs.realpath(target),
+    fs.lstat(target),
+  ]);
+  if (
+    !before.isDirectory() ||
+    before.isSymbolicLink() ||
+    realTarget === physicalRoot ||
+    !isInsidePath(physicalRoot, realTarget) ||
+    realTarget !== path.resolve(physicalRoot, ...relative.split('/')) ||
+    budget.repositories.has(realTarget) ||
+    (await fs.realpath(runGitCommand(realTarget, ['rev-parse', '--show-toplevel']))) !== realTarget
+  ) {
+    throw new Error('Native 检查输入中的子模块目录不可用');
+  }
+  budget.repositories.add(realTarget);
+  const head = runGitCommand(realTarget, ['rev-parse', '--verify', 'HEAD']);
+  if (!/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/u.test(head)) {
+    throw new Error('Native 检查输入中的子模块 HEAD 无效');
+  }
+  // 显式包含未跟踪文件和嵌套子模块，不能受 submodule.*.ignore 配置影响。
+  const status = readGitStatusPorcelain(realTarget);
+  if (status !== '' && !allowDirty)
+    throw new Error(`Native 检查输入中的子模块 ${relative} 有未提交内容`);
+  const index = runGitCommand(realTarget, ['ls-files', '--stage', '-z']);
+  budget.indexBytes += Buffer.byteLength(index);
+  if (budget.indexBytes > NATIVE_CHECK_GITLINK_MAX_INDEX_BYTES) {
+    throw new Error('Native 检查输入中的子模块索引超出读取上限');
+  }
+  const nested: Array<{ path: string; digest: string; observationHash: string }> = [];
+  let dirty = status !== '';
+  for (const [childPath, objectId] of parseGitlinksInIndex(index)) {
+    const child = await readNativeCheckGitlink(
+      realTarget,
+      childPath,
+      budget,
+      depth + 1,
+      allowDirty,
+    );
+    if (!allowDirty && child.head !== objectId) {
+      throw new Error('Native 检查输入中的嵌套子模块 HEAD 与索引不一致');
+    }
+    dirty ||= child.digest !== digestNativeCheckInput(`gitlink:${objectId}`);
+    nested.push({ path: childPath, digest: child.digest, observationHash: child.observationHash });
+  }
+  const childPaths = new Set(nested.map((child) => child.path));
+  const readWorkingTree = async () => {
+    const result: Array<{ path: string; digest: string }> = [];
+    for (const ref of parseGitStatusPaths(status).sort()) {
+      if (childPaths.has(ref)) continue;
+      result.push({ path: ref, digest: await nativeCheckWorkingTreeDigest(realTarget, ref) });
+    }
+    return result;
+  };
+  const workingTree = allowDirty ? await readWorkingTree() : [];
+  const afterStatus = readGitStatusPorcelain(realTarget);
+  const afterIndex = runGitCommand(realTarget, ['ls-files', '--stage', '-z']);
+  const afterHead = runGitCommand(realTarget, ['rev-parse', '--verify', 'HEAD']);
+  const [afterTarget, after] = await Promise.all([fs.realpath(target), fs.lstat(target)]);
+  if (
+    afterStatus !== status ||
+    afterIndex !== index ||
+    head !== afterHead ||
+    realTarget !== afterTarget ||
+    !after.isDirectory() ||
+    after.isSymbolicLink() ||
+    before.ino !== after.ino ||
+    before.dev !== after.dev ||
+    (allowDirty &&
+      canonicalHash('gitlink-files', workingTree) !==
+        canonicalHash('gitlink-files', await readWorkingTree()))
+  ) {
+    throw new Error('Native 检查输入中的子模块有未提交内容或在读取时变化');
+  }
+  return {
+    head,
+    digest: dirty
+      ? canonicalHash('comet.native.dirty-gitlink.v1', {
+          head,
+          index,
+          status,
+          workingTree,
+          nested: nested.map(({ path, digest }) => ({ path, digest })),
+        })
+      : digestNativeCheckInput(`gitlink:${head}`),
+    // 仅比较本次前后采样；持久摘要仍由干净的顶层 HEAD 传递绑定嵌套提交。
+    observationHash: canonicalHash('comet.native.check-gitlink-observation.v1', {
+      head,
+      index: digestNativeCheckInput(index),
+      realTarget,
+      ino: after.ino,
+      dev: after.dev,
+      nested,
+      workingTree,
+    }),
+  };
+}
+
+async function readNativeCheckInputObservation(
+  options: NativeCheckInputGateOptions,
+  allowDirty = false,
+) {
   try {
     const runnerInputs = await nativeRunnerInputArtifactPaths(options.projectRoot);
     const exclusions = [
-      ...nativeRuntimeInputExclusions(options.projectRoot, options.managedArtifactRoot),
+      ...nativeOwnedInputExclusions(options.projectRoot, options.managedArtifactRoot),
       ...(options.archiveOwnedPaths ?? []).map((ref) => `:(exclude,literal)${ref}`),
       ...[...runnerInputs].map((relative) => `:(exclude,literal)${relative}`),
     ];
-    const head = runGitCommand(options.projectRoot, ['rev-parse', 'HEAD']);
-    const branch = runGitCommand(options.projectRoot, ['branch', '--show-current']);
-    const actualStatus = readGitStatusPorcelain(options.projectRoot, exclusions);
+    const queries = await Promise.allSettled([
+      readGitStatusObservationAsync(options.projectRoot, exclusions),
+      runGitCommandAsync(options.projectRoot, ['ls-files', '--stage', '-z', '--', ...exclusions]),
+    ]);
+    const failure = queries.find((query) => query.status === 'rejected');
+    if (failure?.status === 'rejected') throw failure.reason;
+    const {
+      head,
+      branch,
+      status: actualStatus,
+    } = (queries[0] as PromiseFulfilledResult<{ head: string; branch: string; status: string }>)
+      .value;
+    const staged = (queries[1] as PromiseFulfilledResult<string>).value;
     const status = options.legacyArchiveOverlay
       ? nativeLegacyArchiveGitStatus(
           options.projectRoot,
@@ -874,35 +1465,52 @@ async function readNativeCheckInputObservation(options: NativeCheckInputGateOpti
           options.legacyArchiveOverlay,
         )
       : actualStatus;
-    const staged = runGitCommand(options.projectRoot, [
-      'ls-files',
-      '--stage',
-      '-z',
-      '--',
-      ...exclusions,
-    ]);
     if (head === null || status === null) return null;
-    const workingTree: Array<{ path: string; digest: string | null }> = [];
-    for (const changedPath of parseGitStatusPaths(status).filter(
+    const changedPaths = parseGitStatusPaths(status).filter(
       (changedPath) =>
         !runnerInputs.has(changedPath) &&
-        !isNativeRuntimeInputPath(changedPath, options.projectRoot, options.managedArtifactRoot),
-    )) {
-      const target = path.resolve(options.projectRoot, ...changedPath.split('/'));
+        !isNativeOwnedInputPath(changedPath, options.projectRoot, options.managedArtifactRoot),
+    );
+    const gitlinks = new Map<string, Awaited<ReturnType<typeof readNativeCheckGitlink>>>();
+    const beforeGitlinkBudget = { repositories: new Set<string>(), indexBytes: 0 };
+    for (const [relative, objectId] of parseGitlinksInIndex(staged)) {
+      const observed = await readNativeCheckGitlink(
+        options.projectRoot,
+        relative,
+        beforeGitlinkBudget,
+        0,
+        allowDirty,
+      );
+      // 未初始化的子模块可能不出现在 status 中，仍须核对子仓库身份与 HEAD。
+      if (!changedPaths.includes(relative) && observed.head !== objectId) return null;
+      gitlinks.set(relative, observed);
+    }
+    const workingTree: Array<{ path: string; digest: string | null }> = [];
+    for (const changedPath of changedPaths) {
       let digest: string | null = null;
       try {
         const virtual = options.legacyArchiveOverlay?.get(changedPath);
         if (virtual?.text === null) return null;
         digest = virtual
           ? digestNativeCheckInput((virtual.bytes ?? Buffer.from(virtual.text!)).toString('base64'))
-          : (await digestNativeInputFileContent(target)).digest;
+          : (gitlinks.get(changedPath)?.digest ??
+            (await nativeCheckWorkingTreeDigest(options.projectRoot, changedPath)));
       } catch {
-        // A dirty submodule is a directory. Its porcelain entry alone cannot
-        // distinguish two different dirty contents, so disable the fast gate
-        // and let the full fingerprint mark the snapshot non-reusable.
+        // 无法完整读取的工作区输入不能用于快速复用。
         return null;
       }
       workingTree.push({ path: changedPath, digest });
+    }
+    const afterGitlinkBudget = { repositories: new Set<string>(), indexBytes: 0 };
+    for (const [relative, before] of gitlinks) {
+      const after = await readNativeCheckGitlink(
+        options.projectRoot,
+        relative,
+        afterGitlinkBudget,
+        0,
+        allowDirty,
+      );
+      if (after.observationHash !== before.observationHash) return null;
     }
     workingTree.sort((left, right) => left.path.localeCompare(right.path, 'en'));
     return {
@@ -942,6 +1550,7 @@ async function nativeCheckGateFromObservation(
       options.plans ?? [],
       options.managedArtifactRoot,
       observation.runnerInputs,
+      `${observation.binding.staged}\0${observation.binding.workingTree.map(({ path }) => path).join('\0')}`,
     );
     return ignored.complete
       ? canonicalHash('comet.native.check-input-gate.v1', { ...observation.binding, ignored })
@@ -970,6 +1579,7 @@ async function nativeCandidateCommentGate(
         options.plans ?? [],
         options.managedArtifactRoot,
         runnerInputs,
+        'candidate',
       );
       if (!physical.complete) return null;
       if (options.legacyArchiveOverlay) {
@@ -984,7 +1594,7 @@ async function nativeCandidateCommentGate(
               .split('/')
               .slice(0, -1)
               .some((part) => NATIVE_PHYSICAL_INPUT_EXCLUDED_DIRECTORIES.has(part)) &&
-            !isNativeRuntimeInputPath(ref, options.projectRoot, options.managedArtifactRoot)
+            !isNativeOwnedInputPath(ref, options.projectRoot, options.managedArtifactRoot)
           )
             files.set(ref, {
               path: ref,
@@ -1031,7 +1641,7 @@ async function nativeCandidateCommentGate(
   const workingTree: typeof observation.binding.workingTree = [];
   const index = new Map(
     observation.binding.staged.split('\0').flatMap((record) => {
-      const match = record.match(/^(100644|100755) ([a-f0-9]+) 0\t(.+)$/u);
+      const match = record.match(/^(100644|100755|160000) ([a-f0-9]+) 0\t(.+)$/su);
       return match ? [[match[3], { mode: match[1], objectId: match[2] }] as const] : [];
     }),
   );
@@ -1045,13 +1655,17 @@ async function nativeCandidateCommentGate(
         options.projectRoot,
         batch.flatMap((entry) => {
           const indexed = index.get(entry.path);
-          return indexed ? [indexed.objectId] : [];
+          return indexed && indexed.mode !== '160000' ? [indexed.objectId] : [];
         }),
       );
     } catch {
       return null;
     }
     for (const entry of batch) {
+      if (index.get(entry.path)?.mode === '160000') {
+        workingTree.push(entry);
+        continue;
+      }
       if (
         config?.native.document_writes !== 'revert' &&
         isNeutralDocumentPath(entry.path, [
@@ -1088,6 +1702,73 @@ async function nativeCandidateCommentGate(
         const reviewed = options.editReviewScope
           ? await approvedEditFingerprint(options.editReviewScope, entry.path, source.text, reviews)
           : null;
+        const shapeArtifact = options.shapeSemanticSnapshot?.artifacts.find(
+          (artifact) =>
+            options.managedArtifactRoot &&
+            options.editReviewScope &&
+            path
+              .relative(
+                options.projectRoot,
+                path.join(
+                  options.managedArtifactRoot,
+                  'comet',
+                  'changes',
+                  options.editReviewScope.change,
+                  artifact.source,
+                ),
+              )
+              .replaceAll('\\', '/') === entry.path,
+        );
+        if (shapeArtifact) {
+          const current = nativeShapeArtifactSnapshot(shapeArtifact.source, source.text);
+          const effective =
+            reviewed &&
+            options.editReviewScope &&
+            (await nativeShapeReviewAnchorMatches(
+              options.editReviewScope,
+              shapeArtifact,
+              reviewed.beforeHash,
+            ))
+              ? { ...current, commentsHash: shapeArtifact.commentsHash }
+              : current;
+          if (
+            nativeShapeArtifactContractHash(effective) ===
+            nativeShapeArtifactContractHash(shapeArtifact)
+          ) {
+            const indexed = index.get(entry.path);
+            const mode =
+              virtual?.mode ?? (await fs.lstat(path.resolve(options.projectRoot, entry.path))).mode;
+            const executable = process.platform === 'win32' ? false : Boolean(mode & 0o111);
+            const indexedSource = indexed && indexedBlobs.get(indexed.objectId);
+            if (
+              indexed &&
+              indexedSource !== undefined &&
+              (options.legacyShapeSemanticSnapshot && shapeArtifact.legacyFingerprint !== null
+                ? nativeSourceCommentFingerprint(entry.path, indexedSource) ===
+                  shapeArtifact.legacyFingerprint
+                : editContentHash(indexedSource) === shapeArtifact.contentHash) &&
+              (process.platform === 'win32' || executable === (indexed.mode === '100755'))
+            ) {
+              unchangedPaths.add(entry.path);
+              continue;
+            }
+            workingTree.push({
+              path: entry.path,
+              digest: options.legacyShapeSemanticSnapshot
+                ? shapeArtifact.legacyFingerprint
+                  ? canonicalHash('comet.native.comment-source.v1', {
+                      fingerprint: shapeArtifact.legacyFingerprint,
+                      executable,
+                    })
+                  : shapeArtifact.inputHash
+                : canonicalHash('comet.native.shape-candidate-artifact.v1', {
+                    contentHash: shapeArtifact.contentHash,
+                    executable,
+                  }),
+            });
+            continue;
+          }
+        }
         const fingerprint =
           reviewed?.fingerprint ?? nativeSourceCommentFingerprint(entry.path, source.text);
         if (!fingerprint) {
@@ -1174,14 +1855,17 @@ async function nativeCheckInputGates(options: NativeCheckInputGateOptions) {
         ? currentBranch(options.projectRoot)
         : observation.binding.branch || null,
     gate: await nativeCheckGateFromObservation(options, observation),
-    candidateGate: await nativeCandidateCommentGate(options, observation),
+    candidateGate: await nativeCandidateCommentGate(
+      options,
+      observation ?? (await readNativeCheckInputObservation(options, true)),
+    ),
   };
 }
 
 export async function nativeCandidateInputGate(
   options: NativeCheckInputGateOptions,
 ): Promise<string | null> {
-  return nativeCandidateCommentGate(options, await readNativeCheckInputObservation(options));
+  return nativeCandidateCommentGate(options, await readNativeCheckInputObservation(options, true));
 }
 
 export function authoritativePortableChecks(options: {
@@ -1416,6 +2100,10 @@ export async function rebindNativeCheckEvidence(options: {
     const gates = await nativeCheckInputGates({
       ...oldBinding,
       candidateId: next.builder_handoff!.candidate_id,
+      editReviewScope: nativeEditReviewScope(paths, next),
+      shapeSemanticSnapshot: (await readNativeApprovedShapeSemanticSnapshot({ paths, state: next }))
+        ?.snapshot,
+      legacyShapeSemanticSnapshot: next.shape_semantic_snapshot === undefined,
     });
     // The full capture must not adopt a source edit that happened while rebinding.
     if (
@@ -1449,6 +2137,7 @@ async function reserveNativePortableCheckPlan(options: {
       state: NativePortableState;
       local: NativeLocalExecutionState;
       plans: NativeCheckPlan[];
+      inputDiagnostics: string[];
     }
   | { kind: 'reuse'; state: NativePortableState; checks: NativePortableCheckSummary[] }
 > {
@@ -1461,6 +2150,10 @@ async function reserveNativePortableCheckPlan(options: {
       if (state.phase !== 'verify' || state.loop.stage !== 'verify-ready') {
         throw new Error('Native checks require Verify ready state');
       }
+      const shapeEvidence = await readNativeApprovedShapeSemanticSnapshot({
+        paths: options.paths,
+        state,
+      });
       const {
         gate,
         candidateGate,
@@ -1471,6 +2164,8 @@ async function reserveNativePortableCheckPlan(options: {
         plans: options.plans,
         managedArtifactRoot: options.paths.artifactRoot,
         editReviewScope: nativeEditReviewScope(options.paths, state),
+        shapeSemanticSnapshot: shapeEvidence?.snapshot,
+        legacyShapeSemanticSnapshot: !state.shape_semantic_snapshot && Boolean(shapeEvidence),
       });
       let branch = observedBranch;
       const file = nativeLocalExecutionFile(options.paths, state.name);
@@ -1489,12 +2184,8 @@ async function reserveNativePortableCheckPlan(options: {
       if (branch !== null && local.workspace.branch === `heads/${branch}`) {
         branch = currentBranch(options.projectRoot);
       }
-      // A null gate means the workspace could not be snapshotted completely
-      // (for example, an ignored generated tree is too large or a submodule
-      // cannot be hashed as a regular file). The full fingerprint remains
-      // deterministic, but the binding below still forces a fresh execution
-      // because incomplete evidence cannot safely reuse a prior result.
-      const inputSnapshotUncertain = gate === null;
+      // 快速摘要不可用时重新捕获完整输入。非 Git 项目仍可用完整的物理快照；
+      // 真正不完整的快照不能因为其确定性摘要相同而复用旧结果。
       // Reuse decides before the full fingerprint: a matching gate already
       // binds dirty, untracked and ignored generated inputs, so only the clean
       // tracked-tree work in the full fingerprint remains safely skippable.
@@ -1507,19 +2198,23 @@ async function reserveNativePortableCheckPlan(options: {
         path.resolve(local.workspace.projectRoot) === path.resolve(options.projectRoot) &&
         path.resolve(local.workspace.worktreeRoot) === path.resolve(options.projectRoot) &&
         local.workspace.machineId === os.hostname();
-      const inputFingerprint = gateBindingMatches
-        ? local.inputFingerprint!
-        : await nativeCheckInputFingerprint({
+      const inputSnapshot = gateBindingMatches
+        ? null
+        : await nativeCheckInputSnapshot({
             state,
             projectRoot: options.projectRoot,
             plans: options.plans,
             managedArtifactRoot: options.paths.artifactRoot,
           });
+      const inputFingerprint = inputSnapshot?.fingerprint ?? local.inputFingerprint!;
+      const inputDiagnostics = inputSnapshot?.diagnostics ?? [];
+      const forceReexecuteForIncompleteInput = inputSnapshot?.complete === false;
       const runtimeDir = nativePreferredChangeRuntimeDir(options.paths, state.name);
       const runtimeEvidenceAvailable = await hasNativeRuntimeCheckEvidence(local, runtimeDir);
       const allChecksPassed = local.checks.every((check) => check.status === 'passed');
       const retryIds = options.retryCheckIds === undefined ? null : new Set(options.retryCheckIds);
       const sameBinding =
+        !forceReexecuteForIncompleteInput &&
         local.candidateId === state.builder_handoff?.candidate_id &&
         path.resolve(local.workspace.projectRoot) === path.resolve(options.projectRoot) &&
         path.resolve(local.workspace.worktreeRoot) === path.resolve(options.projectRoot) &&
@@ -1557,6 +2252,14 @@ async function reserveNativePortableCheckPlan(options: {
         local.workspace.machineId === os.hostname();
       const forceReexecuteForMissingEvidence =
         sameBinding && allChecksPassed && !runtimeEvidenceAvailable;
+      if (
+        forceReexecuteForIncompleteInput &&
+        local.checks.some((check) => !check.repeatable && check.status !== 'planned')
+      ) {
+        throw new Error(
+          `Native 检查输入快照不完整，不能复用或自动重跑不可重复的检查：${inputDiagnostics.join('；') || '工作区输入无法完整读取'}`,
+        );
+      }
       if (retryIds && retryIds.size === 0) {
         throw new Error('Native check retry list must contain at least one ID');
       }
@@ -1584,7 +2287,10 @@ async function reserveNativePortableCheckPlan(options: {
         (local.execution !== null || local.checks.length > 0)
       ) {
         const fingerprintChanged = local.inputFingerprint !== inputFingerprint;
-        if ((inputSnapshotUncertain && !fingerprintChanged) || generatedInputsChanged) {
+        if (
+          (forceReexecuteForIncompleteInput && (!fingerprintChanged || candidateInputsUnchanged)) ||
+          generatedInputsChanged
+        ) {
           // Fall through to rebuild the local overlay and execute the current
           // plan again. The uncertain snapshot must never make prior checks
           // reusable, but it also must not reject the candidate itself.
@@ -1657,7 +2363,8 @@ async function reserveNativePortableCheckPlan(options: {
           execution.status === 'completed' &&
           allChecksPassed &&
           !forceReexecuteForMissingEvidence &&
-          !generatedInputsChanged
+          !generatedInputsChanged &&
+          !forceReexecuteForIncompleteInput
         ) {
           const requestedNames = new Map(options.plans.map(({ id, name }) => [id, name] as const));
           return {
@@ -1676,7 +2383,8 @@ async function reserveNativePortableCheckPlan(options: {
           execution.status === 'completed' &&
           !allChecksPassed &&
           !forceReexecuteForMissingEvidence &&
-          !generatedInputsChanged
+          !generatedInputsChanged &&
+          !forceReexecuteForIncompleteInput
         ) {
           throw new Error(
             `Native check plan contains a failed check (${local.checks
@@ -1719,7 +2427,8 @@ async function reserveNativePortableCheckPlan(options: {
           interrupted.length > 0 &&
           retryIds === null &&
           !forceReexecuteForMissingEvidence &&
-          !generatedInputsChanged
+          !generatedInputsChanged &&
+          !forceReexecuteForIncompleteInput
         ) {
           const requestedNames = new Map(options.plans.map(({ id, name }) => [id, name] as const));
           return {
@@ -1758,13 +2467,19 @@ async function reserveNativePortableCheckPlan(options: {
           local.execution.actor === 'runtime' &&
           local.checks.some((check) => check.status === 'interrupted') &&
           planMatches;
-        if (!sameInterruptedPlan && !forceReexecuteForMissingEvidence && !generatedInputsChanged) {
+        if (
+          !sameInterruptedPlan &&
+          !forceReexecuteForMissingEvidence &&
+          !generatedInputsChanged &&
+          !forceReexecuteForIncompleteInput
+        ) {
           throw new Error('Native check plan was already resolved with a different plan');
         }
       } else if (
         (local.execution !== null || local.checks.length > 0) &&
         !forceReexecuteForMissingEvidence &&
-        !generatedInputsChanged
+        !generatedInputsChanged &&
+        !forceReexecuteForIncompleteInput
       ) {
         throw new Error('Native check plan was already resolved with a different plan');
       }
@@ -1796,7 +2511,7 @@ async function reserveNativePortableCheckPlan(options: {
         },
         checks: options.plans.map((plan) => {
           const previous = local.checks.find((check) => check.id === plan.id);
-          if (generatedInputsChanged && previous) {
+          if ((generatedInputsChanged || forceReexecuteForIncompleteInput) && previous) {
             return localCheck(plan, operationId, options.projectRoot);
           }
           if (forceReexecuteForMissingEvidence && previous) {
@@ -1815,6 +2530,7 @@ async function reserveNativePortableCheckPlan(options: {
       await writeNativeLocalExecution(file, operation, { containedRoot: options.paths.runtimeDir });
       return {
         kind: 'execute',
+        inputDiagnostics,
         state,
         local: operation,
         plans: options.plans.filter((plan) => {
@@ -1822,6 +2538,7 @@ async function reserveNativePortableCheckPlan(options: {
           return (
             forceReexecuteForMissingEvidence ||
             generatedInputsChanged ||
+            forceReexecuteForIncompleteInput ||
             previous === undefined ||
             (previous.status === 'interrupted' && (retryIds === null || retryIds.has(previous.id)))
           );
@@ -1878,6 +2595,7 @@ export async function executeNativePortableCheckPlan(options: {
   state: NativePortableState;
   checks: NativePortableCheckSummary[];
   disposition: 'executed' | 'reused';
+  inputDiagnostics?: string[];
 }> {
   const projectRoot = options.projectRoot ?? options.paths.projectRoot;
   preflightNativeCheckPlans(projectRoot, options.plans);
@@ -2024,6 +2742,9 @@ export async function executeNativePortableCheckPlan(options: {
       supplied: [],
     }),
     disposition: 'executed',
+    ...(reservation.inputDiagnostics.length
+      ? { inputDiagnostics: reservation.inputDiagnostics }
+      : {}),
   };
 }
 

@@ -14,6 +14,16 @@ from scaffold.python.paths import get_tasks_dir
 from scaffold.python.tasks import list_tasks, load_task
 
 
+def test_current_classic_treatments_follow_the_required_unified_entry_before_classic():
+    from scaffold.python.treatments import load_treatments
+
+    treatments = load_treatments()
+    for name in ("COMET_CLASSIC_DOCS_LAYOUT", "COMET_CLASSIC_LEGACY_LAYOUT"):
+        guidance = treatments[name].claude_md
+        assert guidance.startswith("Begin by invoking /comet for this Classic task")
+        assert "routing to /comet-classic" in guidance
+
+
 BASIC_TASK_TOML = """
 [metadata]
 name = "test-basic"
@@ -70,6 +80,47 @@ def test_load_task_parses_validation_and_setup(mock_tasks_dir: Path):
     assert task.config.setup.template_vars == {"artifact_name": "result-{run_id}.json"}
 
 
+def test_task_declares_classic_proposal_interaction_only_for_fresh_scenarios(mock_tasks_dir):
+    path = mock_tasks_dir / "test-basic/task.toml"
+    assert (
+        load_task(
+            "test-basic", mock_tasks_dir
+        ).config.evaluation.require_classic_proposal_interaction
+        is False
+    )
+    path.write_text(
+        BASIC_TASK_TOML + "\n[evaluation]\nrequire_classic_proposal_interaction = true\n"
+    )
+    assert (
+        load_task(
+            "test-basic", mock_tasks_dir
+        ).config.evaluation.require_classic_proposal_interaction
+        is True
+    )
+    path.write_text(
+        BASIC_TASK_TOML + '\n[evaluation]\nrequire_classic_proposal_interaction = "true"\n'
+    )
+    with pytest.raises(ValueError, match="require_classic_proposal_interaction"):
+        load_task("test-basic", mock_tasks_dir)
+
+
+def test_task_limits_new_reply_requirements_to_the_explicit_decision_scope(mock_tasks_dir):
+    path = mock_tasks_dir / "test-basic/task.toml"
+    prefix = BASIC_TASK_TOML + "\n[evaluation]\nrequire_classic_proposal_interaction = true\n"
+    path.write_text(prefix + 'classic_proposal_interaction_steps = ["full.delivery.confirm"]\n')
+    task = load_task("test-basic", mock_tasks_dir)
+    assert task.config.evaluation.classic_proposal_interaction_steps == ["full.delivery.confirm"]
+    for invalid in [
+        "[]",
+        '["full.unknown.confirm"]',
+        '"full.delivery.confirm"',
+        '["full.delivery.confirm", "full.delivery.confirm"]',
+    ]:
+        path.write_text(prefix + "classic_proposal_interaction_steps = " + invalid + "\n")
+        with pytest.raises(ValueError, match="classic_proposal_interaction_steps"):
+            load_task("test-basic", mock_tasks_dir)
+
+
 def test_load_task_parses_evaluation_and_interaction(mock_tasks_dir: Path):
     task_dir = mock_tasks_dir / "test-basic"
     task_dir.joinpath("task.toml").write_text(
@@ -92,6 +143,7 @@ decision_reply = "Use the recommended option."
 decision_replies = ["First reply.", "Second reply."]
 continue_prompt = "Please continue."
 fresh_resume_marker = "COLD_RESUME_READY"
+completion_runs = [{name = "sentence-full", profile = "full"}]
 """
     )
 
@@ -110,6 +162,7 @@ fresh_resume_marker = "COLD_RESUME_READY"
     assert task.config.interaction.decision_replies == ["First reply.", "Second reply."]
     assert task.config.interaction.continue_prompt == "Please continue."
     assert task.config.interaction.fresh_resume_marker == "COLD_RESUME_READY"
+    assert task.config.interaction.completion_runs == [{"name": "sentence-full", "profile": "full"}]
 
 
 def test_comet_tasks_default_to_comet_workflow_profile():
@@ -161,6 +214,11 @@ def test_classic_layout_lifecycle_uses_current_cli_and_compatible_openspec():
             "local/tasks/comet-native-workflow/environment",
             {"@fission-ai/openspec": "^1.11.0"},
         ),
+        ("local/tasks/comet-native-sdk-recovery/environment", {"@fission-ai/openspec": "^1.11.0"}),
+        ("local/tasks/comet-classic-sdk-recovery/environment", {"@fission-ai/openspec": "^1.11.0"}),
+        ("local/tasks/comet-classic-full-recovery/environment", {"@fission-ai/openspec": "^1.11.0"}),
+        ("local/tasks/comet-small-cli-archive/environment", {"@fission-ai/openspec": "^1.11.0"}),
+        ("local/tasks/comet-counter-refactor-archive/environment", {"@fission-ai/openspec": "^1.11.0"}),
         ("local/tasks/comet-native-wave-f-dashboard-readonly/environment", {}),
     ],
 )
@@ -216,12 +274,17 @@ def test_comet_task_index_lists_real_tasks():
     index = yaml.safe_load(index_path.read_text(encoding="utf-8"))
     names = [task["name"] for task in index["tasks"]]
     assert sorted(names) == sorted(list_tasks())
-    assert len(names) == 32
+    assert len(names) == 37
     assert set(names) == {
         "authoring-skill-smoke",
+        "comet-small-cli-archive",
+        "comet-counter-refactor-archive",
         "comet-agent-memory-routing",
         "comet-api-cache-ttl",
         "comet-classic-layout-lifecycle",
+        "comet-classic-full-recovery",
+        "comet-classic-sdk-recovery",
+        "comet-native-sdk-recovery",
         "comet-cross-file-refactor",
         "comet-dependency-confusion",
         "comet-fix-median",

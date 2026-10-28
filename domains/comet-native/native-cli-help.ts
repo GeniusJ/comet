@@ -34,6 +34,7 @@ const HELP: Readonly<Record<string, NativeHelpEntry>> = Object.freeze({
       'new <change-name>            Create a change and prepare its workspace.',
       'spec disassociate            Revoke a capability association through Runtime.',
       'spec remove                  Record a complete capability removal intent.',
+      'spec snapshot <change-name>  Verify restored approved documents and enable bounded auxiliary edits without changing the Run.',
       'spec sync <change-name> <capability> --input <json-file>  Audit local Markdown reference corrections.',
       'show <change-name>           Read formal artifacts and portable state.',
       'status [<change-name>]       Discover stable boundaries and Runner actions.',
@@ -115,6 +116,7 @@ const HELP: Readonly<Record<string, NativeHelpEntry>> = Object.freeze({
     subcommands: [
       'disassociate <change-name>  Revoke a capability association and return to Shape.',
       'remove <change-name> <capability>  Record a capability removal.',
+      'snapshot <change-name>  Validate restored original documents and capture legacy semantic evidence.',
       'sync <change-name> <capability> --input <json-file>  Compat-only Markdown reference correction; SDK changes return to Shape for revision.',
     ],
     output: 'The updated portable state and continuation.',
@@ -133,6 +135,13 @@ const HELP: Readonly<Record<string, NativeHelpEntry>> = Object.freeze({
       '--expected-action <action>   Must be disassociate-capability.',
     ],
     output: 'The updated portable state and continuation with the next Runner action.',
+  },
+  'spec snapshot': {
+    usage: 'comet native spec snapshot <change-name>',
+    purpose:
+      'Restore the originally approved documents first. Runtime checks their complete legacy fingerprint and saves at most 2 MiB of original evidence in this workspace Runtime. It does not approve changed requirements or change the Run, candidate, Action, claim or check receipts. Evidence is local to this workspace; repeat the verified capture after moving to another device.',
+    output:
+      'The validated original Shape identity and captured sources; no workflow state changes.',
   },
   'spec sync': {
     usage: 'comet native spec sync <change-name> <capability> --input <json-file>',
@@ -173,7 +182,10 @@ const HELP: Readonly<Record<string, NativeHelpEntry>> = Object.freeze({
     ],
   },
   select: {
-    usage: 'comet native select <change-name>',
+    usage: 'comet native select <change-name> [--rebind]',
+    options: [
+      '--rebind  Explicitly bind the same stopped SDK Run to the current Git branch; preserve work and approvals, and reject unresolved executions.',
+    ],
     purpose: 'Select one Native change after validating its workspace binding.',
     output: 'The selected change record.',
   },
@@ -192,7 +204,7 @@ const HELP: Readonly<Record<string, NativeHelpEntry>> = Object.freeze({
       '--revise-requirements    Return Verify, Archive, or a quiescent SDK Supervisor Build to Shape. SDK changes also allow renewing a pending Shape proposal or revising after an ordinary Builder explicitly failed; use the current continuation proposal hash. Preserve partial work and reconcile running/unknown Actions first. The new Shape still requires explicit approval. Completed SDK Runs require an application-validated blocked Child recovery.',
       '--retry-verifier    Retry a failed or unavailable Verifier when the continuation allows it.',
       '--continue-builder  After a failed SDK Builder Action, explicitly continue from its preserved workspace in a new Action.',
-      '--resolve-verifier-blocker  Resolve a compat semantic blocker, or recover an application-validated completed SDK Supervisor by dispatching a new Child Builder. SDK recovery requires the current proposal hash and both expected guards; original candidates, checks, and outcomes remain historical evidence.',
+      '--resolve-verifier-blocker  Resume an SDK or compat blocked Verifier with the retained candidate and valid checks; a completed SDK Supervisor Child resumes with a new Builder. SDK recovery requires the current proposal hash and both expected guards; original outcomes are preserved.',
       '--max-parallel <n>  Supervisor task concurrency cap; defaults to 2, use 1 for serial fallback.',
       '--expected-state-version <n>  Continuation-issued guard that rejects stale public transition decisions.',
       '--expected-action <action>    Continuation-issued guard that binds the public transition decision to its intended action.',
@@ -258,17 +270,18 @@ const HELP: Readonly<Record<string, NativeHelpEntry>> = Object.freeze({
   },
   doctor: {
     usage:
-      'comet native doctor [<change-name>] [--repair] [--confirmed] [--stopped-actions <json-file>] [--migrate-history]',
+      'comet native doctor [<change-name>] [--repair] [--confirmed] [--lock-token <token>] [--stopped-actions <json-file>] [--migrate-history]',
     purpose:
-      'Inspect portable state, migrate a compat Runtime active change, or rebuild its local execution overlay.',
+      'Inspect Native state, original executions, project locks and SDK writer locks, or recover the exact recorded interruption.',
     options: [
       '--stopped-actions <json-file>  With --repair --confirmed, submit original Action/attempt/inputHash/claimToken and actual evidence that its execution and all descendants, including detached processes, stopped; retained results remain unknown and require a fresh repair candidate.',
       '--repair  Apply deterministic migration or rebuild from the portable stable boundary.',
+      '--lock-token <token>  With --repair --confirmed, repair exactly the lock record reported by doctor after confirming its original writer and all concurrent writers stopped. Omit the change name for a project lock. Named changes also inspect Run-store, application and projection locks. Live owners are never removed; age alone does not prove exit.',
       '--migrate-history  Validate and close fully stopped built-in Native terminal Runs. Preserve documents and checkpoints; unfinished or invalid Runs remain active. Safe to rerun after interruption. Upgrade CLI and platform Hooks together: older Runtime versions cannot write the new storage format. Ordinary inspection never migrates.',
       '--confirmed  With --repair and a named managed change whose local Run history is missing, recover its saved Run checkpoint after confirming the original process stopped. Older states without a checkpoint restart at Shape and require fresh approvals and checks.',
     ],
     output:
-      'Health, migration or recovery details, and the continuation with the next Runner action.',
+      'Health, retained execution evidence, lock owners, and structured recovery with diagnosticArgs, recoveryArgs and preconditions. Inspection never acquires a writer lock.',
   },
   transfer: {
     usage:

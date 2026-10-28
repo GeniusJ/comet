@@ -1,4 +1,6 @@
 import path from 'node:path';
+import { inspectGitWorktree } from '../../platform/paths/git-worktree.js';
+import { parseNativePortableState } from './native-portable-state.js';
 import { createFileRuntimeStore, type WorkflowRun } from '../engine/runtime.js';
 import { resolveWorkspaceRuntimeRootSync } from '../workflow-contract/workspace-runtime.js';
 import { readWorkflowApplicationStorageDisposition } from '../workflow-application/index.js';
@@ -9,6 +11,7 @@ import {
   type NativeSdkCheckExecutionInspection,
 } from './native-sdk-check-execution.js';
 import { recoverCancelledNativeSdkArchive } from './native-sdk-archive.js';
+import { assertNativeSdkCandidateUnchanged } from './native-sdk-checks.js';
 
 /** 只读区分状态可读、执行核对和存储收尾；正常用户等待不是损坏。 */
 export async function inspectNativeSdkRunDiagnostics(
@@ -58,7 +61,80 @@ export async function inspectNativeSdkRunDiagnostics(
       // 保留需要核对的归档义务；只读诊断不能完成事务。
     }
   }
+  const candidateIssues: Array<{
+    code: string;
+    runId: string;
+    message: string;
+    nextCommand: string;
+  }> = [];
+  const preflight = [...run.actions]
+    .reverse()
+    .find((action) => action.stepId === 'archive.prepare');
+  const state = parseNativePortableState(run.state);
+  const candidateId = state.builder_handoff?.candidate_id;
+  const currentCheck = [...run.actions]
+    .reverse()
+    .find(
+      (action) =>
+        candidateId &&
+        ['verify.checks', 'verify.requested-checks'].includes(action.stepId) &&
+        action.status === 'succeeded' &&
+        (action.outcome?.output as { candidateId?: unknown } | undefined)?.candidateId ===
+          candidateId,
+    );
+  const failedCandidateCapture =
+    (currentCheck?.outcome?.output as { candidateInputFingerprintGate?: unknown } | undefined)
+      ?.candidateInputFingerprintGate === null;
+  if (
+    failedCandidateCapture ||
+    (state.phase === 'archive' &&
+      preflight &&
+      ['pending', 'failed'].includes(preflight.status) &&
+      !run.actions
+        .slice(run.actions.indexOf(preflight) + 1)
+        .some(
+          (action) =>
+            ['build.builder', 'verify.checks', 'verify.requested-checks'].includes(action.stepId) &&
+            action.status === 'succeeded',
+        ))
+  ) {
+    try {
+      await assertNativeSdkCandidateUnchanged({ run, projectRoot, requireEvidence: true });
+    } catch (error) {
+      candidateIssues.push({
+        code: failedCandidateCapture
+          ? 'native-check-candidate-unavailable'
+          : 'native-archive-candidate-unavailable',
+        runId: run.runId,
+        message: (error as Error).message,
+        nextCommand: `comet native status ${run.runId} --json`,
+      });
+    }
+    if (preflight?.status === 'failed' && candidateIssues.length === 0) {
+      const output = preflight.outcome?.output as { message?: string; reason?: string } | undefined;
+      candidateIssues.push({
+        code: 'native-archive-preflight-blocked',
+        runId: run.runId,
+        message: output?.message ?? 'Native Archive 预检未通过，请核对原 Action',
+        nextCommand: `comet native status ${run.runId} --json`,
+      });
+    }
+  }
   const issues = [
+    ...(!parseNativePortableState(run.state).archived &&
+    parseNativePortableState(run.state).workspace.change_branch &&
+    inspectGitWorktree(projectRoot).currentBranch !==
+      parseNativePortableState(run.state).workspace.change_branch
+      ? [
+          {
+            code: 'native-workspace-branch-mismatch',
+            runId: run.runId,
+            message: '当前分支与原 Run 绑定不一致；切回原分支，或确认接管并核对原执行已结束。',
+            nextCommand: `comet native select ${run.runId} --rebind --json`,
+          },
+        ]
+      : []),
+    ...candidateIssues,
     ...(!storageSettled
       ? [
           {

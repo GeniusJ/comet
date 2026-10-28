@@ -41,6 +41,25 @@ function classifyIssue(
 }
 
 describe('CI workflows', () => {
+  it('prepares locked Python dependencies before Node regression jobs invoke the Eval harness', async () => {
+    const workflow = parse(await readWorkflow('ci.yml'));
+    for (const name of ['quality', 'core-regressions', 'node-compatibility']) {
+      const steps = workflow.jobs[name].steps;
+      const python = steps.findIndex((step: { uses?: string }) =>
+        step.uses?.startsWith('actions/setup-python@'),
+      );
+      const uv = steps.findIndex((step: { uses?: string }) =>
+        step.uses?.startsWith('astral-sh/setup-uv@'),
+      );
+      const sync = steps.findIndex(
+        (step: { run?: string }) => step.run === 'uv sync --locked --extra dev --extra langsmith',
+      );
+      expect(python).toBeGreaterThanOrEqual(0);
+      expect(uv).toBeGreaterThan(python);
+      expect(sync).toBeGreaterThan(uv);
+      expect(steps[sync]['working-directory']).toBe('eval');
+    }
+  });
   it('validates pull requests and master pushes without duplicating development branch runs', async () => {
     for (const name of ['ci.yml', 'security.yml']) {
       const workflow = parse(await readWorkflow(name));
@@ -404,7 +423,7 @@ describe('CI workflows', () => {
         shards: 8,
       })),
     ]);
-    expect(contracts['timeout-minutes']).toBe("${{ matrix.os == 'windows-latest' && 50 || 40 }}");
+    expect(contracts['timeout-minutes']).toBe("${{ matrix.os == 'windows-latest' && 90 || 60 }}");
     expect(contracts.strategy?.['fail-fast']).toBe(false);
     const test = contracts.steps?.find((step) => step.id === 'sdk-tests');
     expect(test?.run).toContain('pnpm test:sdk');
@@ -504,9 +523,14 @@ describe('CI workflows', () => {
 
     expect(modelWorkflow).toContain('workflow_dispatch:');
     expect(modelWorkflow).not.toContain('pull_request:');
-    expect(modelWorkflow).toContain(
-      'uv run python local/scripts/regression_check.py --count 1 --tolerance 0.10',
-    );
+    expect(modelWorkflow).toContain('args=(--suite current --count "$EVAL_COUNT"');
+    expect(modelWorkflow).toContain('args+=(--collect-only)');
+    expect(modelWorkflow).toContain('local/tests/scaffold/test_regression_check.py');
+    expect(modelWorkflow).not.toContain('BENCH_LOOP_MAX_TURNS');
+    const model = parse(modelWorkflow);
+    expect(model.on.workflow_dispatch.inputs.mode.options).toEqual(['validate', 'collect']);
+    expect(model.on.workflow_dispatch.inputs.count.options).toEqual(['1', '2', '3']);
+    expect(model.jobs['model-regression'].steps.at(-1).with.name).toContain('github.sha');
     expect(ciWorkflow).toContain('eval-static:');
     expect(ciWorkflow).toContain('uv sync --locked --extra dev --extra langsmith');
     expect(ciWorkflow).toContain('uv run ruff check');
@@ -522,6 +546,41 @@ describe('CI workflows', () => {
     expect(workflow).toContain('--workflow classic --json');
     expect(workflow).toContain("result[component] === 'failed'");
     expect(workflow).toContain('throw new Error(`External installer failures:');
+  });
+
+  it('requires both actual core platforms before the paid Eval job', async () => {
+    const source = await readWorkflow('eval-regression.yml');
+    const workflow = parse(source);
+    const core = workflow.jobs['core-regressions'];
+    expect(core.needs).toEqual(['candidate-build']);
+    expect(workflow.jobs['candidate-build']['runs-on']).toBe('ubuntu-latest');
+    expect(core.steps.some((step: { run?: string }) => step.run === 'pnpm build')).toBe(false);
+    for (const jobName of ['core-regressions', 'model-regression'])
+      expect(
+        workflow.jobs[jobName].steps.some(
+          (step: { with?: Record<string, string> }) =>
+            step.with?.name === 'eval-candidate-dist-${{ github.sha }}-${{ github.run_attempt }}',
+        ),
+      ).toBe(true);
+    expect(core.strategy.matrix.os).toEqual(['ubuntu-latest', 'windows-latest']);
+    expect(
+      core.steps.some((step: { run?: string }) => step.run?.includes('--record-platform')),
+    ).toBe(true);
+    expect(workflow.jobs['model-regression'].needs).toEqual(['core-regressions']);
+    expect(source).toContain('--core-platform-records');
+    expect(source).toContain(
+      'core-platform-windows-latest-${{ github.sha }}-${{ github.run_attempt }}',
+    );
+    expect(source).toContain(
+      'core-platform-ubuntu-latest-${{ github.sha }}-${{ github.run_attempt }}',
+    );
+    expect(source).toContain('git config --global core.autocrlf false');
+    for (const job of Object.values(workflow.jobs) as Array<{
+      steps: Array<{ uses?: string; with?: Record<string, unknown> }>;
+    }>)
+      expect(job.steps.find((step) => step.uses?.startsWith('actions/checkout@'))?.with?.ref).toBe(
+        '${{ github.sha }}',
+      );
   });
 
   it('runs dependency review and CodeQL with least-privilege permissions', async () => {
@@ -573,7 +632,7 @@ describe('CI workflows', () => {
       ),
     );
 
-    expect(workflow).toMatch(/^  issues:\s*$/m);
+    expect(workflow).toMatch(/^ {2}issues:\s*$/m);
     expect(workflow).toContain('types: [opened, edited]');
     expect(workflow).toContain('issues: write');
     expect(workflow).toContain('actions/github-script@d746ffe35508b1917358783b479e04febd2b8f71');
@@ -681,8 +740,8 @@ describe('CI workflows', () => {
   it('greets first-time contributors from the trusted base workflow', async () => {
     const workflow = await readWorkflow('greeting-guideline-pr.yml');
 
-    expect(workflow).toMatch(/^  pull_request_target:$/m);
-    expect(workflow).not.toMatch(/^  pull_request:$/m);
+    expect(workflow).toMatch(/^ {2}pull_request_target:$/m);
+    expect(workflow).not.toMatch(/^ {2}pull_request:$/m);
     expect(workflow).toContain('pull-requests: write');
     expect(workflow).not.toContain('actions/checkout');
   });

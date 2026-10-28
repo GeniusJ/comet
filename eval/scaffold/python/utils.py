@@ -637,13 +637,27 @@ def _normalise_validation_results(results):
 
 
 def make_execution_validator(
-    validation_dir, test_scripts, target_artifacts, timeout=120, data_dir=None
+    validation_dir, test_scripts, target_artifacts, timeout=120, data_dir=None, environment_dir=None
 ):
     test_scripts = [test_scripts] if isinstance(test_scripts, str) else test_scripts
     artifacts = [target_artifacts] if isinstance(target_artifacts, str) else target_artifacts
+    environment_file_hashes = (
+        {
+            source.relative_to(environment_dir).as_posix(): hashlib.sha256(
+                source.read_bytes()
+            ).hexdigest()
+            for source in sorted(environment_dir.rglob("*"))
+            if source.is_file()
+        }
+        if environment_dir is not None
+        else {}
+    )
 
     def validate_execution(test_dir, outputs):
         passed, failed = [], []
+        # 此字段只由重新拷贝的可信校验器生成，不接受模型传入的同名字段。
+        if outputs is not None:
+            outputs["validation_evidence"] = {}
         for artifact in artifacts:
             if any(c in artifact for c in "*?["):
                 if not list(test_dir.glob(artifact)):
@@ -654,11 +668,14 @@ def make_execution_validator(
             return passed, failed
         context = dict(outputs) if outputs else {}
         context["target_artifacts"] = artifacts
+        context["environment_file_hashes"] = environment_file_hashes
         (test_dir / TEST_CONTEXT_FILE).write_text(json.dumps(context, default=str))
         for script in test_scripts:
             results = run_eval_in_docker(
                 test_dir, validation_dir, script, timeout=timeout, data_dir=data_dir
             )
+            if outputs is not None and isinstance(results.get("validation_evidence"), dict):
+                outputs["validation_evidence"][script] = results["validation_evidence"]
             script_passed, script_failed = _normalise_validation_results(results)
             passed.extend(script_passed)
             failed.extend(script_failed)
