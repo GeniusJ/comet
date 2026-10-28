@@ -97,9 +97,9 @@ describe('release bad-case and Eval gate', () => {
       { regressionsOnly: false },
       { regressionsOnly: false, evalReport: 'current.json' },
     ])
-      expect(
-        releaseSteps(options).some((step) => step.args.includes('--require-acceptance')),
-      ).toBe(true);
+      expect(releaseSteps(options).some((step) => step.args.includes('--require-acceptance'))).toBe(
+        true,
+      );
   });
 
   it('labels the run result by whether a model Eval receipt was verified', () => {

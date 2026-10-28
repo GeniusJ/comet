@@ -16,8 +16,7 @@ export function releaseOptions(args, env = process.env) {
     else throw new Error(`不支持的发布检查参数：${argument}`);
   }
   const receipt = typeof evalReport === 'string' ? evalReport.trim() : '';
-  if (regressionsOnly && receipt)
-    throw new Error('无模型回归检查不能同时声明完整 Eval 放行凭证。');
+  if (regressionsOnly && receipt) throw new Error('无模型回归检查不能同时声明完整 Eval 放行凭证。');
   return { regressionsOnly, evalReport: receipt || undefined };
 }
 
