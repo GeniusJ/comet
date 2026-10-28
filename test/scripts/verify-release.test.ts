@@ -9,10 +9,15 @@ import {
 
 describe('release bad-case and Eval gate', () => {
   it('makes the candidate Eval receipt optional and parses it from flags or environment', () => {
-    expect(releaseOptions([], {})).toEqual({ regressionsOnly: false, evalReport: undefined });
+    expect(releaseOptions([], {})).toEqual({
+      regressionsOnly: false,
+      artifactOnly: false,
+      evalReport: undefined,
+    });
     expect(releaseOptions([], { COMET_RELEASE_EVAL_REPORT: '  ' }).evalReport).toBeUndefined();
     expect(releaseOptions(['--eval-report', 'evidence/current.json'], {})).toEqual({
       regressionsOnly: false,
+      artifactOnly: false,
       evalReport: 'evidence/current.json',
     });
     expect(releaseOptions([], { COMET_RELEASE_EVAL_REPORT: '/tmp/current.json' }).evalReport).toBe(
@@ -22,12 +27,31 @@ describe('release bad-case and Eval gate', () => {
 
   it('keeps no-model checks explicit and rejects ambiguous or unknown flags', () => {
     expect(releaseOptions(['--regressions-only'], {}).regressionsOnly).toBe(true);
+    expect(releaseOptions(['--artifact-only'], {}).artifactOnly).toBe(true);
     for (const args of [
       ['--skip-eval'],
       ['--eval-report'],
       ['--regressions-only', '--eval-report', 'x'],
+      ['--artifact-only', '--eval-report', 'x'],
+      ['--artifact-only', '--regressions-only'],
     ])
       expect(() => releaseOptions(args, {})).toThrow();
+  });
+
+  it('limits the artifact-only publish path to artifact self-checks and trusts merge-time CI for regressions', () => {
+    const steps = releaseSteps(releaseOptions(['--artifact-only'], {}), '/repo');
+    expect(steps.map((step) => step.args.join(' '))).toEqual([
+      'build.js',
+      'scripts/release/prepublish-check.js',
+      'scripts/release/check-sdk-api.mjs',
+    ]);
+    expect(
+      steps.some(
+        (step) =>
+          step.args.some((arg) => String(arg).includes('regressions') || arg.includes('vitest')) ||
+          step.command === 'uv',
+      ),
+    ).toBe(false);
   });
 
   it('runs all bad-case gates before validating the current candidate receipt without spending model budget', () => {
@@ -105,6 +129,12 @@ describe('release bad-case and Eval gate', () => {
   it('labels the run result by whether a model Eval receipt was verified', () => {
     const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
     try {
+      verifyRelease(
+        { regressionsOnly: false, artifactOnly: true },
+        vi.fn().mockReturnValue({ status: 0 }),
+        '/repo',
+      );
+      expect(log).toHaveBeenLastCalledWith(expect.stringContaining('以合并 PR 时的 CI 回归为准'));
       verifyRelease({ regressionsOnly: true }, vi.fn().mockReturnValue({ status: 0 }), '/repo');
       expect(log).toHaveBeenLastCalledWith(
         expect.stringContaining('未运行 badcase 附加验收和完整模型 Eval'),
@@ -122,10 +152,12 @@ describe('release bad-case and Eval gate', () => {
     }
   });
 
-  it('makes npm publication and required CI consume the mandatory regression entry', async () => {
+  it('keeps npm publication on artifact self-checks while release:verify and required CI keep the regression gate', async () => {
     const pkg = JSON.parse(await fs.readFile('package.json', 'utf8'));
-    expect(pkg.scripts.prepublishOnly).toBe('node scripts/release/verify-release.mjs');
-    expect(pkg.scripts['release:verify']).toBe(pkg.scripts.prepublishOnly);
+    expect(pkg.scripts.prepublishOnly).toBe(
+      'node scripts/release/verify-release.mjs --artifact-only',
+    );
+    expect(pkg.scripts['release:verify']).toBe('node scripts/release/verify-release.mjs');
     const ci = await fs.readFile('.github/workflows/ci.yml', 'utf8');
     expect(ci).toContain('      - core-regressions');
     expect(ci).toContain('run: pnpm test:core-regressions');

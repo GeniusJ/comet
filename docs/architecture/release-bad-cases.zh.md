@@ -5,7 +5,8 @@
 ## 两层检查
 
 1. `pnpm test:release-regressions` 执行无模型检查：构建、实际发布文件扫描、SDK API、发布元数据、核心历史回归以及 Eval 判定器自身的反例。它明确不提供模型 Eval 放行。
-2. `pnpm release:verify --eval-report <release-gate.json>` 在上述检查之外核对完整 Eval 凭证。`npm publish` 的 `prepublishOnly` 使用同一入口，凭证路径也可由 `COMET_RELEASE_EVAL_REPORT` 提供。没有凭证、候选不符、场景缺项或检查失败都会阻止发布。该命令不自动调用付费模型，不会初始化或降低评分基线。
+2. `pnpm release:verify [--eval-report <release-gate.json>]` 运行上述全部检查和 badcase 附加验收；提供 `--eval-report`（或设置 `COMET_RELEASE_EVAL_REPORT`）时额外核对完整 Eval 凭证。没有凭证、候选不符、场景缺项或检查失败都会阻止发布。该命令不自动调用付费模型，不会初始化或降低评分基线。
+3. `npm publish` 的 `prepublishOnly` 以 `--artifact-only` 运行，只执行构建、发布文件扫描和 SDK API 检查，回归、badcase 验收和模型 Eval 依赖合并 PR 时的 CI。从未经 CI 验证的工作区发布时，先手动运行 `pnpm release:verify`。
 
 先按 Eval 文档准备锁定依赖与完整场景；首次没有有效基线时先收集完整实验、审核并显式建立基线，再复核同一实验，不必仅为迁移基线重跑模型。不能通过旧报告目录的修改时间选择候选，更不能在正常验证中自动接纳缺失维度。
 

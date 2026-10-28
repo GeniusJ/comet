@@ -2,14 +2,14 @@ import { promises as fs } from 'fs';
 import { describe, expect, it } from 'vitest';
 
 describe('package scripts', () => {
-  it('runs the mandatory release gate without invoking pnpm from the npm lifecycle', async () => {
+  it('runs npm publication checks through node without invoking pnpm from the npm lifecycle', async () => {
     const packageJson = JSON.parse(await fs.readFile('package.json', 'utf-8')) as {
       scripts?: Record<string, string>;
     };
 
     const prepublishOnly = packageJson.scripts?.prepublishOnly;
 
-    expect(prepublishOnly).toBe('node scripts/release/verify-release.mjs');
+    expect(prepublishOnly).toBe('node scripts/release/verify-release.mjs --artifact-only');
     expect(prepublishOnly).not.toContain('pnpm');
     const releaseGate = await fs.readFile('scripts/release/verify-release.mjs', 'utf8');
     expect(releaseGate).toContain("['build.js']");

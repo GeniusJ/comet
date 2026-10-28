@@ -97,7 +97,7 @@ uv run --locked --no-sync --no-python-downloads python local/scripts/regression_
 uv run --locked --no-sync --no-python-downloads python local/scripts/regression_check.py --verify-receipt local/logs/experiments/release_<id>/release-gate.json
 ```
 
-必须保留整个实验目录，不能只复制凭证 JSON。发布脚本在提供 `--eval-report` 或 `COMET_RELEASE_EVAL_REPORT` 时核对这份凭证；是否为发布运行完整 Eval 由发布者决定，未提供时发布检查不包含模型 Eval。无模型 badcase 通过不等于真实模型通过。
+必须保留整个实验目录，不能只复制凭证 JSON。`npm publish` 的 `prepublishOnly` 以 `--artifact-only` 运行，只做构建、发布文件扫描和 SDK API 检查，回归与 badcase 验收以合并 PR 时的 CI 为准。`pnpm release:verify` 保留完整门禁，在提供 `--eval-report` 或 `COMET_RELEASE_EVAL_REPORT` 时核对这份凭证；是否为发布运行完整 Eval 由发布者决定，未提供时不包含模型 Eval。无模型 badcase 通过不等于真实模型通过。
 
 ## GitHub 手动工作流
 

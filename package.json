@@ -122,7 +122,7 @@
     "prepare": "node scripts/release/prepare.js",
     "prepack": "node scripts/release/npm-readme.mjs apply",
     "postpack": "node scripts/release/npm-readme.mjs restore",
-    "prepublishOnly": "node scripts/release/verify-release.mjs",
+    "prepublishOnly": "node scripts/release/verify-release.mjs --artifact-only",
     "postinstall": "node scripts/install/postinstall.js",
     "benchmark:workflow-scale": "node scripts/benchmark/workflow-scale-benchmark.mjs"
   },
